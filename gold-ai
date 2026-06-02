@@ -212,6 +212,29 @@ async function fetchTwelveData(count){ const res=await fetch(`https://api.twelve
   if(j.status==='error'||!j.values) throw new Error(`TwelveData: ${j.message||'no data'}`)
   const out=j.values.map(v=>({timestamp:new Date(v.datetime.replace(' ','T')+'Z').getTime(),open:+(+v.open).toFixed(2),high:+(+v.high).toFixed(2),low:+(+v.low).toFixed(2),close:+(+v.close).toFixed(2),price:+(+v.close).toFixed(2)})).reverse()
   if(out.length<200) throw new Error('TwelveData: too few candles'); return out }
+// Paginated history: stacks 5000-bar requests backward via end_date.
+// Respects ~8 req/min free tier with a delay. Stops when no older data.
+async function fetchTwelveDataPaged(target=30000){
+  const key=process.env.TWELVEDATA_KEY, all=new Map(); let endDate=null
+  const maxPages=Math.ceil(target/5000)+3
+  for(let page=0;page<maxPages;page++){
+    let url=`https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=5min&outputsize=5000&apikey=${key}`
+    if(endDate) url+=`&end_date=${encodeURIComponent(endDate)}`
+    const res=await fetch(url); if(!res.ok){ console.error(`  TwelveData page ${page+1}: HTTP ${res.status} — stopping`); break }
+    const j=await res.json()
+    if(j.status==='error'||!j.values||!j.values.length){ console.error(`  TwelveData: ${j.message||'no more history'} — stopping`); break }
+    let added=0
+    for(const v of j.values){ const ts=new Date(v.datetime.replace(' ','T')+'Z').getTime()
+      if(!all.has(ts)){ all.set(ts,{timestamp:ts,open:+(+v.open).toFixed(2),high:+(+v.high).toFixed(2),low:+(+v.low).toFixed(2),close:+(+v.close).toFixed(2),price:+(+v.close).toFixed(2)}); added++ } }
+    const oldest=j.values[j.values.length-1].datetime
+    console.log(`  page ${page+1}: +${added} bars (total ${all.size}) back to ${oldest}`)
+    if(added===0||endDate===oldest||all.size>=target) break
+    endDate=oldest
+    await new Promise(r=>setTimeout(r,8500)) // stay under 8 req/min
+  }
+  const arr=[...all.values()].sort((a,b)=>a.timestamp-b.timestamp)
+  if(arr.length<200) throw new Error('TwelveData paged: too few candles')
+  return arr }
 function parseYahoo(j){ const r=j.chart?.result?.[0]; if(!r?.timestamp) return []; const q=r.indicators.quote[0]
   return r.timestamp.map((t,i)=>{ const o=q.open?.[i],h=q.high?.[i],l=q.low?.[i],c=q.close?.[i]; if([o,h,l,c].some(v=>v==null||isNaN(v)))return null
     return {timestamp:t*1000,open:+o.toFixed(2),high:+h.toFixed(2),low:+l.toFixed(2),close:+c.toFixed(2),price:+c.toFixed(2)} }).filter(Boolean) }
@@ -348,7 +371,9 @@ if(mode==='backtest'||mode==='report'){
   // CHANGE #8: loud same-source reminder
   console.log(`⚠️  BACKTEST SOURCE = ${SOURCE}. This MUST be the same venue you trade live, or the results are invalid.`)
   if(SOURCE==='yahoo') console.log('    Yahoo spot is patchy intraday — use OANDA for both backtest and live.')
-  const raw=await fetchCandles(5000)
+  const raw = SOURCE==='twelvedata'
+    ? await fetchTwelveDataPaged(parseInt(process.env.BARS)||30000)   // ~3-4 months if free tier allows
+    : await fetchCandles(5000)
   const v=validateData(raw.filter(x=>x.complete!==false))
   console.log(`Data: ${v.clean.length} clean M5 bars (~${(v.clean.length*5/60/24).toFixed(1)}d) · validation:`, JSON.stringify(v.issues))
   console.log(`Costs: base spread $${SPREAD_BASE} (×${SPREAD_NEWS_MULT} news, ×${SPREAD_ROLLOVER_MULT} rollover, ×${SPREAD_VOL_MULT} volatile), entry slip $${ENTRY_SLIP}, stop slip $${STOP_SLIP}/$${STOP_SLIP_FAST} fast, commission $${COMMISSION_USD}`)
