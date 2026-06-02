@@ -275,12 +275,19 @@ function simulateTrade(candles,i,sig,maxHold=24){
 }
 
 // ── CHANGE #5: backtest WITH risk governor ───────────────────────
-function backtest(candles,{maxHold=24,warmup=200}={}){
+// PERF: analyse() gets a trailing WINDOW (not full history) so each call
+// is constant-time. Indicators/HTF only need recent bars, so results are
+// unchanged — but the backtest goes from O(n^2) to O(n).
+function backtest(candles,{maxHold=24,warmup=700,window=1200}={}){
   const trades=[]; const skipped={governor_kill:0,governor_day:0,governor_consec:0,gap_past_stop:0,zero_risk:0}
-  let i=warmup, equityR=0, peakR=0, consec=0, killed=false, curDay=null, dayR=0, dayHalted=false
+  let i=warmup, equityR=0, peakR=0, consec=0, killed=false, curDay=null, dayR=0, dayHalted=false, lastBeat=warmup
   while(i<candles.length-2){
-    const sig=analyse(candles.slice(0,i+1),candles[i].timestamp)
+    if(i-lastBeat>=5000){ console.error(`  …bar ${i}/${candles.length} · trades ${trades.length}`); lastBeat=i }
+    const from=Math.max(0,i-window+1)
+    const sig=analyse(candles.slice(from,i+1),candles[i].timestamp)
     if(sig.skipped){ i++; continue }
+    // skip if there's a data gap right at entry (no clean next-bar open)
+    if(candles[i+1].timestamp-candles[i].timestamp>10*60000){ i++; continue }
     const day=new Date(candles[i+1].timestamp).toISOString().slice(0,10)
     if(day!==curDay){ curDay=day; dayR=0; dayHalted=false }
     if(killed){ skipped.governor_kill++; i++; continue }
