@@ -15,8 +15,8 @@
 import fs from 'fs'
 
 // ── CONFIG (secrets come from env now — never commit them) ───────
-const TG_TOKEN = '1408577116'
-const TG_CHAT  ='8970765755:AAHexBHcEKLnnBsly5AIOUAPgftnEl6_9Hg'
+const TG_TOKEN ='8970765755:AAHexBHcEKLnnBsly5AIOUAPgftnEl6_9Hg'
+const TG_CHAT  = '1408577116'
 const ACCT     = parseFloat(process.env.ACCT) || 10000
 const RISK     = parseFloat(process.env.RISK) || 1        // % per trade
 const SPREAD   = parseFloat(process.env.SPREAD)   || 0.30 // $ XAUUSD-ish round-trip-able spread
@@ -498,7 +498,7 @@ Size: ${sig.posSize}
 Why: ${sig.reasons.join('; ')}
 Invalid: ${sig.inv}
 
-⚠️ Instrument: COMEX futures (GC=F). If you trade SPOT, levels sit ~$20-40 high.
+⚠️ Source: ${SOURCE} XAU/USD spot — confirm it matches your broker's feed.
 ⚠️ Tier is descriptive only. Win rate comes from the backtest, not this alert.`)
   console.log(`[${ts}] ✅ ${sig.direction} score ${sig.score} · live $${live} · drift ${slip}`)
 }
@@ -509,68 +509,6 @@ if (mode==='backtest'){
   const raw=await fetchCandles(5000)                 // OANDA caps at 5000/req (~17d M5); paginate for more
   const c=raw.filter(x=>x.complete!==false)           // never backtest on a forming bar
   console.log(`Source: ${SOURCE} · ${c.length} M5 bars (~${(c.length*5/60/24).toFixed(1)}d) · spread $${SPREAD} · slippage $${SLIPPAGE}/fill\n`)
-  console.log(JSON.stringify(backtest(c), null, 2))
-} else {
-  await check()
-}
-  for(const r of Rs){ cum+=r; peak=Math.max(peak,cum); mdd=Math.min(mdd,cum-peak) }
-  // by regime/tier breakdown
-  const byKey=(fn)=>{ const m={}; for(const t of trades){ const k=fn(t); (m[k]??=[]).push(t.R) }
-    return Object.fromEntries(Object.entries(m).map(([k,v])=>[k,{n:v.length,exp:+(v.reduce((a,b)=>a+b,0)/v.length).toFixed(3)}])) }
-  return {
-    trades:trades.length,
-    winRate:+(wins.length/trades.length*100).toFixed(1)+'%',
-    expectancyR:+(sum/trades.length).toFixed(3),
-    profitFactor:grossL? +(grossW/grossL).toFixed(2) : Infinity,
-    totalR:+sum.toFixed(2),
-    maxDrawdownR:+mdd.toFixed(2),
-    byRegime:byKey(t=>t.regime),
-    byTier:byKey(t=>t.tier),
-  }
-}
-
-// ─────────────────────────────────────────────────────────────
-//  TELEGRAM + DEDUPE  (now also logs every live signal for stats)
-// ─────────────────────────────────────────────────────────────
-async function sendTelegram(text){
-  if(!TG_TOKEN||!TG_CHAT){ console.log('[telegram disabled — set TG_TOKEN/TG_CHAT]\n'+text); return }
-  const res=await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,{
-    method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({chat_id:TG_CHAT,text,parse_mode:'HTML'})})
-  if(!res.ok) console.error('Telegram error',res.status,await res.text())
-}
-const loadKey=()=>{ try{return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')).lastKey}catch{return null} }
-const saveKey=k=>{ try{fs.writeFileSync(STATE_FILE,JSON.stringify({lastKey:k,at:new Date().toISOString()}))}catch(e){console.error(e)} }
-const logTrade=o=>{ let a=[]; try{a=JSON.parse(fs.readFileSync(TRADE_LOG,'utf8'))}catch{} ; a.push(o); fs.writeFileSync(TRADE_LOG,JSON.stringify(a,null,2)) }
-
-async function check(){
-  const candles=await fetchCandles()
-  // do NOT fabricate a live bar; analyse the last CLOSED bar
-  const sig=analyse(candles.slice(0,-1), candles[candles.length-2].timestamp)
-  const ts=new Date().toISOString()
-  if(sig.skipped){ console.log(`[${ts}] WAIT · ${sig.regime} · ${sig.why}`); return }
-  const barTs=candles[candles.length-2].timestamp
-  const key=`${sig.direction}|${barTs}`
-  if(key===loadKey()){ console.log(`[${ts}] ${sig.direction} already alerted this bar`); return }
-  saveKey(key); logTrade({ts,...sig})
-  await sendTelegram(
-`🟡 <b>GOLD M5 — ${sig.direction}</b>  (score ${sig.score}/100, tier ${sig.tier})
-Regime: ${sig.regime} (ADX ${sig.adx})  ·  ${sig.session}
-Entry $${sig.entry}  SL $${sig.sl}
-TP1 $${sig.tp1}  TP2 $${sig.tp2}  TP3 $${sig.tp3}   R:R ${sig.rr}
-Size: ${sig.posSize}
-Why: ${sig.reasons.join('; ')}
-Invalid: ${sig.inv}
-
-⚠️ Tier is descriptive only. Win rate must come from backtest, not this alert.`)
-  console.log(`[${ts}] ✅ ${sig.direction} score ${sig.score}`)
-}
-
-// ── entry point ───────────────────────────────────────────────
-const mode=process.argv[2]||'check'
-if (mode==='backtest'){
-  const c=await fetchCandles()
-  console.log(`Backtesting ${c.length} M5 bars (~${(c.length*5/60/24).toFixed(0)}d), spread $${SPREAD}, slippage $${SLIPPAGE}/fill\n`)
   console.log(JSON.stringify(backtest(c), null, 2))
 } else {
   await check()
