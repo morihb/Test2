@@ -18,6 +18,7 @@ import fs from 'fs'
 
 // ── CONFIG (secrets from env only) ───────────────────────────────
 const TG_TOKEN=process.env.TG_TOKEN||'', TG_CHAT=process.env.TG_CHAT||''
+const envNum=(k,d)=>process.env[k]!==undefined&&process.env[k]!==''?parseFloat(process.env[k]):d
 const ACCT=parseFloat(process.env.ACCT)||10000, RISK=parseFloat(process.env.RISK)||1
 const STATE_FILE='./bot_state.json', TRADE_LOG='./trade_log.json', REPORT_FILE='./report.json'
 
@@ -29,14 +30,15 @@ const STOP_SLIP=parseFloat(process.env.STOP_SLIP)||0.20          // $ extra adve
 const STOP_SLIP_FAST=parseFloat(process.env.STOP_SLIP_FAST)||2.0 // $ during news/volatile
 const COMMISSION_USD=parseFloat(process.env.COMMISSION)||0       // round-trip $ per position
 
-// risk governor (in R units)
-const DAILY_LOSS_LIMIT_R=parseFloat(process.env.DAILY_LOSS_R)||3
-const MAX_CONSEC_LOSSES=parseInt(process.env.MAX_CONSEC)||4
-const KILL_DD_R=parseFloat(process.env.KILL_DD_R)||10
+// risk governor (in R units) — set very high to disable for measurement runs
+const DAILY_LOSS_LIMIT_R=envNum('DAILY_LOSS_R',3)
+const MAX_CONSEC_LOSSES=envNum('MAX_CONSEC',4)
+const KILL_DD_R=envNum('KILL_DD_R',10)
 const MAX_CONCURRENT=1   // single-position system
 
-// scoring / gating (unchanged from v2)
-const MIN_NET=30, MIN_CONV=0.35, MAX_CONFLICT=0.40, USE_MTF=true
+// scoring / gating — env-overridable so you can loosen for MEASUREMENT runs
+const MIN_NET=envNum('MIN_NET',30), MIN_CONV=envNum('MIN_CONV',0.35), MAX_CONFLICT=envNum('MAX_CONFLICT',0.40)
+const USE_MTF=process.env.USE_MTF!=='0'
 const TP_PLAN=[{tp:'tp1',w:0.5},{tp:'tp2',w:0.3},{tp:'tp3',w:0.2}], MOVE_BE_AFTER_TP1=true
 const NEWS_BLACKOUT_MIN={before:30,after:30}
 const NEWS_EVENTS=[ /* {time:'2026-06-06T12:30:00Z',label:'NFP'} — keep current from a calendar */ ]
