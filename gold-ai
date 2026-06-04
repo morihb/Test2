@@ -41,9 +41,11 @@ const MAX_CONCURRENT=1   // single-position system
 
 // ── TIMEFRAME PRESETS (5m | 15m | 1h) — interval + sane defaults ──
 const TF_PRESETS={
-  '5m': {min:5,  td:'5min', oanda:'M5', trendMin:60,  structMin:15, atrLow:0.04,atrHigh:0.55,window:1200,warmup:700,maxHold:24,target:30000},
-  '15m':{min:15, td:'15min',oanda:'M15',trendMin:240, structMin:60, atrLow:0.08,atrHigh:0.80,window:600, warmup:400,maxHold:24,target:25000},
-  '1h': {min:60, td:'1h',   oanda:'H1', trendMin:240, structMin:60, atrLow:0.15,atrHigh:1.20,window:400, warmup:300,maxHold:24,target:20000},
+  '5m': {min:5,   td:'5min', oanda:'M5', trendMin:60,   structMin:15,  atrLow:0.04,atrHigh:0.55,window:1200,warmup:700,maxHold:24,target:30000},
+  '15m':{min:15,  td:'15min',oanda:'M15',trendMin:240,  structMin:60,  atrLow:0.08,atrHigh:0.80,window:600, warmup:400,maxHold:24,target:25000},
+  '1h': {min:60,  td:'1h',   oanda:'H1', trendMin:240,  structMin:60,  atrLow:0.15,atrHigh:1.20,window:400, warmup:300,maxHold:24,target:20000},
+  '4h': {min:240, td:'4h',   oanda:'H4', trendMin:1440, structMin:240, atrLow:0.15,atrHigh:1.50,window:360, warmup:240,maxHold:24,target:15000},
+  '1d': {min:1440,td:'1day', oanda:'D',  trendMin:10080,structMin:1440,atrLow:0.40,atrHigh:2.80,window:400, warmup:300,maxHold:20,target:8000},
 }
 // Backtest default TF (single-TF). Live ignores this and uses LIVE_TFS.
 const TFRAME=process.env.TF||'5m'
@@ -263,7 +265,7 @@ async function fetchTwelveDataPaged(target=30000,cfg){
 function parseYahoo(j){ const r=j.chart?.result?.[0]; if(!r?.timestamp) return []; const q=r.indicators.quote[0]
   return r.timestamp.map((t,i)=>{ const o=q.open?.[i],h=q.high?.[i],l=q.low?.[i],c=q.close?.[i]; if([o,h,l,c].some(v=>v==null||isNaN(v)))return null
     return {timestamp:t*1000,open:+o.toFixed(2),high:+h.toFixed(2),low:+l.toFixed(2),close:+c.toFixed(2),price:+c.toFixed(2)} }).filter(Boolean) }
-async function fetchYahooSpot(cfg){ const iv=cfg.min===60?'1h':cfg.min===15?'15m':'5m', range=cfg.min>=60?'730d':'60d'
+async function fetchYahooSpot(cfg){ const iv=cfg.min>=1440?'1d':cfg.min===60?'1h':cfg.min===15?'15m':'5m', range=cfg.min>=1440?'5y':cfg.min>=60?'730d':'60d'
   for(const q of ['query1','query2']){ try{ const res=await fetch(`https://${q}.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=${iv}&range=${range}`,{headers:{'User-Agent':'Mozilla/5.0'}})
   if(res.ok){ const a=parseYahoo(await res.json()); if(a.length>200) return a } }catch(_){} }
   throw new Error('No Yahoo spot data — set OANDA_TOKEN or TWELVEDATA_KEY') }
