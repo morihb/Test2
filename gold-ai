@@ -1,18 +1,18 @@
 // ─────────────────────────────────────────────────────────────
-//  GOLD.AI — v3 (execution-realism + statistical-validity pass)
-//  NO new signals. Same edge logic as v2. What changed:
-//   1. Next-bar-OPEN fills (kills close-entry look-ahead)
-//   2. Completed, calendar-aligned H1/M15 (kills HTF look-ahead)
-//   3. OANDA XAU/USD sizing in UNITS (oz), not 100oz "lots"
-//   4. Realistic cost model: variable spread (news/rollover/vol),
-//      commission, stop-loss slippage
-//   5. Account risk governor: daily loss cap, consec-loss cap,
-//      drawdown kill switch, single-position exposure
-//   6. Data validation: dedupe, bad-timestamp, outlier, gap detect
-//   7. Statistical validation: bootstrap CI + Monte-Carlo DD
-//   8. Backtest & live share ONE source/assumptions (loud warning)
+//  GOLD.AI — v3.1 (multi-timeframe live: 15m + 1h together)
+//  Same edge logic as v3. What changed vs v3 (NO strategy changes):
+//   • TF-specific params (interval, ATR band, trend/struct, window…)
+//     now come from a cfg object instead of fixed globals, so the
+//     SAME analyse() can run on more than one timeframe.
+//   • `check` (live) now runs 15m AND 1h every cycle and labels each
+//     Telegram signal with its timeframe.
+//   • `backtest`/`report` stay single-TF — choose with TF=15m or TF=1h.
+//   • Dedupe state is now per-timeframe (so 15m & 1h don't clobber).
+//   All scoring, gates, stop/TP, sizing, costs, governor: UNCHANGED.
 //
-//  Run:  node gold-ai check | backtest | report
+//  Run:  node gold-ai check                 (live: 15m + 1h)
+//        TF=15m node gold-ai backtest       (backtest 15m)
+//        TF=1h  node gold-ai report         (full report 1h)
 // ─────────────────────────────────────────────────────────────
 import fs from 'fs'
 
@@ -21,6 +21,9 @@ const TG_TOKEN=process.env.TG_TOKEN||'', TG_CHAT=process.env.TG_CHAT||''
 const envNum=(k,d)=>process.env[k]!==undefined&&process.env[k]!==''?parseFloat(process.env[k]):d
 const ACCT=parseFloat(process.env.ACCT)||10000, RISK=parseFloat(process.env.RISK)||1
 const STATE_FILE='./bot_state.json', TRADE_LOG='./trade_log.json', REPORT_FILE='./report.json'
+
+// which timeframes run together in LIVE check (override: LIVE_TFS="15m,1h")
+const LIVE_TFS=(process.env.LIVE_TFS||'15m,1h').split(',').map(s=>s.trim()).filter(Boolean)
 
 // cost model (tune to YOUR broker's actual fills)
 const SPREAD_BASE=parseFloat(process.env.SPREAD)||0.30   // $ normal XAUUSD spread
@@ -36,17 +39,28 @@ const MAX_CONSEC_LOSSES=envNum('MAX_CONSEC',4)
 const KILL_DD_R=envNum('KILL_DD_R',10)
 const MAX_CONCURRENT=1   // single-position system
 
-// ── TIMEFRAME (TF=5m | 1h) — picks data interval + sane defaults ──
-const TFRAME=process.env.TF||'5m'
+// ── TIMEFRAME PRESETS (5m | 15m | 1h) — interval + sane defaults ──
 const TF_PRESETS={
-  '5m':{min:5,  td:'5min',oanda:'M5',trendMin:60,  structMin:15, atrLow:0.04,atrHigh:0.55,window:1200,warmup:700,maxHold:24,target:30000},
-  '1h':{min:60, td:'1h',  oanda:'H1',trendMin:240, structMin:60, atrLow:0.15,atrHigh:1.20,window:400, warmup:300,maxHold:24,target:20000},
+  '5m': {min:5,  td:'5min', oanda:'M5', trendMin:60,  structMin:15, atrLow:0.04,atrHigh:0.55,window:1200,warmup:700,maxHold:24,target:30000},
+  '15m':{min:15, td:'15min',oanda:'M15',trendMin:240, structMin:60, atrLow:0.08,atrHigh:0.80,window:600, warmup:400,maxHold:24,target:25000},
+  '1h': {min:60, td:'1h',   oanda:'H1', trendMin:240, structMin:60, atrLow:0.15,atrHigh:1.20,window:400, warmup:300,maxHold:24,target:20000},
 }
-const P=TF_PRESETS[TFRAME]||TF_PRESETS['5m']
-const TF_MIN=P.min, TD_INTERVAL=P.td, OANDA_GRAN=P.oanda
-const TREND_MIN=envNum('TREND_MIN',P.trendMin), STRUCT_MIN=envNum('STRUCT_MIN',P.structMin)
-const ATR_LOW=envNum('ATR_LOW',P.atrLow), ATR_HIGH=envNum('ATR_HIGH',P.atrHigh)
-const WINDOW=envNum('WINDOW',P.window), WARMUP=envNum('WARMUP',P.warmup), MAXHOLD=envNum('MAXHOLD',P.maxHold)
+// Backtest default TF (single-TF). Live ignores this and uses LIVE_TFS.
+const TFRAME=process.env.TF||'5m'
+
+// Build a per-timeframe config bundle. env overrides apply to whichever
+// TF(s) run; for multi-TF live, prefer NOT setting TREND_MIN/ATR_* env so
+// each timeframe keeps its own preset values.
+function cfgFor(tframe){
+  const p=TF_PRESETS[tframe]||TF_PRESETS['5m']
+  return {
+    tframe,
+    min:p.min, td:p.td, oanda:p.oanda, target:p.target,
+    trendMin:envNum('TREND_MIN',p.trendMin), structMin:envNum('STRUCT_MIN',p.structMin),
+    atrLow:envNum('ATR_LOW',p.atrLow), atrHigh:envNum('ATR_HIGH',p.atrHigh),
+    window:envNum('WINDOW',p.window), warmup:envNum('WARMUP',p.warmup), maxHold:envNum('MAXHOLD',p.maxHold),
+  }
+}
 
 // scoring / gating — env-overridable so you can loosen for MEASUREMENT runs
 const MIN_NET=envNum('MIN_NET',30), MIN_CONV=envNum('MIN_CONV',0.35), MAX_CONFLICT=envNum('MAX_CONFLICT',0.40)
@@ -78,9 +92,7 @@ const stochCalc=(c,n=14)=>{ if(c.length<n) return null; const w=c.slice(-n)
   const H=Math.max(...w.map(v=>v.high)),L=Math.min(...w.map(v=>v.low)); return +((c[c.length-1].close-L)/((H-L)||1e-9)*100).toFixed(2) }
 const sma20=(c)=>c.length<20?null:+(c.slice(-20).reduce((a,b)=>a+b.close,0)/20).toFixed(2)
 
-// ── CHANGE #2: calendar-aligned + COMPLETED-only HTF resample ────
-// Buckets by real UTC time; DROPS the final (still-forming) bucket
-// so the higher-TF filter never peeks at an unfinished candle.
+// ── calendar-aligned + COMPLETED-only HTF resample (unchanged) ───
 function resampleTF(c, minutes){
   const ms=minutes*60000, map=new Map()
   for(const bar of c){ const k=Math.floor(bar.timestamp/ms)*ms
@@ -91,7 +103,7 @@ function resampleTF(c, minutes){
   return arr.slice(0,-1)   // drop forming HTF bar — completed bars only
 }
 
-// ── REGIME / structure / session (unchanged) ─────────────────────
+// ── REGIME / structure / session ─────────────────────────────────
 function adx(c,n=14){ if(c.length<2*n+1) return null
   const H=c.map(x=>x.high),L=c.map(x=>x.low),C=c.map(x=>x.close); const trs=[],pdm=[],mdm=[]
   for(let i=1;i<c.length;i++){ const up=H[i]-H[i-1],dn=L[i-1]-L[i]
@@ -103,10 +115,10 @@ function adx(c,n=14){ if(c.length<2*n+1) return null
   const dx=pdi.map((v,i)=>100*Math.abs(v-mdi[i])/((v+mdi[i])||1e-9)); if(dx.length<n) return null
   let a=dx.slice(0,n).reduce((x,y)=>x+y,0)/n; for(let i=n;i<dx.length;i++) a=(a*(n-1)+dx[i])/n
   return {adx:+a.toFixed(1),pdi:+last(pdi).toFixed(1),mdi:+last(mdi).toFixed(1)} }
-function marketRegime(c,price){ const d=adx(c),atr=atrCalc(c); const atrPct=atr?atr/price*100:null
+function marketRegime(c,price,cfg){ const d=adx(c),atr=atrCalc(c); const atrPct=atr?atr/price*100:null
   if(!d||atrPct==null) return {regime:'unknown',adx:null,atrPct,allowTrend:true,allowMR:true}
-  if(atrPct<ATR_LOW) return {regime:'low_liquidity',...d,atrPct,allowTrend:false,allowMR:false}
-  if(atrPct>ATR_HIGH) return {regime:'volatile_expansion',...d,atrPct,allowTrend:true,allowMR:false}
+  if(atrPct<cfg.atrLow) return {regime:'low_liquidity',...d,atrPct,allowTrend:false,allowMR:false}
+  if(atrPct>cfg.atrHigh) return {regime:'volatile_expansion',...d,atrPct,allowTrend:true,allowMR:false}
   if(d.adx>=25&&d.pdi>d.mdi) return {regime:'trending_bull',...d,atrPct,allowTrend:true,allowMR:false}
   if(d.adx>=25&&d.mdi>d.pdi) return {regime:'trending_bear',...d,atrPct,allowTrend:true,allowMR:false}
   if(d.adx<18) return {regime:'ranging',...d,atrPct,allowTrend:false,allowMR:true}
@@ -132,7 +144,7 @@ function htfTrend(h1){ if(h1.length<50) return 'neutral'
   const p=h1.map(x=>x.close),e20=last(ema(p,20)),e50=last(ema(p,50)),price=last(p)
   if(e20&&e50&&price>e50&&e20>e50) return 'bullish'; if(e20&&e50&&price<e50&&e20<e50) return 'bearish'; return 'neutral' }
 
-// ── cost model helpers ───────────────────────────────────────────
+// ── cost model helpers (unchanged) ───────────────────────────────
 function inNewsBlackout(ts){ for(const e of NEWS_EVENTS){ const et=new Date(e.time).getTime()
   if(ts>=et-NEWS_BLACKOUT_MIN.before*60000 && ts<=et+NEWS_BLACKOUT_MIN.after*60000) return e.label } return null }
 function isRollover(ts){ return new Date(ts).getUTCHours()===21 } // ~OANDA 21:00 UTC daily rollover
@@ -143,20 +155,20 @@ function spreadAt(ts,regime){ let s=SPREAD_BASE
   return s }
 function stopSlipAt(ts,regime){ return (inNewsBlackout(ts)||regime==='volatile_expansion')?STOP_SLIP_FAST:STOP_SLIP }
 
-// ── SCORING + gates (unchanged logic; #3 sizing fixed) ───────────
+// ── SCORING + gates (strategy unchanged; now takes cfg) ──────────
 const WEIGHTS={regime:25,liquidity:20,structure:20,ema:12,macd:8,osc:10,sma:5}
 const TOTAL=Object.values(WEIGHTS).reduce((a,b)=>a+b,0)
-function analyse(candles, nowMs){
+function analyse(candles, nowMs, cfg){
   const price=last(candles).close, prices=candles.map(c=>c.close)
-  const reg=marketRegime(candles,price), str=detectStructure(candles,TF.scalp.slb), liq=detectLiquiditySweep(candles)
+  const reg=marketRegime(candles,price,cfg), str=detectStructure(candles,TF.scalp.slb), liq=detectLiquiditySweep(candles)
   const e20=last(ema(prices,20)),e50=last(ema(prices,50))
   const rsi=rsiCalc(prices),macd=macdCalc(prices),bb=bbCalc(prices),st=stochCalc(candles),s20=sma20(candles),atr=atrCalc(candles)
-  if(!atr||reg.regime==='low_liquidity') return wait('low liquidity / no ATR',reg)
-  if(reg.atrPct<0.03||reg.atrPct>3.0) return wait(`ATR ${reg.atrPct?.toFixed(3)}% outside band`,reg)
-  const news=inNewsBlackout(nowMs); if(news) return wait(`news blackout: ${news}`,reg)
-  // CHANGE #2: completed, calendar-aligned HTF
+  if(!atr||reg.regime==='low_liquidity') return wait('low liquidity / no ATR',reg,cfg)
+  if(reg.atrPct<0.03||reg.atrPct>3.0) return wait(`ATR ${reg.atrPct?.toFixed(3)}% outside band`,reg,cfg)
+  const news=inNewsBlackout(nowMs); if(news) return wait(`news blackout: ${news}`,reg,cfg)
+  // completed, calendar-aligned HTF
   let h1Trend='neutral',m15Bos='none'
-  if(USE_MTF){ const h1=resampleTF(candles,TREND_MIN), m15=resampleTF(candles,STRUCT_MIN)
+  if(USE_MTF){ const h1=resampleTF(candles,cfg.trendMin), m15=resampleTF(candles,cfg.structMin)
     h1Trend=htfTrend(h1); if(m15.length>20) m15Bos=detectStructure(m15,3).bos }
   let bull=0,bear=0; const reasons=[]
   if(reg.regime==='trending_bull'){bull+=WEIGHTS.regime;reasons.push('Regime bull')} else if(reg.regime==='trending_bear'){bear+=WEIGHTS.regime;reasons.push('Regime bear')}
@@ -168,12 +180,12 @@ function analyse(candles, nowMs){
   if(reg.allowMR&&rsi!=null&&st!=null&&bb){ if(price<=bb.lower&&rsi<35&&st<25){bull+=WEIGHTS.osc;reasons.push('Oversold reclaim')} if(price>=bb.upper&&rsi>65&&st>75){bear+=WEIGHTS.osc;reasons.push('Overbought reject')} }
   const dominant=Math.max(bull,bear),opposing=Math.min(bull,bear),net=dominant-opposing,conv=net/TOTAL,conflict=dominant?opposing/dominant:0
   const dir0=bull===bear?'WAIT':(bull>bear?'BUY':'SELL')
-  if(dir0==='WAIT'||net<MIN_NET||conv<MIN_CONV) return wait(`net ${net} conv ${conv.toFixed(2)} below floor`,reg,{net,bull,bear})
-  if(conflict>MAX_CONFLICT) return wait(`conflict ${(conflict*100|0)}%`,reg,{net,bull,bear})
+  if(dir0==='WAIT'||net<MIN_NET||conv<MIN_CONV) return wait(`net ${net} conv ${conv.toFixed(2)} below floor`,reg,cfg,{net,bull,bear})
+  if(conflict>MAX_CONFLICT) return wait(`conflict ${(conflict*100|0)}%`,reg,cfg,{net,bull,bear})
   if(USE_MTF){ const oppH1=(dir0==='BUY'&&h1Trend==='bearish')||(dir0==='SELL'&&h1Trend==='bullish')
-    if(oppH1) return wait(`opposes H1 (${h1Trend})`,reg,{net,bull,bear})
+    if(oppH1) return wait(`opposes H1 (${h1Trend})`,reg,cfg,{net,bull,bear})
     const oppM15=(dir0==='BUY'&&m15Bos==='bearish')||(dir0==='SELL'&&m15Bos==='bullish')
-    if(oppM15&&conv<MIN_CONV+0.15) return wait('opposes M15 & weak',reg,{net,bull,bear}) }
+    if(oppM15&&conv<MIN_CONV+0.15) return wait('opposes M15 & weak',reg,cfg,{net,bull,bear}) }
   const dir=dir0, score=Math.round(conv*100), tier=score>=70?'A':score>=55?'B':'C'
   const stopMult=reg.regime==='volatile_expansion'?2.2:1.5
   let entry=price,sl,tp1,tp2,tp3
@@ -183,18 +195,18 @@ function analyse(candles, nowMs){
   } else { let base=liq.sweepBear&&liq.prevHigh?liq.prevHigh+atr*0.3:str.rH?str.rH.close+atr*0.3:price+atr*stopMult
     if(base<=entry)base=price+atr*stopMult; sl=+Math.min(base,price+atr*5).toFixed(2); const r=sl-entry
     tp1=+(entry-r*1.5).toFixed(2);tp2=+(entry-r*2.5).toFixed(2);tp3=+(entry-r*4).toFixed(2) }
-  // CHANGE #3: OANDA XAU_USD is priced in UNITS (ounces). $1 move = $1/unit.
+  // OANDA XAU_USD is priced in UNITS (ounces). $1 move = $1/unit.
   const riskUSD=ACCT*(RISK/100), units=riskUSD/Math.abs(entry-sl)
-  return { direction:dir,score,tier,net,bull,bear,conflict:+conflict.toFixed(2),
+  return { tframe:cfg.tframe, direction:dir,score,tier,net,bull,bear,conflict:+conflict.toFixed(2),
     regime:reg.regime,adx:reg.adx,atrPct:+reg.atrPct.toFixed(3),session:sessionOf(nowMs),h1Trend,m15Bos,
     entry:+entry.toFixed(2),sl,tp1,tp2,tp3,rr:`1:${Math.abs((tp2-entry)/(entry-sl)).toFixed(1)}`,
     units:+units.toFixed(2), posSize:`${units.toFixed(2)} units(oz) · OANDA order≈${Math.round(units)} · $${riskUSD.toFixed(0)} risk`,
-    inv:dir==='BUY'?`5m close below $${sl}`:`5m close above $${sl}`,reasons,skipped:false }
+    inv:dir==='BUY'?`${cfg.tframe} close below $${sl}`:`${cfg.tframe} close above $${sl}`,reasons,skipped:false }
 }
-function wait(why,reg,extra={}){ return {direction:'WAIT',skipped:true,why,regime:reg?.regime,...extra} }
+function wait(why,reg,cfg,extra={}){ return {direction:'WAIT',skipped:true,why,tframe:cfg?.tframe,regime:reg?.regime,...extra} }
 
-// ── CHANGE #6: data-quality validation ───────────────────────────
-function validateData(c){
+// ── data-quality validation (now takes cfg.min) ──────────────────
+function validateData(c,cfg){
   const issues={dups:0,badTs:0,outliers:0,midGaps:0,weekendGaps:0}
   const sorted=c.slice().sort((a,b)=>a.timestamp-b.timestamp)
   const ranges=sorted.map(x=>x.high-x.low).filter(r=>r>0).sort((a,b)=>a-b)
@@ -206,33 +218,32 @@ function validateData(c){
     const jump=prev?Math.abs(bar.open-prev.close):0
     if((bar.high-bar.low)>med*25 || jump>med*25){ issues.outliers++; continue }   // bad print
     if(prev){ const gap=bar.timestamp-prev.timestamp
-      if(gap>TF_MIN*60000*1.5){ if(gap>20*3600000) issues.weekendGaps++; else issues.midGaps++ } }
+      if(gap>cfg.min*60000*1.5){ if(gap>20*3600000) issues.weekendGaps++; else issues.midGaps++ } }
     out.push(bar); prev=bar
   }
   return { clean:out, issues, medianRange:+med.toFixed(2) }
 }
 
-// ── DATA SOURCES (unchanged) ─────────────────────────────────────
+// ── DATA SOURCES (now take cfg for interval/granularity) ─────────
 const SOURCE=process.env.GOLD_SOURCE||(process.env.OANDA_TOKEN?'oanda':process.env.TWELVEDATA_KEY?'twelvedata':'yahoo')
-async function fetchCandles(count=500){ if(SOURCE==='oanda')return fetchOanda(count); if(SOURCE==='twelvedata')return fetchTwelveData(count); return fetchYahooSpot() }
-async function fetchOanda(count){ const host=process.env.OANDA_ENV==='live'?'api-fxtrade.oanda.com':'api-fxpractice.oanda.com'
-  const res=await fetch(`https://${host}/v3/instruments/XAU_USD/candles?granularity=${OANDA_GRAN}&count=${Math.min(count,5000)}&price=M`,{headers:{Authorization:`Bearer ${process.env.OANDA_TOKEN}`}})
+async function fetchCandles(count=500,cfg){ if(SOURCE==='oanda')return fetchOanda(count,cfg); if(SOURCE==='twelvedata')return fetchTwelveData(count,cfg); return fetchYahooSpot(cfg) }
+async function fetchOanda(count,cfg){ const host=process.env.OANDA_ENV==='live'?'api-fxtrade.oanda.com':'api-fxpractice.oanda.com'
+  const res=await fetch(`https://${host}/v3/instruments/XAU_USD/candles?granularity=${cfg.oanda}&count=${Math.min(count,5000)}&price=M`,{headers:{Authorization:`Bearer ${process.env.OANDA_TOKEN}`}})
   if(!res.ok) throw new Error(`OANDA ${res.status}: ${await res.text()}`)
   const {candles=[]}=await res.json()
   const out=candles.map(c=>({timestamp:new Date(c.time).getTime(),open:+(+c.mid.o).toFixed(2),high:+(+c.mid.h).toFixed(2),low:+(+c.mid.l).toFixed(2),close:+(+c.mid.c).toFixed(2),price:+(+c.mid.c).toFixed(2),complete:c.complete}))
   if(out.length<200) throw new Error('OANDA: too few candles'); return out }
-async function fetchTwelveData(count){ const res=await fetch(`https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=${TD_INTERVAL}&outputsize=${Math.min(count,5000)}&apikey=${process.env.TWELVEDATA_KEY}`)
+async function fetchTwelveData(count,cfg){ const res=await fetch(`https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=${cfg.td}&outputsize=${Math.min(count,5000)}&apikey=${process.env.TWELVEDATA_KEY}`)
   if(!res.ok) throw new Error(`TwelveData ${res.status}`); const j=await res.json()
   if(j.status==='error'||!j.values) throw new Error(`TwelveData: ${j.message||'no data'}`)
   const out=j.values.map(v=>({timestamp:new Date(v.datetime.replace(' ','T')+'Z').getTime(),open:+(+v.open).toFixed(2),high:+(+v.high).toFixed(2),low:+(+v.low).toFixed(2),close:+(+v.close).toFixed(2),price:+(+v.close).toFixed(2)})).reverse()
   if(out.length<200) throw new Error('TwelveData: too few candles'); return out }
 // Paginated history: stacks 5000-bar requests backward via end_date.
-// Respects ~8 req/min free tier with a delay. Stops when no older data.
-async function fetchTwelveDataPaged(target=30000){
+async function fetchTwelveDataPaged(target=30000,cfg){
   const key=process.env.TWELVEDATA_KEY, all=new Map(); let endDate=null
   const maxPages=Math.ceil(target/5000)+3
   for(let page=0;page<maxPages;page++){
-    let url=`https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=${TD_INTERVAL}&outputsize=5000&apikey=${key}`
+    let url=`https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=${cfg.td}&outputsize=5000&apikey=${key}`
     if(endDate) url+=`&end_date=${encodeURIComponent(endDate)}`
     const res=await fetch(url); if(!res.ok){ console.error(`  TwelveData page ${page+1}: HTTP ${res.status} — stopping`); break }
     const j=await res.json()
@@ -252,11 +263,12 @@ async function fetchTwelveDataPaged(target=30000){
 function parseYahoo(j){ const r=j.chart?.result?.[0]; if(!r?.timestamp) return []; const q=r.indicators.quote[0]
   return r.timestamp.map((t,i)=>{ const o=q.open?.[i],h=q.high?.[i],l=q.low?.[i],c=q.close?.[i]; if([o,h,l,c].some(v=>v==null||isNaN(v)))return null
     return {timestamp:t*1000,open:+o.toFixed(2),high:+h.toFixed(2),low:+l.toFixed(2),close:+c.toFixed(2),price:+c.toFixed(2)} }).filter(Boolean) }
-async function fetchYahooSpot(){ for(const q of ['query1','query2']){ try{ const res=await fetch(`https://${q}.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=5m&range=60d`,{headers:{'User-Agent':'Mozilla/5.0'}})
+async function fetchYahooSpot(cfg){ const iv=cfg.min===60?'1h':cfg.min===15?'15m':'5m', range=cfg.min>=60?'730d':'60d'
+  for(const q of ['query1','query2']){ try{ const res=await fetch(`https://${q}.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=${iv}&range=${range}`,{headers:{'User-Agent':'Mozilla/5.0'}})
   if(res.ok){ const a=parseYahoo(await res.json()); if(a.length>200) return a } }catch(_){} }
   throw new Error('No Yahoo spot data — set OANDA_TOKEN or TWELVEDATA_KEY') }
 
-// ── CHANGE #1 + #4: next-open fills + realistic costs ────────────
+// ── next-open fills + realistic costs (unchanged) ────────────────
 function simulateTrade(candles,i,sig,maxHold=24){
   if(i+1>=candles.length) return null
   const dir=sig.direction, eb=candles[i+1]
@@ -288,20 +300,16 @@ function simulateTrade(candles,i,sig,maxHold=24){
     day:new Date(eb.timestamp).toISOString().slice(0,10) }
 }
 
-// ── CHANGE #5: backtest WITH risk governor ───────────────────────
-// PERF: analyse() gets a trailing WINDOW (not full history) so each call
-// is constant-time. Indicators/HTF only need recent bars, so results are
-// unchanged — but the backtest goes from O(n^2) to O(n).
-function backtest(candles,{maxHold=MAXHOLD,warmup=WARMUP,window=WINDOW}={}){
+// ── backtest WITH risk governor (now takes cfg) ──────────────────
+function backtest(candles,cfg,{maxHold=cfg.maxHold,warmup=cfg.warmup,window=cfg.window}={}){
   const trades=[]; const skipped={governor_kill:0,governor_day:0,governor_consec:0,gap_past_stop:0,zero_risk:0}
   let i=warmup, equityR=0, peakR=0, consec=0, killed=false, curDay=null, dayR=0, dayHalted=false, lastBeat=warmup
   while(i<candles.length-2){
     if(i-lastBeat>=5000){ console.error(`  …bar ${i}/${candles.length} · trades ${trades.length}`); lastBeat=i }
     const from=Math.max(0,i-window+1)
-    const sig=analyse(candles.slice(from,i+1),candles[i].timestamp)
+    const sig=analyse(candles.slice(from,i+1),candles[i].timestamp,cfg)
     if(sig.skipped){ i++; continue }
-    // skip if there's a data gap right at entry (no clean next-bar open)
-    if(candles[i+1].timestamp-candles[i].timestamp>TF_MIN*60000*1.5){ i++; continue }
+    if(candles[i+1].timestamp-candles[i].timestamp>cfg.min*60000*1.5){ i++; continue }
     const day=new Date(candles[i+1].timestamp).toISOString().slice(0,10)
     if(day!==curDay){ curDay=day; dayR=0; dayHalted=false }
     if(killed){ skipped.governor_kill++; i++; continue }
@@ -319,7 +327,7 @@ function backtest(candles,{maxHold=MAXHOLD,warmup=WARMUP,window=WINDOW}={}){
   return { trades, skipped, killed, finalEquityR:+equityR.toFixed(2) }
 }
 
-// ── stats / analytics / CHANGE #7 bootstrap + Monte-Carlo ────────
+// ── stats / analytics / bootstrap + Monte-Carlo (unchanged) ──────
 function agg(Rs){ if(!Rs.length) return {n:0}; const w=Rs.filter(r=>r>0),l=Rs.filter(r=>r<=0)
   const gw=w.reduce((a,b)=>a+b,0),gl=Math.abs(l.reduce((a,b)=>a+b,0))
   return {n:Rs.length,winRate:+(w.length/Rs.length*100).toFixed(1),exp:+(Rs.reduce((a,b)=>a+b,0)/Rs.length).toFixed(3),pf:gl?+(gw/gl).toFixed(2):(gw>0?99.99:0),totalR:+Rs.reduce((a,b)=>a+b,0).toFixed(2)} }
@@ -357,51 +365,63 @@ function fullReport(bt){
     report:{ bestRegime:pick(byRegime,1),worstRegime:pick(byRegime,0),bestSession:pick(bySession,1),worstSession:pick(bySession,0),bestScoreBucket:pick(byScore,1),worstScoreBucket:pick(byScore,0) } }
 }
 
-// ── TELEGRAM / live check (unchanged logic) ──────────────────────
+// ── TELEGRAM / live check (now multi-TF + per-TF dedupe) ─────────
 async function sendTelegram(text){ if(!TG_TOKEN||!TG_CHAT){ console.log('[telegram disabled]\n'+text); return }
   const res=await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:TG_CHAT,text,parse_mode:'HTML'})})
   if(!res.ok) console.error('Telegram error',res.status,await res.text()) }
-const loadKey=()=>{ try{return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')).lastKey}catch{return null} }
-const saveKey=k=>{ try{fs.writeFileSync(STATE_FILE,JSON.stringify({lastKey:k,at:new Date().toISOString()}))}catch(e){console.error(e)} }
+const loadKey=(tf)=>{ try{ return JSON.parse(fs.readFileSync(STATE_FILE,'utf8'))[tf]||null }catch{ return null } }
+const saveKey=(tf,k)=>{ let o={}; try{o=JSON.parse(fs.readFileSync(STATE_FILE,'utf8'))}catch{}; o[tf]=k; o.at=new Date().toISOString(); try{fs.writeFileSync(STATE_FILE,JSON.stringify(o))}catch(e){console.error(e)} }
 const logTrade=o=>{ let a=[];try{a=JSON.parse(fs.readFileSync(TRADE_LOG,'utf8'))}catch{};a.push(o);fs.writeFileSync(TRADE_LOG,JSON.stringify(a,null,2)) }
-async function check(){
-  let candles=await fetchCandles(); const v=validateData(candles); candles=v.clean
+
+// run ONE timeframe's live check (returns nothing; sends/logs as needed)
+async function checkOne(tframe){
+  const cfg=cfgFor(tframe), ts=new Date().toISOString()
+  let candles
+  try{ candles=await fetchCandles(500,cfg) }
+  catch(e){ console.error(`[${ts}] ${tframe} fetch failed: ${e.message}`); return }
+  const v=validateData(candles,cfg); candles=v.clean
+  if(candles.length<50){ console.log(`[${ts}] ${tframe} too few bars`); return }
   const closed=candles.slice(0,-1), forming=candles[candles.length-1]
-  const sig=analyse(closed,closed[closed.length-1].timestamp); const ts=new Date().toISOString()
-  if(sig.skipped){ console.log(`[${ts}] WAIT · ${sig.regime} · ${sig.why}`); return }
+  const sig=analyse(closed,closed[closed.length-1].timestamp,cfg)
+  if(sig.skipped){ console.log(`[${ts}] ${tframe} WAIT · ${sig.regime} · ${sig.why}`); return }
   const live=forming.close, R=Math.abs(sig.entry-sig.sl)
-  if((sig.direction==='BUY'?live<=sig.sl:live>=sig.sl)){ console.log(`[${ts}] SKIP: live past stop`); return }
-  if((sig.direction==='BUY'?sig.entry-live:live-sig.entry)>0.5*R){ console.log(`[${ts}] SKIP: stale (>0.5R drift)`); return }
+  if((sig.direction==='BUY'?live<=sig.sl:live>=sig.sl)){ console.log(`[${ts}] ${tframe} SKIP: live past stop`); return }
+  if((sig.direction==='BUY'?sig.entry-live:live-sig.entry)>0.5*R){ console.log(`[${ts}] ${tframe} SKIP: stale (>0.5R drift)`); return }
   const slip=+(live-sig.entry).toFixed(2)
-  const barTs=closed[closed.length-1].timestamp, key=`${sig.direction}|${barTs}`
-  if(key===loadKey()){ console.log(`[${ts}] already alerted this bar`); return }
-  saveKey(key); logTrade({ts,live,slip,...sig})
+  const barTs=closed[closed.length-1].timestamp, key=`${tframe}|${sig.direction}|${barTs}`
+  if(key===loadKey(tframe)){ console.log(`[${ts}] ${tframe} already alerted this bar`); return }
+  saveKey(tframe,key); logTrade({ts,tframe,live,slip,...sig})
   await sendTelegram(
-`🟡 <b>GOLD M5 — ${sig.direction}</b> (score ${sig.score}/100 ${sig.tier})
+`🟡 <b>GOLD ${tframe.toUpperCase()} — ${sig.direction}</b> (score ${sig.score}/100 ${sig.tier})
 Net ${sig.net} (bull ${sig.bull}/bear ${sig.bear}) · H1 ${sig.h1Trend} · ${sig.session}
 Planned $${sig.entry} · live $${live} (drift ${slip>=0?'+':''}${slip})
 SL $${sig.sl}  TP1 $${sig.tp1} TP2 $${sig.tp2} TP3 $${sig.tp3}
 Size ${sig.posSize}
 ⚠️ Source ${SOURCE} — must equal your execution venue. Trust the report, not this tier.`)
-  console.log(`[${ts}] ✅ ${sig.direction} net ${sig.net} · live $${live}`)
+  console.log(`[${ts}] ✅ ${tframe} ${sig.direction} net ${sig.net} · live $${live}`)
+}
+
+// run ALL live timeframes (15m + 1h) one after another
+async function check(){
+  for(const tf of LIVE_TFS){ await checkOne(tf) }
 }
 
 // ── ENTRY POINT ─────────────────────────────────────────────────
 const mode=process.argv[2]||'check'
 if(mode==='backtest'||mode==='report'){
-  // CHANGE #8: loud same-source reminder
-  console.log(`Timeframe: ${TFRAME} (${TD_INTERVAL}) · trend filter ${TREND_MIN}m · ATR band ${ATR_LOW}–${ATR_HIGH}%`)
+  const cfg=cfgFor(TFRAME)
+  console.log(`Timeframe: ${TFRAME} (${cfg.td}) · trend filter ${cfg.trendMin}m · ATR band ${cfg.atrLow}–${cfg.atrHigh}%`)
   console.log(`⚠️  BACKTEST SOURCE = ${SOURCE}. This MUST be the same venue you trade live, or the results are invalid.`)
   if(SOURCE==='yahoo') console.log('    Yahoo spot is patchy intraday — use OANDA for both backtest and live.')
   const raw = SOURCE==='twelvedata'
-    ? await fetchTwelveDataPaged(parseInt(process.env.BARS)||P.target)
-    : await fetchCandles(5000)
-  const v=validateData(raw.filter(x=>x.complete!==false))
-  console.log(`Data: ${v.clean.length} clean ${TFRAME} bars (~${(v.clean.length*TF_MIN/60/24).toFixed(1)}d) · validation:`, JSON.stringify(v.issues))
+    ? await fetchTwelveDataPaged(parseInt(process.env.BARS)||cfg.target,cfg)
+    : await fetchCandles(5000,cfg)
+  const v=validateData(raw.filter(x=>x.complete!==false),cfg)
+  console.log(`Data: ${v.clean.length} clean ${TFRAME} bars (~${(v.clean.length*cfg.min/60/24).toFixed(1)}d) · validation:`, JSON.stringify(v.issues))
   console.log(`Costs: base spread $${SPREAD_BASE} (×${SPREAD_NEWS_MULT} news, ×${SPREAD_ROLLOVER_MULT} rollover, ×${SPREAD_VOL_MULT} volatile), entry slip $${ENTRY_SLIP}, stop slip $${STOP_SLIP}/$${STOP_SLIP_FAST} fast, commission $${COMMISSION_USD}`)
   console.log(`Governor: daily ${DAILY_LOSS_LIMIT_R}R · consec ${MAX_CONSEC_LOSSES} · kill ${KILL_DD_R}R DD\n`)
-  const bt=backtest(v.clean)
+  const bt=backtest(v.clean,cfg)
   const rep=fullReport(bt)
-  if(mode==='report'){ fs.writeFileSync(REPORT_FILE,JSON.stringify({generated:new Date().toISOString(),source:SOURCE,dataIssues:v.issues,...bt,report:rep},null,2)); console.log(`Full report → ${REPORT_FILE}\n`) }
+  if(mode==='report'){ fs.writeFileSync(REPORT_FILE,JSON.stringify({generated:new Date().toISOString(),timeframe:TFRAME,source:SOURCE,dataIssues:v.issues,...bt,report:rep},null,2)); console.log(`Full report → ${REPORT_FILE}\n`) }
   console.log(JSON.stringify(mode==='report'?rep:{overall:rep.overall,governor:rep.governor,bootstrap:rep.bootstrap,outSample:rep.outSample},null,2))
 } else { await check() }
