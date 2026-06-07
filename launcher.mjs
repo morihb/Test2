@@ -13,6 +13,7 @@ const TG_TOKEN       = process.env.TG_TOKEN        || '8970765755:AAHexBHcEKLnnB
 const TWELVEDATA_KEY = process.env.TWELVEDATA_KEY  || 'dbf374976088424aa703db6034942e19'
 const LIVE_TFS       = (process.env.LIVE_TFS || '15m,1h').split(',').map(s => s.trim()).filter(Boolean)
 const SOURCE         = process.env.GOLD_SOURCE || (process.env.OANDA_TOKEN ? 'oanda' : 'twelvedata')
+const TG_CHAT        = process.env.TG_CHAT || '1408577116'
 const STATE_FILE     = './bot_state.json'
 const TRADE_LOG      = './trade_log.json'
 
@@ -34,6 +35,7 @@ async function runSignalCycle() {
         TWELVEDATA_KEY,
         TG_TOKEN,
         GOLD_SOURCE: SOURCE,
+        TG_CHAT,
       }
 
       const { stdout, stderr } = await exec('node', ['gold-ai.mjs', 'check'], {
