@@ -7,10 +7,21 @@ import fs from 'fs'
 const TG_TOKEN     = process.env.TG_TOKEN        || '8970765755:AAHexBHcEKLnnBsly5AIOUAPgftnEl6_9Hg'
 const ADMIN_ID     = process.env.ADMIN_CHAT_ID   || '1408577116'
 const CHANNEL      = process.env.CHANNEL_USERNAME || '@MH_Signals'
-const USDT_ADDRESS = process.env.USDT_ADDRESS    || 'TEST_USDT_ADDRESS'
-const BTC_ADDRESS  = process.env.BTC_ADDRESS     || 'TEST_BTC_ADDRESS'
-const SUB_FILE     = './subscribers.json'
-const PKG_FILE     = './packages.json'
+const SUB_FILE      = './subscribers.json'
+const PKG_FILE      = './packages.json'
+const SETTINGS_FILE = './settings.json'
+
+// ── SETTINGS (wallets etc — editable from Telegram) ──────────────────────────
+const DEFAULT_SETTINGS = {
+  usdt_address: process.env.USDT_ADDRESS || 'TEST_USDT_ADDRESS',
+  btc_address:  process.env.BTC_ADDRESS  || 'TEST_BTC_ADDRESS',
+}
+function loadSettings() {
+  try { return { ...DEFAULT_SETTINGS, ...JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')) } }
+  catch { return DEFAULT_SETTINGS }
+}
+function saveSettings(s) { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2)) }
+function getSetting(k) { return loadSettings()[k] }
 
 if (!TG_TOKEN) { console.error('❌  TG_TOKEN not set'); process.exit(1) }
 
@@ -39,10 +50,13 @@ function nextPkgId() {
   return `p${ids.length ? Math.max(...ids) + 1 : 1}`
 }
 
-// ── PAYMENT METHODS ───────────────────────────────────────────────────────────
-const PAY_METHODS = {
-  usdt: { label:'💵 USDT (TRC-20)', address: USDT_ADDRESS, coin:'USDT' },
-  btc:  { label:'₿  Bitcoin',       address: BTC_ADDRESS,  coin:'BTC'  },
+// ── PAYMENT METHODS (dynamic — reads from settings.json) ──────────────────────
+function getPayMethods() {
+  const s = loadSettings()
+  return {
+    usdt: { label:'💵 USDT (TRC-20)', address: s.usdt_address, coin:'USDT' },
+    btc:  { label:'₿  Bitcoin',       address: s.btc_address,  coin:'BTC'  },
+  }
 }
 
 // ── STORAGE ───────────────────────────────────────────────────────────────────
@@ -140,13 +154,13 @@ async function screenPickPayment(chatId, pkgId, msgId) {
   const pkg = getPackage(pkgId)
   if (!pkg) return
   upsertSub(chatId, { status:'pending_payment', pendingPkg:pkgId, msgId })
-  const rows = Object.entries(PAY_METHODS).map(([key, m]) => [{ text:m.label, callback_data:`pay_${pkgId}_${key}` }])
+  const rows = Object.entries(getPayMethods()).map(([key, m]) => [{ text:m.label, callback_data:`pay_${pkgId}_${key}` }])
   rows.push([{ text:'⬅️ Back', callback_data:'back_packages' }])
   await editMsg(chatId, msgId, `📦 <b>${pkg.label} Plan — $${pkg.price}</b>\n\nChoose your payment method:`, rows)
 }
 
 async function screenPayment(chatId, pkgId, methodKey, msgId) {
-  const pkg = getPackage(pkgId), method = PAY_METHODS[methodKey]
+  const pkg = getPackage(pkgId), method = getPayMethods()[methodKey]
   if (!pkg || !method) return
   upsertSub(chatId, { status:'pending_payment', pendingPkg:pkgId, pendingMethod:methodKey, msgId })
   const rows = [
@@ -180,7 +194,7 @@ async function screenConfirmPending(chatId, pkgId, methodKey, msgId) {
 
 User: <a href="tg://user?id=${chatId}">${chatId}</a>
 Plan: ${pkg?.label} — $${pkg?.price}
-Method: ${PAY_METHODS[methodKey]?.label}
+Method: ${getPayMethods()[methodKey]?.label}
 Claimed: ${new Date().toLocaleString()}
 
 /approve ${chatId}  or  /deny ${chatId}`)
@@ -327,17 +341,22 @@ async function screenAdminPending(chatId, msgId) {
 }
 
 async function screenAdminWallets(chatId, msgId) {
-  const rows = [[{ text:'⬅️ Back', callback_data:'adm_home' }]]
+  const s = loadSettings()
+  const rows = [
+    [{ text:'✏️ Edit USDT Address', callback_data:'adm_wallet_edit_usdt' }],
+    [{ text:'✏️ Edit BTC Address',  callback_data:'adm_wallet_edit_btc'  }],
+    [{ text:'⬅️ Back',              callback_data:'adm_home'             }],
+  ]
   await editMsg(chatId, msgId,
 `💳 <b>Payment Addresses</b>
 
-USDT (TRC-20):
-<code>${USDT_ADDRESS}</code>
+💵 USDT (TRC-20):
+<code>${s.usdt_address}</code>
 
-Bitcoin:
-<code>${BTC_ADDRESS}</code>
+₿ Bitcoin:
+<code>${s.btc_address}</code>
 
-To change addresses, update the env vars USDT_ADDRESS and BTC_ADDRESS and restart.`, rows)
+Tap a button below to update an address.`, rows)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -503,6 +522,22 @@ Users will see it immediately on /start.
         return send(chatId, `📢 Broadcast sent!\n\n✅ Delivered: ${result.sent}\n❌ Failed: ${result.failed}`)
       }
 
+      // ── WALLET EDIT steps ──
+      if (step === 'edit_usdt') {
+        const s = loadSettings()
+        s.usdt_address = text.trim()
+        saveSettings(s)
+        clearSession(chatId)
+        return send(chatId, `✅ <b>USDT address updated!</b>\n\n<code>${text.trim()}</code>\n\n/admin — back to panel`)
+      }
+      if (step === 'edit_btc') {
+        const s = loadSettings()
+        s.btc_address = text.trim()
+        saveSettings(s)
+        clearSession(chatId)
+        return send(chatId, `✅ <b>BTC address updated!</b>\n\n<code>${text.trim()}</code>\n\n/admin — back to panel`)
+      }
+
       // Cancel session if user sends a command
       if (text.startsWith('/')) clearSession(chatId)
     }
@@ -632,6 +667,16 @@ Always use a broker with tight XAUUSD spreads.`)
     const admDeny = data.match(/^adm_deny_(\d+)$/)
     if (admDeny) { await adminDeny(chatId, admDeny[1]); return screenAdminPending(chatId, msgId) }
 
+    // Wallet edit buttons
+    if (data === 'adm_wallet_edit_usdt') {
+      setSession(chatId, 'edit_usdt', {})
+      return editMsg(chatId, msgId, `✏️ <b>Update USDT (TRC-20) Address</b>\n\nSend your new USDT wallet address:`, [[{ text:'❌ Cancel', callback_data:'adm_wallets' }]])
+    }
+    if (data === 'adm_wallet_edit_btc') {
+      setSession(chatId, 'edit_btc', {})
+      return editMsg(chatId, msgId, `✏️ <b>Update Bitcoin Address</b>\n\nSend your new BTC wallet address:`, [[{ text:'❌ Cancel', callback_data:'adm_wallets' }]])
+    }
+
     // Broadcast
     if (data === 'adm_broadcast') {
       setSession(chatId, 'broadcast_msg', {})
@@ -649,14 +694,17 @@ async function startPolling() {
   let offset = 0
   while (true) {
     try {
-      const res = await fetch(`${API}/getUpdates?offset=${offset}&timeout=30&allowed_updates=["message","callback_query"]`)
+      const res = await fetch(`${API}/getUpdates?offset=${offset}&timeout=1&allowed_updates=["message","callback_query"]`)
       const j   = await res.json()
-      if (!j.ok) { await sleep(5000); continue }
-      for (const upd of j.result || []) {
+      if (!j.ok) { await sleep(3000); continue }
+      const updates = j.result || []
+      for (const upd of updates) {
         offset = upd.update_id + 1
         handleUpdate(upd).catch(e => console.error('[update error]', e.message))
       }
-    } catch (e) { console.error('[poll error]', e.message); await sleep(5000) }
+      // Small pause only when idle to avoid hammering Telegram
+      if (!updates.length) await sleep(300)
+    } catch (e) { console.error('[poll error]', e.message); await sleep(3000) }
   }
 }
 
