@@ -113,19 +113,34 @@ function startTunnel() {
 }
 
 // ── Auto-register webhook URL in Twilio sandbox ───────────────
+// Twilio sandbox webhook must be set via the WhatsApp Sandbox resource
 async function registerTwilioWebhook(webhookUrl) {
   const t = tag('TUNNEL', C.magenta)
   try {
     const creds  = Buffer.from(`${process.env.TWILIO_SID}:${process.env.TWILIO_TOKEN}`).toString('base64')
-    const params = new URLSearchParams({ SandboxWebhookUrl: webhookUrl, Method: 'POST' })
+
+    // Correct endpoint: update the sandbox inbound webhook URL
+    const params = new URLSearchParams({
+      InboundRequestUrl: webhookUrl,
+      InboundMethod:     'POST',
+    })
     const res = await fetch(
-      `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Sandbox.json`,
+      `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/IncomingPhoneNumbers/Sandbox/WhatsApp.json`,
       { method:'POST', headers:{ Authorization:`Basic ${creds}`, 'Content-Type':'application/x-www-form-urlencoded' }, body:params.toString() }
     )
-    if (res.ok) console.log(`${t} ${C.green}✅ Twilio webhook registered automatically${C.reset}`)
-    else        console.log(`${t} ${C.yellow}⚠️  Auto-register failed (${res.status}) — paste URL manually in Twilio sandbox settings${C.reset}`)
+
+    if (res.ok) {
+      console.log(`${t} ${C.green}✅ Twilio webhook registered automatically${C.reset}`)
+    } else {
+      // Fallback: print the URL clearly so user can paste it manually (takes 5 seconds)
+      console.log(`${t} ${C.yellow}⚠️  Could not auto-register (${res.status})${C.reset}`)
+      console.log(`${t} ${C.yellow}👉 Paste this URL in Twilio Sandbox settings manually:${C.reset}`)
+      console.log(`${t} ${C.green}   ${webhookUrl}${C.reset}`)
+      console.log(`${t} ${C.yellow}   twilio.com/console → Messaging → Try it out → Send a WhatsApp message → Sandbox Settings${C.reset}`)
+    }
   } catch(e) {
     console.log(`${t} ${C.yellow}⚠️  Could not auto-register: ${e.message}${C.reset}`)
+    console.log(`${t} ${C.green}👉 Webhook URL: ${webhookUrl}${C.reset}`)
   }
 }
 
