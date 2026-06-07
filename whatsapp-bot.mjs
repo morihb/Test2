@@ -24,7 +24,7 @@ import fs   from 'fs'
 // ── CREDENTIALS (baked in) ────────────────────────────────────
 const ENV = {
   TWILIO_SID:   'AC749a3893c6d15036e9fbaf7d6cdd9b56',
-  TWILIO_TOKEN: '431e427643597a2521f2103a68300ee3',
+  TWILIO_TOKEN: '96d7b0fd0a68de1e4976ce51359eda5b',
   TWILIO_FROM:  'whatsapp:+14155238886',
   ADMIN_WA:     'whatsapp:+96181826800',
   USDT_ADDRESS: 'TEST_USDT_ADDRESS',
