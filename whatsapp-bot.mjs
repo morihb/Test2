@@ -306,7 +306,7 @@ const server = http.createServer(async (req, res) => {
     req.on('end', async () => {
       try {
         const data = parseForm(raw)
-        const from = data.From || ''
+        const from = (data.From || '').replace('whatsapp: ', 'whatsapp:+')
         const body = data.Body || ''
         console.log(`[msg] ${from}: ${body.slice(0,80)}`)
         await handleMessage(from, body)
