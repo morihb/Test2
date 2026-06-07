@@ -1,81 +1,118 @@
-// ─────────────────────────────────────────────────────────────────────────────
-//  launcher.mjs  —  runs subscription bot + signal checker in one process
-//  Run: node launcher.mjs
-// ─────────────────────────────────────────────────────────────────────────────
-import { broadcastSignal } from './bot-subscription.mjs'
-import fs from 'fs'
+// ─────────────────────────────────────────────────────────────
+//  GOLD AI — Master Launcher
+//  Runs all three services in ONE process:
+//    1. Telegram subscription bot  (bot-subscription.mjs)
+//    2. WhatsApp subscription bot  (whatsapp-bot.mjs)
+//    3. Signal checker             (gold-ai.mjs — check mode)
+//
+//  Run:  node launcher.mjs
+// ─────────────────────────────────────────────────────────────
+import { spawn } from 'child_process'
+import path from 'path'
+import { fileURLToPath } from 'url'
 
-// ── Signal checker interval (minutes) — must match your live TF ──────────────
-const CHECK_EVERY_MS = (parseInt(process.env.CHECK_MIN) || 15) * 60 * 1000
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-// ── Credentials (env overrides these defaults) ────────────────────────────────
-const TG_TOKEN       = process.env.TG_TOKEN        || '8970765755:AAHexBHcEKLnnBsly5AIOUAPgftnEl6_9Hg'
-const TWELVEDATA_KEY = process.env.TWELVEDATA_KEY  || 'dbf374976088424aa703db6034942e19'
-const LIVE_TFS       = (process.env.LIVE_TFS || '15m,1h').split(',').map(s => s.trim()).filter(Boolean)
-const SOURCE         = process.env.GOLD_SOURCE || (process.env.OANDA_TOKEN ? 'oanda' : 'twelvedata')
-const TG_CHAT        = process.env.TG_CHAT || '1408577116'
-const STATE_FILE     = './bot_state.json'
-const TRADE_LOG      = './trade_log.json'
+// ── CREDENTIALS (baked in — real env vars override if set) ───
+const ENV = {
+  // Telegram
+  TG_TOKEN:         '8970765755:AAHexBHcEKLnnBsly5AIOUAPgftnEl6_9Hg',
+  ADMIN_CHAT_ID:    '1408577116',
+  CHANNEL_USERNAME: '@MH_Signals',
 
-// ── Signal cycle: spawn gold-ai.mjs check with correct env ───────────────────
-async function runSignalCycle() {
-  const ts = new Date().toISOString()
-  console.log(`[${ts}] 🔍 Running signal check for: ${LIVE_TFS.join(', ')}`)
+  // WhatsApp (Green API)
+  WA_INSTANCE:      '7107645470',
+  WA_TOKEN:         '37e51f5f69794180acf390f80ee89bcac29ceb0748b148f1a4',
+  ADMIN_WA:         '96181826800@c.us',
 
-  for (const tf of LIVE_TFS) {
-    try {
-      const { execFile } = await import('child_process')
-      const { promisify } = await import('util')
-      const exec = promisify(execFile)
+  // Signal data
+  TWELVEDATA_KEY:   'dbf374976088424aa703db6034942e19',
+  LIVE_TFS:         '15m,1h',
 
-      // Pass all credentials into the child process env
-      const env = {
-        ...process.env,
-        LIVE_TFS: tf,
-        TWELVEDATA_KEY,
-        TG_TOKEN,
-        GOLD_SOURCE: SOURCE,
-        TG_CHAT,
-      }
-
-      const { stdout, stderr } = await exec('node', ['gold-ai.mjs', 'check'], {
-        env,
-        timeout: 60000,
-      })
-
-      if (stdout) console.log(`[${tf}]`, stdout.trim())
-      if (stderr) console.error(`[${tf} err]`, stderr.trim())
-
-      // If a signal fired, broadcast to all active subscribers
-      if (stdout.includes('✅')) {
-        const log = (() => {
-          try { return JSON.parse(fs.readFileSync(TRADE_LOG, 'utf8')) } catch { return [] }
-        })()
-        const latest = log[log.length - 1]
-        if (latest && latest.tframe === tf && Date.now() - new Date(latest.ts).getTime() < 5 * 60000) {
-          const sig = latest
-          const msgText =
-`🟡 <b>GOLD ${tf.toUpperCase()} — ${sig.direction}</b> (score ${sig.score}/100 ${sig.tier})
-Net ${sig.net} · H1 ${sig.h1Trend} · ${sig.session}
-Entry $${sig.entry} · SL $${sig.sl}
-TP1 $${sig.tp1} · TP2 $${sig.tp2} · TP3 $${sig.tp3}
-Size: ${sig.posSize}
-⚠️ Manage risk. Not financial advice.`
-          const result = await broadcastSignal(msgText)
-          console.log(`[${tf}] 📡 Broadcast: sent=${result.sent} failed=${result.failed}`)
-        }
-      }
-    } catch (e) {
-      console.error(`[${tf}] cycle error: ${e.message}`)
-    }
-  }
+  // Payments (replace with real wallet addresses)
+  USDT_ADDRESS:     'TEST_USDT_ADDRESS',
+  BTC_ADDRESS:      'TEST_BTC_ADDRESS',
 }
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-console.log('🚀 Launcher started')
-console.log(`   Signal check every ${CHECK_EVERY_MS / 60000} min`)
-console.log(`   Timeframes: ${LIVE_TFS.join(', ')}`)
-console.log(`   Data source: ${SOURCE} (TwelveData key: ${TWELVEDATA_KEY.slice(0,8)}…)`)
+// Merge: baked-in values are defaults; real env vars always win
+for (const [k, v] of Object.entries(ENV)) {
+  if (!process.env[k]) process.env[k] = v
+}
 
-runSignalCycle()
-setInterval(runSignalCycle, CHECK_EVERY_MS)
+const CHECK_EVERY_MS = (parseInt(process.env.CHECK_MIN) || 15) * 60 * 1000
+
+// ── Colour helpers ────────────────────────────────────────────
+const C = {
+  reset:  '\x1b[0m',
+  yellow: '\x1b[33m',
+  cyan:   '\x1b[36m',
+  green:  '\x1b[32m',
+  red:    '\x1b[31m',
+}
+const tag = (label, color) => `${color}[${label}]${C.reset}`
+
+// ── Spawn a long-running service with auto-restart ────────────
+function spawnService(label, color, file, args = []) {
+  const t = tag(label, color)
+  const child = spawn(process.execPath, [file, ...args], {
+    env: { ...process.env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  child.stdout.on('data', d => process.stdout.write(`${t} ${d}`))
+  child.stderr.on('data', d => process.stderr.write(`${t} ${C.red}${d}${C.reset}`))
+  child.on('exit', (code, signal) => {
+    console.log(`${t} exited (code=${code} signal=${signal}) — restarting in 5s…`)
+    setTimeout(() => spawnService(label, color, file, args), 5000)
+  })
+  child.on('error', err => console.error(`${t} spawn error: ${err.message}`))
+  console.log(`${t} started (pid ${child.pid})`)
+  return child
+}
+
+// ── Spawn a one-shot child (signal checker) ───────────────────
+function spawnOnce(label, color, file, args = []) {
+  const t = tag(label, color)
+  const child = spawn(process.execPath, [file, ...args], {
+    env: { ...process.env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  child.stdout.on('data', d => process.stdout.write(`${t} ${d}`))
+  child.stderr.on('data', d => process.stderr.write(`${t} ${C.red}${d}${C.reset}`))
+  child.on('exit', code => { if (code !== 0) console.log(`${t} finished (code ${code})`) })
+  return child
+}
+
+const resolve = f => path.join(__dirname, f)
+
+// ── Startup banner ────────────────────────────────────────────
+console.log(`
+╔══════════════════════════════════════╗
+║   🟡  GOLD AI — Master Launcher      ║
+╚══════════════════════════════════════╝
+  Telegram bot : ${C.green}✅ ${process.env.TG_TOKEN.slice(0,12)}…${C.reset}
+  WhatsApp bot : ${C.green}✅ instance ${process.env.WA_INSTANCE}${C.reset}
+  Admin WA     : ${process.env.ADMIN_WA}
+  Signal data  : ${C.green}✅ TwelveData${C.reset}
+  Check every  : ${CHECK_EVERY_MS / 60000} min
+`)
+
+// ── 1. Telegram subscription bot ─────────────────────────────
+spawnService('TG-BOT', C.cyan, resolve('bot-subscription.mjs'))
+
+// ── 2. WhatsApp subscription bot ─────────────────────────────
+spawnService('WA-BOT', C.yellow, resolve('whatsapp-bot.mjs'))
+
+// ── 3. Signal checker — runs every CHECK_EVERY_MS ────────────
+function runSignalCheck() {
+  spawnOnce('SIGNALS', C.green, resolve('gold-ai.mjs'), ['check'])
+}
+
+console.log(`${tag('SIGNALS', C.green)} first check in 10s, then every ${CHECK_EVERY_MS / 60000} min`)
+setTimeout(() => {
+  runSignalCheck()
+  setInterval(runSignalCheck, CHECK_EVERY_MS)
+}, 10_000)
+
+// ── Graceful shutdown ─────────────────────────────────────────
+process.on('SIGINT',  () => { console.log('\n🛑  Shutting down…'); process.exit(0) })
+process.on('SIGTERM', () => { console.log('\n🛑  Shutting down…'); process.exit(0) })
