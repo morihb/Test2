@@ -8,40 +8,34 @@ import fs from 'fs'
 // ── Signal checker interval (minutes) — must match your live TF ──────────────
 const CHECK_EVERY_MS = (parseInt(process.env.CHECK_MIN) || 15) * 60 * 1000
 
-// ── Import gold-ai logic ─────────────────────────────────────────────────────
-// We inline the minimal fetch+analyse+sendSignal loop here so we don't need
-// to modify gold-ai.mjs at all. It still works standalone too.
+// ── Credentials (env overrides these defaults) ────────────────────────────────
+const TG_TOKEN       = process.env.TG_TOKEN        || '8970765755:AAHexBHcEKLnnBsly5AIOUAPgftnEl6_9Hg'
+const TWELVEDATA_KEY = process.env.TWELVEDATA_KEY  || 'dbf374976088424aa703db6034942e19'
+const LIVE_TFS       = (process.env.LIVE_TFS || '15m,1h').split(',').map(s => s.trim()).filter(Boolean)
+const SOURCE         = process.env.GOLD_SOURCE || (process.env.OANDA_TOKEN ? 'oanda' : 'twelvedata')
+const STATE_FILE     = './bot_state.json'
+const TRADE_LOG      = './trade_log.json'
 
-const TG_TOKEN   = process.env.TG_TOKEN || '8970765755:AAHexBHcEKLnnBsly5AIOUAPgftnEl6_9Hg'
-const LIVE_TFS   = (process.env.LIVE_TFS || '15m,1h').split(',').map(s => s.trim()).filter(Boolean)
-const SOURCE     = process.env.GOLD_SOURCE || (process.env.OANDA_TOKEN ? 'oanda' : process.env.TWELVEDATA_KEY ? 'twelvedata' : 'yahoo')
-const STATE_FILE = './bot_state.json'
-const TRADE_LOG  = './trade_log.json'
-
-// Re-export the sendSignal hook — gold-ai's checkOne() will call this
-// instead of (or in addition to) the plain Telegram message
-// Patch: we monkey-patch the broadcast into the signal check cycle.
-// Each time gold-ai.mjs finds a signal it calls broadcastSignal automatically.
-
-// ── Patch: wrap gold-ai check() to also broadcast ────────────────────────────
-// Since gold-ai.mjs is a standalone script, we replicate ONLY the live-check
-// call here and wire broadcastSignal in. Strategy/analysis code untouched.
-
+// ── Signal cycle: spawn gold-ai.mjs check with correct env ───────────────────
 async function runSignalCycle() {
   const ts = new Date().toISOString()
   console.log(`[${ts}] 🔍 Running signal check for: ${LIVE_TFS.join(', ')}`)
 
   for (const tf of LIVE_TFS) {
     try {
-      // Dynamically spawn gold-ai check for this TF and capture output
-      // We use a child process so gold-ai.mjs is 100% untouched
       const { execFile } = await import('child_process')
       const { promisify } = await import('util')
       const exec = promisify(execFile)
 
-      // Run gold-ai check — it sends its own Telegram message to TG_CHAT
-      // broadcastSignal is called separately below if a signal fired
-      const env = { ...process.env, LIVE_TFS: tf }
+      // Pass all credentials into the child process env
+      const env = {
+        ...process.env,
+        LIVE_TFS: tf,
+        TWELVEDATA_KEY,
+        TG_TOKEN,
+        GOLD_SOURCE: SOURCE,
+      }
+
       const { stdout, stderr } = await exec('node', ['gold-ai.mjs', 'check'], {
         env,
         timeout: 60000,
@@ -50,9 +44,8 @@ async function runSignalCycle() {
       if (stdout) console.log(`[${tf}]`, stdout.trim())
       if (stderr) console.error(`[${tf} err]`, stderr.trim())
 
-      // If a signal was fired (gold-ai logs "✅ TF DIRECTION"), broadcast to subscribers
+      // If a signal fired, broadcast to all active subscribers
       if (stdout.includes('✅')) {
-        // Parse the relevant line and read last logged signal from trade log
         const log = (() => {
           try { return JSON.parse(fs.readFileSync(TRADE_LOG, 'utf8')) } catch { return [] }
         })()
@@ -80,7 +73,7 @@ Size: ${sig.posSize}
 console.log('🚀 Launcher started')
 console.log(`   Signal check every ${CHECK_EVERY_MS / 60000} min`)
 console.log(`   Timeframes: ${LIVE_TFS.join(', ')}`)
+console.log(`   Data source: ${SOURCE} (TwelveData key: ${TWELVEDATA_KEY.slice(0,8)}…)`)
 
-// Run once immediately, then on interval
 runSignalCycle()
 setInterval(runSignalCycle, CHECK_EVERY_MS)
