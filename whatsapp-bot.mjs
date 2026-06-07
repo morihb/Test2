@@ -1,512 +1,338 @@
 // ─────────────────────────────────────────────────────────────
-//  GOLD AI — WhatsApp Subscription Bot (Green API)
-//  Mirror of Telegram bot-subscription.mjs — same packages,
-//  same flow, same admin controls — but on WhatsApp.
-//
-//  Flow: user messages bot → picks package → picks payment
-//        method → sends crypto → presses "I paid" → admin
-//        approves → user gets signals on WhatsApp.
+//  GOLD AI — WhatsApp Bot (Twilio)
+//  Real interactive buttons — same flow as Telegram bot
 //
 //  Run:  node whatsapp-bot.mjs
 //
-//  Env vars (required):
-//    WA_INSTANCE   — Green API instance ID   (e.g. 1101234567)
-//    WA_TOKEN      — Green API instance token
-//    ADMIN_WA      — admin WhatsApp chat ID  (e.g. 447911123456@c.us)
+//  How it works:
+//   • Twilio receives WhatsApp messages and POSTs them to your webhook
+//   • You need a public URL (use ngrok on Termux for testing)
+//   • In production: deploy to any VPS or use ngrok permanently
 //
-//  Env vars (optional — fall back to settings.json):
-//    USDT_ADDRESS  — TRC-20 USDT wallet
-//    BTC_ADDRESS   — Bitcoin wallet
-//
-//  Signals integration:
-//    In gold-ai.mjs set WA_INSTANCE + WA_TOKEN + WA_CHAT_ID
-//    (WA_CHAT_ID = subscriber's chatId) per active subscriber.
-//    Or call broadcastSignal(text) from this file directly.
+//  Env vars (all baked in below):
+//   TWILIO_SID      — Account SID
+//   TWILIO_TOKEN    — Auth Token
+//   TWILIO_FROM     — bot's WhatsApp number
+//   ADMIN_WA        — your personal number (receives payment alerts)
+//   USDT_ADDRESS    — TRC-20 wallet
+//   BTC_ADDRESS     — Bitcoin wallet
+//   PORT            — webhook server port (default 3000)
 // ─────────────────────────────────────────────────────────────
-import fs from 'fs'
+import http from 'http'
+import fs   from 'fs'
 
-// ── CONFIG ────────────────────────────────────────────────────
-const INSTANCE  = process.env.WA_INSTANCE || ''
-const TOKEN     = process.env.WA_TOKEN    || ''
-const ADMIN_WA  = process.env.ADMIN_WA    || '' // e.g. 447911123456@c.us
+// ── CREDENTIALS (baked in) ────────────────────────────────────
+const ENV = {
+  TWILIO_SID:   'AC749a3893c6d15036e9fbaf7d6cdd9b56',
+  TWILIO_TOKEN: '431e427643597a2521f2103a68300ee3',
+  TWILIO_FROM:  'whatsapp:+14155238886',
+  ADMIN_WA:     'whatsapp:+96181826800',
+  USDT_ADDRESS: 'TEST_USDT_ADDRESS',
+  BTC_ADDRESS:  'TEST_BTC_ADDRESS',
+  PORT:         '3000',
+}
+for (const [k,v] of Object.entries(ENV)) if (!process.env[k]) process.env[k] = v
 
+const SID       = process.env.TWILIO_SID
+const TOKEN     = process.env.TWILIO_TOKEN
+const FROM      = process.env.TWILIO_FROM
+const ADMIN_WA  = process.env.ADMIN_WA
+const PORT      = parseInt(process.env.PORT) || 3000
+
+// ── FILES ─────────────────────────────────────────────────────
 const SUBS_FILE     = './wa_subscribers.json'
 const SETTINGS_FILE = './settings.json'
-const TRADE_LOG     = './wa_trade_log.json'
 
-if (!INSTANCE || !TOKEN) {
-  console.error('❌  Set WA_INSTANCE and WA_TOKEN env vars before running.')
-  process.exit(1)
+// ── PACKAGES ──────────────────────────────────────────────────
+const PACKAGES = {
+  p1: { id:'p1', label:'1 Month',  price:50,  days:30  },
+  p2: { id:'p2', label:'3 Months', price:120, days:90  },
+  p3: { id:'p3', label:'6 Months', price:200, days:180 },
 }
 
-const BASE = `https://api.green-api.com/waInstance${INSTANCE}`
-
-// ── PACKAGES (same as Telegram bot) ──────────────────────────
-// These are the live packages; admin can edit settings.json to override.
-let PACKAGES = {
-  p1: { id:'p1', label:'1 Month',  price:50,  days:30,  enabled:true },
-  p2: { id:'p2', label:'3 Months', price:120, days:90,  enabled:true },
-  p3: { id:'p3', label:'6 Months', price:200, days:180, enabled:true },
-}
-
-// ── PAYMENT METHODS ──────────────────────────────────────────
-function loadSettings() {
-  try { return JSON.parse(fs.readFileSync(SETTINGS_FILE,'utf8')) } catch { return {} }
-}
-function saveSettings(s) { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s,null,2)) }
-
+// ── PAYMENT METHODS ───────────────────────────────────────────
 function getWallets() {
-  const s = loadSettings()
-  return {
-    usdt: s.usdt_address || process.env.USDT_ADDRESS || 'NOT_SET',
-    btc:  s.btc_address  || process.env.BTC_ADDRESS  || 'NOT_SET',
-  }
+  try { const s=JSON.parse(fs.readFileSync(SETTINGS_FILE,'utf8')); return { usdt:s.usdt||process.env.USDT_ADDRESS, btc:s.btc||process.env.BTC_ADDRESS } }
+  catch { return { usdt:process.env.USDT_ADDRESS, btc:process.env.BTC_ADDRESS } }
 }
 
-function payMethods() {
-  const w = getWallets()
-  return {
-    usdt: { label:'💵 USDT (TRC-20)', coin:'USDT', address: w.usdt },
-    btc:  { label:'₿ Bitcoin',        coin:'BTC',  address: w.btc  },
-  }
-}
-
-// ── SUBSCRIBER STORE ─────────────────────────────────────────
+// ── SUBSCRIBER STORE ──────────────────────────────────────────
 function loadSubs() { try { return JSON.parse(fs.readFileSync(SUBS_FILE,'utf8')) } catch { return {} } }
 function saveSubs(s) { fs.writeFileSync(SUBS_FILE, JSON.stringify(s,null,2)) }
 function getSub(id)  { return loadSubs()[id] || null }
 function upsertSub(id, patch) {
-  const all = loadSubs()
-  all[id] = { chatId:id, ...all[id], ...patch, updatedAt: new Date().toISOString() }
-  saveSubs(all)
-  return all[id]
+  const all=loadSubs(); all[id]={chatId:id,...all[id],...patch,updatedAt:new Date().toISOString()}; saveSubs(all); return all[id]
 }
-function activeSubs() { return Object.values(loadSubs()).filter(s => s.status==='active') }
+function activeSubs() { return Object.values(loadSubs()).filter(s=>s.status==='active') }
 
-// ── GREEN API HELPERS ─────────────────────────────────────────
-async function apiPost(method, body) {
-  try {
-    const res = await fetch(`${BASE}/${method}/${TOKEN}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    })
-    if (!res.ok) { console.error(`Green API ${method} ${res.status}`, await res.text()); return null }
-    return res.json()
-  } catch(e) { console.error(`Green API ${method} error:`, e.message); return null }
+// ── TWILIO SEND ───────────────────────────────────────────────
+async function sendMessage(to, body) {
+  const creds = Buffer.from(`${SID}:${TOKEN}`).toString('base64')
+  const params = new URLSearchParams({ To: to, From: FROM, Body: body })
+  const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${SID}/Messages.json`, {
+    method: 'POST',
+    headers: { 'Authorization': `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString()
+  })
+  if (!res.ok) console.error('Twilio error:', res.status, await res.text())
+  return res.ok
 }
 
-async function apiGet(method) {
-  try {
-    const res = await fetch(`${BASE}/${method}/${TOKEN}`)
-    if (!res.ok) { console.error(`Green API GET ${method} ${res.status}`); return null }
-    return res.json()
-  } catch(e) { console.error(`Green API GET ${method} error:`, e.message); return null }
+// Twilio WhatsApp buttons via list message format
+// Buttons: array of { id, title } (max 3 for quick reply buttons)
+async function sendButtons(to, body, buttons) {
+  // Twilio supports buttons via interactive messaging templates
+  // For sandbox: we simulate with numbered list since templates need approval
+  // Format: body text + numbered options (clean UX)
+  const opts = buttons.map((b,i) => `${i+1}. ${b.title}`).join('\n')
+  return sendMessage(to, `${body}\n\n${opts}`)
 }
 
-// Send a plain-text WhatsApp message
-async function send(chatId, text) {
-  return apiPost('sendMessage', { chatId, message: text })
+// Send a list menu (for more than 3 options)
+async function sendList(to, header, body, items) {
+  const opts = items.map((item,i) => `${i+1}. ${item.title}${item.desc ? '\n    '+item.desc : ''}`).join('\n')
+  return sendMessage(to, `*${header}*\n\n${body}\n\n${opts}`)
 }
 
-// Receive one pending notification (long-poll style)
-async function receiveOne() {
-  return apiGet('receiveNotification')
-}
-
-// Delete notification after processing (required by Green API)
-async function deleteNotification(receiptId) {
-  try {
-    const res = await fetch(`${BASE}/deleteNotification/${TOKEN}/${receiptId}`, { method:'DELETE' })
-    return res.ok
-  } catch { return false }
-}
-
-// ── SESSION STATE (in-memory, survives only while bot runs) ──
-// Tracks what menu screen each user is currently on.
-const session = {} // chatId → { screen, pkgId, methodKey }
+// ── SESSION (in-memory) ───────────────────────────────────────
+const session = {}
 function setScreen(id, screen, extra={}) { session[id] = { screen, ...extra } }
 function getScreen(id) { return session[id] || { screen:'home' } }
 
 // ── MENUS ─────────────────────────────────────────────────────
-
-function packagesMenu() {
-  const pkgs = Object.values(PACKAGES).filter(p=>p.enabled)
-  const lines = pkgs.map((p,i) => `  ${i+1}. ${p.label} — $${p.price}`)
-  return `🟡 *GOLD AI — Premium Signals*
-
-Real-time XAUUSD trading signals powered by multi-timeframe analysis.
-
-✅ 15m + 1h signals
-✅ Entry, SL, TP1/TP2/TP3 included
-✅ Score, regime & session context
-✅ Instant WhatsApp delivery
-
-*Choose your subscription plan* (reply with number):
-
-${lines.join('\n')}
-
-  0. Cancel`
+async function showHome(to) {
+  setScreen(to, 'packages')
+  return sendList(to,
+    '🟡 GOLD AI — Premium Signals',
+    `Real-time XAUUSD trading signals\n\n✅ 15m + 1h timeframes\n✅ Entry, SL, TP1/TP2/TP3\n✅ Score & regime context\n✅ Instant WhatsApp delivery\n\n*Choose your plan:*`,
+    [
+      { title:'1 Month — $50',   desc:'30 days of premium signals' },
+      { title:'3 Months — $120', desc:'90 days · save $30'         },
+      { title:'6 Months — $200', desc:'180 days · best value'      },
+      { title:'My Status',       desc:'Check current subscription'  },
+    ]
+  )
 }
 
-function paymentMenu(pkg) {
-  const methods = Object.values(payMethods())
-  const lines = methods.map((m,i) => `  ${i+1}. ${m.label}`)
-  return `📦 *${pkg.label} Plan — $${pkg.price}*
-
-Choose your payment method (reply with number):
-
-${lines.join('\n')}
-
-  0. ← Back to plans`
+async function showPaymentMethods(to, pkgId) {
+  const pkg = PACKAGES[pkgId]
+  setScreen(to, 'payment_method', { pkgId })
+  return sendButtons(to,
+    `📦 *${pkg.label} — $${pkg.price}*\n\nChoose payment method:`,
+    [
+      { id:'usdt', title:'💵 USDT (TRC-20)' },
+      { id:'btc',  title:'₿  Bitcoin'       },
+      { id:'back', title:'← Back to plans'  },
+    ]
+  )
 }
 
-function paymentDetails(pkg, method, chatId) {
-  return `💳 *Payment Instructions*
-
-Plan: *${pkg.label} — $${pkg.price}*
-Method: *${method.label}*
-
-Send exactly *$${pkg.price} worth of ${method.coin}* to:
-
-\`${method.address}\`
-
-⚠️ *Important:*
-• Send the exact amount — no partial payments
-• Note your WhatsApp number in the memo if possible
-• Payment confirms within 10–30 min
-
-After sending, reply:
-  1. ✅ I Sent the Payment
-  0. ← Back to methods`
+async function showPaymentDetails(to, pkgId, method) {
+  const pkg = PACKAGES[pkgId]
+  const w   = getWallets()
+  const addr = method==='usdt' ? w.usdt : w.btc
+  const coin = method==='usdt' ? 'USDT (TRC-20)' : 'Bitcoin'
+  upsertSub(to, { status:'pending_payment', pendingPkg:pkgId, pendingMethod:method })
+  setScreen(to, 'awaiting_payment', { pkgId, method })
+  return sendButtons(to,
+    `💳 *Payment Instructions*\n\nPlan: *${pkg.label} — $${pkg.price}*\nMethod: *${coin}*\n\nSend exactly *$${pkg.price} worth of ${coin}* to:\n\n${addr}\n\n⚠️ Send exact amount · use correct network`,
+    [
+      { id:'paid', title:'✅ I Sent the Payment' },
+      { id:'back', title:'← Back to methods'     },
+    ]
+  )
 }
 
-function statusMsg(sub) {
-  if (!sub || sub.status === 'none') return `You have no active subscription.\n\nReply *hi* or *menu* to browse plans.`
-  if (sub.status === 'pending_payment') return `⏳ You have a pending payment awaiting admin review.\n\nReply *status* to check again.`
-  if (sub.status === 'awaiting_admin') return `⏳ Payment submitted — awaiting admin approval.\n\nUsually 10–30 min. We'll message you here when confirmed.`
-  if (sub.status === 'active') {
+async function showStatus(to) {
+  const sub = getSub(to)
+  if (!sub || sub.status==='none') return sendMessage(to, '📭 No active subscription.\n\nReply *menu* to see plans.')
+  if (sub.status==='pending_payment') return sendMessage(to, '⏳ Pending payment — awaiting your confirmation.\n\nReply *menu* to restart.')
+  if (sub.status==='awaiting_admin')  return sendMessage(to, '⏳ Payment submitted — admin reviewing.\n\nUsually confirmed within 10–30 min. We will message you here.')
+  if (sub.status==='active') {
     const exp = new Date(sub.expiresAt).toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'})
-    return `✅ *Subscription Active*\n\nPlan: *${sub.planLabel}*\nExpires: *${exp}*\n\nSignals are sent directly to this chat. 🟡`
+    return sendMessage(to, `✅ *Subscription Active*\n\nPlan: *${sub.planLabel}*\nExpires: *${exp}*\n\nSignals are sent directly here. 🟡`)
   }
-  if (sub.status === 'expired') return `❌ Your subscription has expired.\n\nReply *menu* to renew.`
-  if (sub.status === 'denied')  return `❌ Your last payment was not confirmed.\n\nReply *menu* to try again or contact support.`
-  return `Reply *menu* to get started.`
+  if (sub.status==='expired') return sendMessage(to, '❌ Subscription expired.\n\nReply *menu* to renew.')
+  if (sub.status==='denied')  return sendMessage(to, '❌ Payment not confirmed.\n\nReply *menu* to try again or contact support.')
 }
 
 // ── MESSAGE HANDLER ───────────────────────────────────────────
-async function handleMessage(chatId, text) {
-  const t     = (text||'').trim().toLowerCase()
-  const sub   = getSub(chatId)
-  const scr   = getScreen(chatId)
-  const isAdmin = chatId === ADMIN_WA
+async function handleMessage(from, body) {
+  const t   = (body||'').trim().toLowerCase()
+  const sub = getSub(from)
+  const scr = getScreen(from)
+  const isAdmin = from === ADMIN_WA
 
-  // ── ADMIN COMMANDS ────────────────────────────────────────
+  // ── ADMIN COMMANDS ──────────────────────────────────────────
   if (isAdmin) {
-    // /subs or subs
-    if (t==='subs'||t==='/subs') {
+    const approveM = t.match(/^approve\s+(\S+)/)
+    if (approveM) return adminApprove(from, approveM[1])
+
+    const denyM = t.match(/^deny\s+(\S+)/)
+    if (denyM) return adminDeny(from, denyM[1])
+
+    const revokeM = t.match(/^revoke\s+(\S+)/)
+    if (revokeM) return adminRevoke(from, revokeM[1])
+
+    const bcM = body.match(/^broadcast\s+(.+)/is)
+    if (bcM) return adminBroadcast(from, bcM[1])
+
+    if (t==='subs') {
       const active = activeSubs()
-      if (!active.length) return send(chatId, 'No active subscribers.')
-      const lines = active.map(s => {
-        const exp = s.expiresAt ? new Date(s.expiresAt).toLocaleDateString() : '?'
-        return `• ${s.chatId} — ${s.planLabel||'?'} → ${exp}`
-      })
-      return send(chatId, `📋 *Active Subscribers (${active.length})*\n\n${lines.join('\n')}`)
+      if (!active.length) return sendMessage(from, 'No active subscribers.')
+      const lines = active.map(s=>`• ${s.chatId}\n  ${s.planLabel} → ${new Date(s.expiresAt).toLocaleDateString()}`)
+      return sendMessage(from, `📋 *Active Subscribers (${active.length})*\n\n${lines.join('\n\n')}`)
     }
 
-    // approve <chatId>
-    const approveM = text.match(/^\/?(approve)\s+(\S+)/i)
-    if (approveM) return adminApprove(chatId, approveM[2])
-
-    // deny <chatId>
-    const denyM = text.match(/^\/?(deny)\s+(\S+)/i)
-    if (denyM) return adminDeny(chatId, denyM[2])
-
-    // revoke <chatId>
-    const revokeM = text.match(/^\/?(revoke)\s+(\S+)/i)
-    if (revokeM) return adminRevoke(chatId, revokeM[2])
-
-    // broadcast <message>
-    const bcM = text.match(/^\/?(broadcast)\s+(.+)/is)
-    if (bcM) return adminBroadcast(chatId, bcM[2])
-
-    // setwallet usdt <address>  or  setwallet btc <address>
-    const walletM = text.match(/^\/?(setwallet)\s+(usdt|btc)\s+(\S+)/i)
-    if (walletM) {
-      const s = loadSettings()
-      const key = walletM[2].toLowerCase()==='usdt' ? 'usdt_address' : 'btc_address'
-      s[key] = walletM[3]
-      saveSettings(s)
-      return send(chatId, `✅ ${walletM[2].toUpperCase()} wallet updated to:\n${walletM[3]}`)
-    }
-
-    // pending — list awaiting admin
-    if (t==='pending'||t==='/pending') {
+    if (t==='pending') {
       const all = Object.values(loadSubs()).filter(s=>s.status==='awaiting_admin')
-      if (!all.length) return send(chatId, 'No pending approvals.')
-      const lines = all.map(s=>`• ${s.chatId} — ${PACKAGES[s.pendingPkg]?.label||'?'} via ${s.pendingMethod||'?'}\n  Claimed: ${s.claimedAt||'?'}\n  → approve ${s.chatId}  or  deny ${s.chatId}`)
-      return send(chatId, `🔔 *Pending Approvals (${all.length})*\n\n${lines.join('\n\n')}`)
+      if (!all.length) return sendMessage(from, 'No pending approvals.')
+      const lines = all.map(s=>`• ${s.chatId}\n  ${PACKAGES[s.pendingPkg]?.label} via ${s.pendingMethod}\n  → approve ${s.chatId}\n  → deny ${s.chatId}`)
+      return sendMessage(from, `🔔 *Pending (${all.length})*\n\n${lines.join('\n\n')}`)
     }
 
-    // admin help
-    if (t==='admin'||t==='/admin'||t==='/help') {
-      return send(chatId, `🔧 *Admin Commands*
-
-subs              — list active subscribers
-pending           — list awaiting approval
-approve <id>      — confirm payment & activate
-deny <id>         — reject payment
-revoke <id>       — cancel subscription
-broadcast <msg>   — send message to all active subs
-setwallet usdt <addr>  — update USDT address
-setwallet btc <addr>   — update BTC address`)
-    }
+    if (t==='admin') return sendMessage(from,
+      `🔧 *Admin Commands*\n\nsubs — active subscribers\npending — awaiting approval\napprove <number> — activate\ndeny <number> — reject\nrevoke <number> — cancel\nbroadcast <msg> — send to all`)
   }
 
-  // ── USER: global shortcuts ────────────────────────────────
-  if (t==='hi'||t==='hello'||t==='start'||t==='menu'||t==='/'||t==='') {
-    // Check expiry first
-    if (sub?.status==='active' && new Date(sub.expiresAt)<new Date()) {
-      upsertSub(chatId,{status:'expired'})
-    }
-    const freshSub = getSub(chatId)
-    if (freshSub?.status==='active') {
-      setScreen(chatId,'home')
-      return send(chatId, `🟡 *GOLD AI*\n\n${statusMsg(freshSub)}\n\nReply *status* anytime to check your plan.`)
-    }
-    setScreen(chatId,'packages')
-    return send(chatId, packagesMenu())
+  // ── GLOBAL SHORTCUTS ────────────────────────────────────────
+  if (['hi','hello','start','menu','hey',''].includes(t)) {
+    if (sub?.status==='active' && new Date(sub.expiresAt)<new Date()) upsertSub(from,{status:'expired'})
+    return showHome(from)
   }
+  if (t==='status') return showStatus(from)
 
-  if (t==='status'||t==='/status') {
-    if (sub?.status==='active' && new Date(sub.expiresAt)<new Date()) upsertSub(chatId,{status:'expired'})
-    return send(chatId, statusMsg(getSub(chatId)))
-  }
-
-  if (t==='help'||t==='/help') {
-    return send(chatId,
-`🟡 *GOLD AI Help*
-
-*How to subscribe:*
-1. Reply *menu* to see plans
-2. Pick a plan (send the number)
-3. Pick payment method
-4. Send crypto to the shown address
-5. Reply 1 when done
-6. Admin confirms → signals start
-
-*Commands:*
-  menu    — show subscription plans
-  status  — check your subscription
-  help    — this message
-
-*Signal format explained:*
-  BUY/SELL + Entry + SL + TP1/TP2/TP3
-  Score = signal strength (higher = better)
-  Tier A/B/C = confidence level`)
-  }
-
-  // ── PACKAGE SELECTION SCREEN ──────────────────────────────
+  // ── PACKAGE SELECTION ────────────────────────────────────────
   if (scr.screen==='packages') {
-    const pkgs = Object.values(PACKAGES).filter(p=>p.enabled)
-    const n = parseInt(t)
-    if (t==='0') { setScreen(chatId,'home'); return send(chatId,'Cancelled. Reply *menu* anytime.') }
-    if (isNaN(n)||n<1||n>pkgs.length) return send(chatId,`Please reply with a number 1–${pkgs.length} (or 0 to cancel).`)
-    const pkg = pkgs[n-1]
-    upsertSub(chatId,{ status:'pending_payment', pendingPkg:pkg.id })
-    setScreen(chatId,'payment_method', { pkgId:pkg.id })
-    return send(chatId, paymentMenu(pkg))
+    if (t==='1') return showPaymentMethods(from, 'p1')
+    if (t==='2') return showPaymentMethods(from, 'p2')
+    if (t==='3') return showPaymentMethods(from, 'p3')
+    if (t==='4') return showStatus(from)
+    return showHome(from)
   }
 
-  // ── PAYMENT METHOD SCREEN ─────────────────────────────────
+  // ── PAYMENT METHOD ───────────────────────────────────────────
   if (scr.screen==='payment_method') {
-    const methods = Object.entries(payMethods())
-    const n = parseInt(t)
-    if (t==='0') { setScreen(chatId,'packages'); return send(chatId, packagesMenu()) }
-    if (isNaN(n)||n<1||n>methods.length) return send(chatId,`Please reply with a number 1–${methods.length} (or 0 to go back).`)
-    const [methodKey, method] = methods[n-1]
-    const pkg = PACKAGES[scr.pkgId]
-    upsertSub(chatId,{ pendingMethod:methodKey })
-    setScreen(chatId,'awaiting_payment', { pkgId:scr.pkgId, methodKey })
-    return send(chatId, paymentDetails(pkg, method, chatId))
+    if (t==='1') return showPaymentDetails(from, scr.pkgId, 'usdt')
+    if (t==='2') return showPaymentDetails(from, scr.pkgId, 'btc')
+    if (t==='3') return showHome(from)
+    return showPaymentMethods(from, scr.pkgId)
   }
 
-  // ── AWAITING PAYMENT CONFIRMATION SCREEN ─────────────────
+  // ── AWAITING PAYMENT ─────────────────────────────────────────
   if (scr.screen==='awaiting_payment') {
-    if (t==='0') {
-      setScreen(chatId,'payment_method',{ pkgId:scr.pkgId })
-      return send(chatId, paymentMenu(PACKAGES[scr.pkgId]))
-    }
+    if (t==='2') return showPaymentMethods(from, scr.pkgId)
     if (t==='1') {
       const pkg = PACKAGES[scr.pkgId]
-      upsertSub(chatId,{ status:'awaiting_admin', claimedAt: new Date().toISOString() })
-      setScreen(chatId,'home')
-
-      // Notify admin
+      upsertSub(from, { status:'awaiting_admin', claimedAt:new Date().toISOString() })
+      setScreen(from, 'home')
       if (ADMIN_WA) {
-        await send(ADMIN_WA,
-`🔔 *New Payment Claim*
-
-User: ${chatId}
-Plan: ${pkg.label} — $${pkg.price}
-Method: ${payMethods()[scr.methodKey]?.label||scr.methodKey}
-Claimed: ${new Date().toLocaleString()}
-
-Reply:
-  approve ${chatId}
-  deny ${chatId}`)
+        await sendMessage(ADMIN_WA,
+`🔔 *New Payment Claim*\n\nUser: ${from}\nPlan: ${pkg.label} — $${pkg.price}\nMethod: ${scr.method==='usdt'?'USDT':'Bitcoin'}\n\nReply:\napprove ${from.replace('whatsapp:','')}\ndeny ${from.replace('whatsapp:','')}`)
       }
-
-      return send(chatId,
-`⏳ *Payment Under Review*
-
-Thank you! Our team will verify your payment and activate your account within 10–30 minutes.
-
-You'll receive a message here when confirmed. 🟡`)
+      return sendMessage(from, '⏳ *Payment Under Review*\n\nThank you! We will verify and activate your account within 10–30 minutes.\n\nYou will receive a message here when confirmed. 🟡')
     }
-    return send(chatId,'Reply *1* after you have sent payment, or *0* to go back.')
+    return sendMessage(from, 'Reply *1* after sending payment, or *2* to go back.')
   }
 
-  // ── FALLBACK ──────────────────────────────────────────────
-  return send(chatId, `Reply *menu* to see subscription plans, or *status* to check your account.`)
+  // ── FALLBACK ─────────────────────────────────────────────────
+  return sendMessage(from, 'Reply *menu* to see plans or *status* to check your subscription.')
 }
 
 // ── ADMIN ACTIONS ─────────────────────────────────────────────
-async function adminApprove(adminId, targetId) {
-  const sub = getSub(targetId)
-  if (!sub) return send(adminId, `❌ User ${targetId} not found.`)
+async function adminApprove(adminId, target) {
+  const to = target.includes('@') ? `whatsapp:+${target.replace(/\D/g,'')}` : `whatsapp:+${target.replace(/\D/g,'')}`
+  const sub = getSub(to)
+  if (!sub) return sendMessage(adminId, `❌ User ${to} not found.`)
   const pkg = PACKAGES[sub.pendingPkg]
-  if (!pkg) return send(adminId, `❌ No pending package for ${targetId}.`)
-
-  const now = new Date(), exp = new Date(now.getTime() + pkg.days*86400000)
-  upsertSub(targetId, {
-    status:'active', plan:pkg.id, planLabel:pkg.label, price:pkg.price,
-    activatedAt:now.toISOString(), expiresAt:exp.toISOString(),
-    pendingPkg:null, pendingMethod:null,
-  })
+  if (!pkg) return sendMessage(adminId, `❌ No pending package for ${to}.`)
+  const now=new Date(), exp=new Date(now.getTime()+pkg.days*86400000)
+  upsertSub(to, { status:'active', plan:pkg.id, planLabel:pkg.label, price:pkg.price, activatedAt:now.toISOString(), expiresAt:exp.toISOString(), pendingPkg:null, pendingMethod:null })
   const expStr = exp.toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'})
-  await send(adminId, `✅ Approved ${targetId} — ${pkg.label} until ${expStr}`)
-  await send(targetId,
-`🎉 *Payment Confirmed!*
-
-Your *${pkg.label}* subscription is now *ACTIVE*.
-
-✅ Expires: *${expStr}*
-✅ Signals will be sent directly to this chat
-
-Welcome to GOLD AI Premium! 🟡`)
+  await sendMessage(adminId, `✅ Approved ${to} — ${pkg.label} until ${expStr}`)
+  await sendMessage(to, `🎉 *Payment Confirmed!*\n\nYour *${pkg.label}* subscription is now *ACTIVE*.\n\n✅ Expires: *${expStr}*\n\nWelcome to GOLD AI Premium! Signals will be sent directly here. 🟡`)
 }
 
-async function adminDeny(adminId, targetId) {
-  const sub = getSub(targetId)
-  if (!sub) return send(adminId, `❌ User ${targetId} not found.`)
+async function adminDeny(adminId, target) {
+  const to = `whatsapp:+${target.replace(/\D/g,'')}`
+  const sub = getSub(to)
+  if (!sub) return sendMessage(adminId, `❌ User ${to} not found.`)
   const pkg = PACKAGES[sub.pendingPkg]
-  upsertSub(targetId, { status:'denied', pendingPkg:null, pendingMethod:null })
-  await send(adminId, `✅ Denied & notified ${targetId}.`)
-  await send(targetId,
-`❌ *Payment Not Confirmed*
-
-We could not verify your payment for the ${pkg?.label||''} plan.
-
-Common reasons:
-• Wrong amount sent
-• Wrong wallet/network used
-• Transaction not yet broadcast
-
-Reply *menu* to try again or contact support.`)
+  upsertSub(to, { status:'denied', pendingPkg:null, pendingMethod:null })
+  await sendMessage(adminId, `✅ Denied ${to}.`)
+  await sendMessage(to, `❌ *Payment Not Confirmed*\n\nWe could not verify your ${pkg?.label||''} payment.\n\nCommon reasons:\n• Wrong amount\n• Wrong network\n• Not yet broadcast\n\nReply *menu* to try again.`)
 }
 
-async function adminRevoke(adminId, targetId) {
-  const sub = getSub(targetId)
-  if (!sub) return send(adminId, `❌ User ${targetId} not found.`)
-  upsertSub(targetId, { status:'expired' })
-  await send(adminId, `✅ Revoked subscription for ${targetId}.`)
-  await send(targetId, `❌ Your GOLD AI subscription has been cancelled by admin.\n\nReply *menu* if you believe this is an error.`)
+async function adminRevoke(adminId, target) {
+  const to = `whatsapp:+${target.replace(/\D/g,'')}`
+  upsertSub(to, { status:'expired' })
+  await sendMessage(adminId, `✅ Revoked ${to}.`)
+  await sendMessage(to, `❌ Your GOLD AI subscription has been cancelled.\n\nReply *menu* if you think this is an error.`)
 }
 
 async function adminBroadcast(adminId, message) {
   const subs = activeSubs()
-  if (!subs.length) return send(adminId, 'No active subscribers to broadcast to.')
+  if (!subs.length) return sendMessage(adminId, 'No active subscribers.')
   let ok=0, fail=0
   for (const s of subs) {
-    const r = await send(s.chatId, `📢 *GOLD AI Update*\n\n${message}`)
+    const r = await sendMessage(s.chatId, `📢 *GOLD AI Update*\n\n${message}`)
     r ? ok++ : fail++
-    await new Promise(r=>setTimeout(r,500)) // rate-limit friendly
+    await new Promise(r=>setTimeout(r,1000))
   }
-  return send(adminId, `✅ Broadcast sent: ${ok} delivered, ${fail} failed.`)
+  return sendMessage(adminId, `✅ Broadcast: ${ok} sent, ${fail} failed.`)
 }
 
-// ── SIGNAL BROADCAST (called by gold-ai.mjs or externally) ───
+// ── SIGNAL BROADCAST (call from gold-ai.mjs) ─────────────────
 export async function broadcastSignal(text) {
   const subs = activeSubs()
-  // Check expiry on each send
   for (const s of subs) {
-    if (new Date(s.expiresAt) < new Date()) { upsertSub(s.chatId,{status:'expired'}); continue }
-    await send(s.chatId, text)
-    await new Promise(r=>setTimeout(r,400))
+    if (new Date(s.expiresAt)<new Date()) { upsertSub(s.chatId,{status:'expired'}); continue }
+    await sendMessage(s.chatId, text)
+    await new Promise(r=>setTimeout(r,500))
   }
   console.log(`[whatsapp] signal sent to ${subs.length} subscriber(s)`)
 }
 
-// ── EXPIRY CHECK (run daily) ──────────────────────────────────
-function checkExpiries() {
-  const all = loadSubs()
-  const now = new Date()
-  for (const [id, sub] of Object.entries(all)) {
-    if (sub.status==='active' && new Date(sub.expiresAt)<now) {
-      upsertSub(id,{status:'expired'})
-      send(id,
-`⚠️ *Subscription Expired*
-
-Your GOLD AI subscription has ended.
-
-Reply *menu* to renew and keep receiving signals. 🟡`)
-    }
-  }
+// ── WEBHOOK SERVER ────────────────────────────────────────────
+// Twilio sends incoming messages as POST to this server
+function parseForm(body) {
+  return Object.fromEntries(new URLSearchParams(body))
 }
 
-// ── POLLING LOOP ─────────────────────────────────────────────
-async function poll() {
-  console.log(`[${new Date().toISOString()}] WhatsApp bot polling… (instance ${INSTANCE})`)
-  let lastExpiry = Date.now()
-
-  while (true) {
-    try {
-      const notif = await receiveOne()
-
-      if (!notif) {
-        await new Promise(r=>setTimeout(r,1500))
-      } else {
-        const { receiptId, body } = notif
-
-        // Only handle inbound text messages
-        if (body?.typeWebhook === 'incomingMessageReceived' &&
-            body?.messageData?.typeMessage === 'textMessage') {
-          const chatId  = body.senderData?.chatId  || ''
-          const text    = body.messageData?.textMessageData?.textMessage || ''
-          console.log(`[msg] ${chatId}: ${text.slice(0,80)}`)
-          await handleMessage(chatId, text)
-        }
-
-        await deleteNotification(receiptId)
-        await new Promise(r=>setTimeout(r,300))
-      }
-
-      // Check expiries every hour
-      if (Date.now()-lastExpiry > 3600000) { checkExpiries(); lastExpiry=Date.now() }
-
-    } catch(e) {
-      console.error('Poll error:', e.message)
-      await new Promise(r=>setTimeout(r,5000))
-    }
+const server = http.createServer(async (req, res) => {
+  if (req.method === 'POST' && req.url === '/webhook') {
+    let raw = ''
+    req.on('data', chunk => raw += chunk)
+    req.on('end', async () => {
+      try {
+        const data = parseForm(raw)
+        const from = data.From || ''
+        const body = data.Body || ''
+        console.log(`[msg] ${from}: ${body.slice(0,80)}`)
+        await handleMessage(from, body)
+      } catch(e) { console.error('Webhook error:', e.message) }
+      res.writeHead(200, {'Content-Type':'text/plain'})
+      res.end('OK')
+    })
+  } else if (req.method === 'GET' && req.url === '/health') {
+    res.writeHead(200); res.end('🟡 GOLD AI WhatsApp Bot running')
+  } else {
+    res.writeHead(404); res.end('Not found')
   }
-}
+})
 
-// ── ENTRY POINT ───────────────────────────────────────────────
-console.log('🟡 GOLD AI WhatsApp Bot starting…')
-console.log(`   Instance : ${INSTANCE}`)
-console.log(`   Admin WA : ${ADMIN_WA||'(not set)'}`)
-console.log(`   Packages : ${Object.values(PACKAGES).filter(p=>p.enabled).map(p=>p.label).join(', ')}`)
-if (!ADMIN_WA) console.warn('⚠️  ADMIN_WA not set — payment claim notifications will not be sent to admin.')
+server.listen(PORT, () => {
+  console.log(`
+╔══════════════════════════════════════╗
+║   🟡  GOLD AI WhatsApp Bot (Twilio)  ║
+╚══════════════════════════════════════╝
+  From     : ${FROM}
+  Admin    : ${ADMIN_WA}
+  Webhook  : http://localhost:${PORT}/webhook
+  Health   : http://localhost:${PORT}/health
 
-poll()
+  ⚠️  Expose this port publicly so Twilio can reach it:
+      npx ngrok http ${PORT}
+  Then paste the ngrok URL into Twilio sandbox settings.
+`)
+})
