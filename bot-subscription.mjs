@@ -23,7 +23,7 @@ import fs from 'fs'
 
 // ── ENV ───────────────────────────────────────────────────────────────────────
 const TG_TOKEN        = process.env.TG_TOKEN        || '8970765755:AAHexBHcEKLnnBsly5AIOUAPgftnEl6_9Hg'
-const ADMIN_ID        = process.env.ADMIN_CHAT_ID   || '8970765755'
+const ADMIN_ID        = process.env.ADMIN_CHAT_ID   || '1408577116'
 const CHANNEL         = process.env.CHANNEL_USERNAME || '@MH_Signals'
 const USDT_ADDRESS    = process.env.USDT_ADDRESS    || 'TEST_USDT_ADDRESS'
 const BTC_ADDRESS     = process.env.BTC_ADDRESS     || 'TEST_BTC_ADDRESS'
