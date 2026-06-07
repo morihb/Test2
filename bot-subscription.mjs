@@ -310,8 +310,18 @@ async function adminApprove(adminChatId, targetId) {
   const sub = getSub(targetId)
   if (!sub) return send(adminChatId, `❌ User ${targetId} not found.`)
 
-  const pkg = PACKAGES[sub.pendingPkg]
-  if (!pkg) return send(adminChatId, `❌ No pending package for ${targetId}.`)
+  // Debug: show current sub state
+  console.log('[approve] sub record:', JSON.stringify(sub))
+
+  // If already active, just confirm
+  if (sub.status === 'active' && sub.expiresAt && new Date(sub.expiresAt) > new Date()) {
+    return send(adminChatId, `ℹ️ User ${targetId} is already active until ${new Date(sub.expiresAt).toLocaleDateString()}`)
+  }
+
+  // Try pendingPkg first, fall back to last known plan, then default to p1
+  const pkgId = sub.pendingPkg || sub.plan || 'p1'
+  const pkg = PACKAGES[pkgId]
+  if (!pkg) return send(adminChatId, `❌ No package found for ${targetId}. Sub: ${JSON.stringify(sub)}`)
 
   const now   = new Date()
   const exp   = new Date(now.getTime() + pkg.days * 86400000)
@@ -475,6 +485,10 @@ Always use a broker with tight XAUUSD spreads.`)
       if (parts[0] === '/approve' && parts[1]) return adminApprove(chatId, parts[1])
       if (parts[0] === '/deny'    && parts[1]) return adminDeny(chatId, parts[1])
       if (parts[0] === '/revoke'  && parts[1]) return adminRevoke(chatId, parts[1])
+      if (parts[0] === '/check'   && parts[1]) {
+        const s = getSub(parts[1])
+        return send(chatId, s ? `<pre>${JSON.stringify(s,null,2)}</pre>` : `❌ Not found: ${parts[1]}`)
+      }
       if (text === '/subs')                    return adminListSubs(chatId)
       if (text === '/admin') return send(chatId,
 `🔧 <b>Admin Commands</b>
