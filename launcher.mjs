@@ -7,11 +7,34 @@
 import { broadcastSignal } from './bot-subscription.mjs'
 import fs from 'fs'
 
-const PRICE_CHECK_MS = (parseInt(process.env.PRICE_CHECK_SEC) || 30) * 1000
-const CANDLE_DELAY_MS = 1500   // wait 1.5s after close for API to update
+const PRICE_CHECK_MS  = (parseInt(process.env.PRICE_CHECK_SEC) || 30) * 1000
+const CANDLE_DELAY_MS = 2000   // wait 2s after close for API to finalize bar
+const RETRY_DELAY_MS  = 60000  // retry after 60s on 429 / fetch failure
+const MAX_RETRIES     = 3      // max retries per candle before giving up
+// Stagger: offset each TF so they never fire at the same second → avoids 429
+const TF_STAGGER_MS   = { '15m':0, '1h':30000, '4h':45000, '1d':60000 }
 
 const TG_TOKEN       = process.env.TG_TOKEN        || '8970765755:AAHexBHcEKLnnBsly5AIOUAPgftnEl6_9Hg'
-const TWELVEDATA_KEY = process.env.TWELVEDATA_KEY  || 'dbf374976088424aa703db6034942e19'
+// Primary and fallback TwelveData API keys
+// Fallback activates automatically when primary hits rate limit (429)
+const TWELVEDATA_KEYS = [
+  process.env.TWELVEDATA_KEY  || 'dbf374976088424aa703db6034942e19',  // primary
+  'da16adf775b04e31a6a33386689e38c8',                                   // fallback
+]
+let activeKeyIndex = 0
+let TWELVEDATA_KEY = TWELVEDATA_KEYS[0]
+
+function switchToNextKey() {
+  const next = (activeKeyIndex + 1) % TWELVEDATA_KEYS.length
+  if (next === activeKeyIndex) {
+    console.error('[API] No more fallback keys available!')
+    return false
+  }
+  activeKeyIndex = next
+  TWELVEDATA_KEY = TWELVEDATA_KEYS[activeKeyIndex]
+  console.log(`[API] ⚠️ Switched to key #${activeKeyIndex + 1}: ${TWELVEDATA_KEY.slice(0,8)}…`)
+  return true
+}
 const LIVE_TFS       = (process.env.LIVE_TFS || '15m,1h').split(',').map(s => s.trim()).filter(Boolean)
 const SOURCE         = process.env.GOLD_SOURCE || (process.env.OANDA_TOKEN ? 'oanda' : 'twelvedata')
 const TG_CHAT        = process.env.TG_CHAT || '1408577116'
@@ -41,15 +64,40 @@ function scheduleCandle(tf, callback) {
   const mins = TF_MINUTES[tf]
   if (!mins) { console.error(`Unknown TF: ${tf}`); return }
 
-  const wait = msUntilNextClose(mins)
+  const stagger = TF_STAGGER_MS[tf] || 0
+  const wait    = msUntilNextClose(mins) + stagger
   const closeAt = new Date(Date.now() + wait).toISOString()
-  console.log(`[scheduler] ${tf} next candle close in ${(wait/1000).toFixed(1)}s (at ${closeAt})`)
+  console.log(`[scheduler] ${tf} next candle close in ${(wait/1000).toFixed(1)}s (at ${closeAt})${stagger ? ` +${stagger/1000}s stagger` : ''}`)
 
   setTimeout(async () => {
-    // Small delay so the API has the closed candle available
     await new Promise(r => setTimeout(r, CANDLE_DELAY_MS))
-    await callback(tf)
-    // Schedule the next one
+
+    // Retry loop — on 429 or fetch error, wait 60s and try again (up to MAX_RETRIES)
+    let success = false
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        await callback(tf)
+        success = true
+        break
+      } catch (e) {
+        const is429 = e.message?.includes('429') || e.message?.includes('rate')
+        const isNet = e.message?.includes('fetch') || e.message?.includes('ECONNRESET')
+        if ((is429 || isNet) && attempt < MAX_RETRIES) {
+          if (is429) {
+            console.log(`[scheduler] ${tf} rate limited — switching API key and retrying in ${RETRY_DELAY_MS/1000}s`)
+            switchToNextKey()
+          } else {
+            console.log(`[scheduler] ${tf} attempt ${attempt} failed (${e.message}) — retrying in ${RETRY_DELAY_MS/1000}s`)
+          }
+          await new Promise(r => setTimeout(r, RETRY_DELAY_MS))
+        } else {
+          console.error(`[scheduler] ${tf} gave up after ${attempt} attempt(s): ${e.message}`)
+          break
+        }
+      }
+    }
+
+    // Schedule next candle regardless of success
     scheduleCandle(tf, callback)
   }, wait)
 }
@@ -99,22 +147,27 @@ async function sendAll(text, replyToMsgId = null) {
 
 // ── Live price (lightweight, no candles) ─────────────────────────────────────
 async function fetchLivePrice() {
-  try {
-    const res = await fetch(
-      `https://api.twelvedata.com/price?symbol=XAU/USD&apikey=${TWELVEDATA_KEY}`,
-      { signal: AbortSignal.timeout(8000) }
-    )
-    const j = await res.json()
-    if (j.price) return parseFloat(j.price)
-  } catch {}
-  try {
-    const res = await fetch(
-      `https://api.twelvedata.com/quote?symbol=XAU/USD&apikey=${TWELVEDATA_KEY}`,
-      { signal: AbortSignal.timeout(8000) }
-    )
-    const j = await res.json()
-    if (j.close) return parseFloat(j.close)
-  } catch {}
+  for (let attempt = 0; attempt < TWELVEDATA_KEYS.length; attempt++) {
+    try {
+      const res = await fetch(
+        `https://api.twelvedata.com/price?symbol=XAU/USD&apikey=${TWELVEDATA_KEY}`,
+        { signal: AbortSignal.timeout(8000) }
+      )
+      if (res.status === 429) { switchToNextKey(); continue }
+      const j = await res.json()
+      if (j.price) return parseFloat(j.price)
+      if (j.code === 429) { switchToNextKey(); continue }
+    } catch {}
+    try {
+      const res = await fetch(
+        `https://api.twelvedata.com/quote?symbol=XAU/USD&apikey=${TWELVEDATA_KEY}`,
+        { signal: AbortSignal.timeout(8000) }
+      )
+      if (res.status === 429) { switchToNextKey(); continue }
+      const j = await res.json()
+      if (j.close) return parseFloat(j.close)
+    } catch {}
+  }
   return null
 }
 
@@ -207,26 +260,30 @@ async function runSignalCycle(tf) {
   const ts = new Date().toISOString()
   console.log(`[${ts}] 🕯️  Candle closed: ${tf} — running signal check`)
 
-  try {
-    const { execFile } = await import('child_process')
-    const { promisify } = await import('util')
-    const exec = promisify(execFile)
+  const { execFile } = await import('child_process')
+  const { promisify } = await import('util')
+  const exec = promisify(execFile)
 
-    const env = {
-      ...process.env,
-      LIVE_TFS: tf,
-      TWELVEDATA_KEY,
-      TG_TOKEN: '',        // blank — launcher sends, not gold-ai.mjs
-      GOLD_SOURCE: SOURCE,
-      TG_CHAT,
-    }
+  const env = {
+    ...process.env,
+    LIVE_TFS: tf,
+    TWELVEDATA_KEY,   // always uses currently active key (may have switched after 429)
+    TG_TOKEN: '',        // blank — launcher sends, not gold-ai.mjs
+    GOLD_SOURCE: SOURCE,
+    TG_CHAT,
+  }
 
-    const { stdout, stderr } = await exec('node', ['gold-ai.mjs', 'check'], {
-      env, timeout: 60000,
-    })
+  const { stdout, stderr } = await exec('node', ['gold-ai.mjs', 'check'], {
+    env, timeout: 60000,
+  })
 
-    if (stdout) console.log(`[${tf}]`, stdout.trim())
-    if (stderr) console.error(`[${tf} err]`, stderr.trim())
+  if (stdout) console.log(`[${tf}]`, stdout.trim())
+  if (stderr) console.error(`[${tf} err]`, stderr.trim())
+
+  // Throw on rate limit or fetch failure so retry loop in scheduleCandle kicks in
+  if (stderr && (stderr.includes('429') || stderr.includes('fetch failed'))) {
+    throw new Error(stderr.trim().slice(0, 120))
+  }
 
     const lines = stdout.split('\n')
     for (const line of lines) {
@@ -295,10 +352,6 @@ Live $${livePrice.toFixed(2)} vs entry $${sig.entry}`
         console.log(`[${tf}] ⚠️ Invalidation (${profitStr})`)
       }
     }
-
-  } catch (e) {
-    console.error(`[${tf}] cycle error: ${e.message}`)
-  }
 }
 
 // ── DAILY SUMMARY — sent at UTC midnight ─────────────────────────────────────
