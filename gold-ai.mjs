@@ -1,19 +1,14 @@
 // ─────────────────────────────────────────────────────────────
-//  GOLD.AI — v4.0
-//  Changes vs v3.1:
-//   • Weekend blackout: no signals Saturday or Sunday (market closed).
-//   • Signal lifecycle per timeframe:
-//       – New signal fires → full alert sent, state saved.
-//       – Same direction on next bar → "Keep Holding" update sent.
-//       – Signal flips to WAIT → "Signal Invalidated – close manually" sent.
-//       – TP1/TP2/TP3 hit (tracked via live price) → reply with pips.
-//       – SL hit → reply with SL pips loss.
-//   • Structure-based TPs (instead of fixed R multiples):
-//       – BUY  → TP targets = recent swing highs / prior-session high.
-//       – SELL → TP targets = recent swing lows  / prior-session low.
-//       – Minimum 1.0R per TP; skip signal if no qualifying structure level.
-//       – Falls back to R-multiple if no structural level qualifies.
-//   All scoring, gates, sizing, costs, governor: UNCHANGED.
+//  GOLD.AI — v3.1 (multi-timeframe live: 15m + 1h together)
+//  Same edge logic as v3. What changed vs v3 (NO strategy changes):
+//   • TF-specific params (interval, ATR band, trend/struct, window…)
+//     now come from a cfg object instead of fixed globals, so the
+//     SAME analyse() can run on more than one timeframe.
+//   • `check` (live) now runs 15m AND 1h every cycle and labels each
+//     Telegram signal with its timeframe.
+//   • `backtest`/`report` stay single-TF — choose with TF=15m or TF=1h.
+//   • Dedupe state is now per-timeframe (so 15m & 1h don't clobber).
+//   All scoring, gates, stop/TP, sizing, costs, governor: UNCHANGED.
 //
 //  Run:  node gold-ai check                 (live: 15m + 1h)
 //        TF=15m node gold-ai backtest       (backtest 15m)
@@ -131,7 +126,19 @@ function marketRegime(c,price,cfg){ const d=adx(c),atr=atrCalc(c); const atrPct=
   if(d.adx<18) return {regime:'ranging',...d,atrPct,allowTrend:false,allowMR:true}
   return {regime:'transition',...d,atrPct,allowTrend:true,allowMR:true} }
 function sessionOf(ts){ const d=new Date(ts), h=d.getUTCHours()+d.getUTCMinutes()/60
-  if(h>=0&&h<7) return 'asian'; if(h>=7&&h<12) return 'london'; if(h>=13&&h<21) return 'ny'; return 'offhours' }
+  // XAUUSD session times in UTC (verified from market hours chart):
+  // Asian:       00:00–10:00 UTC  (Cairo 03:00–13:00)
+  // London:      10:00–14:00 UTC  (Cairo 13:00–17:00)
+  // London+NY:   14:00–19:00 UTC  (Cairo 17:00–22:00) ← peak volume
+  // NY only:     19:00–23:00 UTC  (Cairo 22:00–02:00)
+  // Off-hours:   23:00–00:00 UTC  (Cairo 02:00–03:00)
+  if(h>=0  && h<10) return 'asian'
+  if(h>=10 && h<14) return 'london'
+  if(h>=14 && h<19) return 'london_ny'
+  if(h>=19 && h<23) return 'ny'
+  return 'offhours'
+}
+const SESSION_LABEL={asian:'🌏 Asian',london:'🇬🇧 London',london_ny:'🌍🗽 London+NY',ny:'🗽 New York',offhours:'🌙 Off-hours'}
 function detectStructure(c,lb=3){ const H=[],L=[]
   for(let i=lb;i<c.length-lb;i++){ const v=c[i].close
     const lf=c.slice(i-lb,i).map(d=>d.close), rt=c.slice(i+1,i+1+lb).map(d=>d.close)
@@ -155,10 +162,6 @@ function htfTrend(h1){ if(h1.length<50) return 'neutral'
 function inNewsBlackout(ts){ for(const e of NEWS_EVENTS){ const et=new Date(e.time).getTime()
   if(ts>=et-NEWS_BLACKOUT_MIN.before*60000 && ts<=et+NEWS_BLACKOUT_MIN.after*60000) return e.label } return null }
 function isRollover(ts){ return new Date(ts).getUTCHours()===21 } // ~OANDA 21:00 UTC daily rollover
-// Weekend blackout: Saturday (day 6) all day, Sunday (day 0) all day — market closed
-function isWeekend(ts){ const d=new Date(ts).getUTCDay(); return d===0||d===6 }
-// Pip value for XAUUSD: 1 pip = $0.10 (i.e. price in dollars, 1 decimal = 1 pip)
-const toPips=dollars=>Math.round(Math.abs(dollars)*10)
 function spreadAt(ts,regime){ let s=SPREAD_BASE
   if(inNewsBlackout(ts)) s*=SPREAD_NEWS_MULT
   else if(isRollover(ts)) s*=SPREAD_ROLLOVER_MULT
@@ -176,7 +179,6 @@ function analyse(candles, nowMs, cfg){
   const rsi=rsiCalc(prices),macd=macdCalc(prices),bb=bbCalc(prices),st=stochCalc(candles),s20=sma20(candles),atr=atrCalc(candles)
   if(!atr||reg.regime==='low_liquidity') return wait('low liquidity / no ATR',reg,cfg)
   if(reg.atrPct<0.03||reg.atrPct>3.0) return wait(`ATR ${reg.atrPct?.toFixed(3)}% outside band`,reg,cfg)
-  if(isWeekend(nowMs)) return wait('weekend — market closed',reg,cfg)
   const news=inNewsBlackout(nowMs); if(news) return wait(`news blackout: ${news}`,reg,cfg)
   // completed, calendar-aligned HTF
   let h1Trend='neutral',m15Bos='none'
@@ -200,49 +202,13 @@ function analyse(candles, nowMs, cfg){
     if(oppM15&&conv<MIN_CONV+0.15) return wait('opposes M15 & weak',reg,cfg,{net,bull,bear}) }
   const dir=dir0, score=Math.round(conv*100), tier=score>=70?'A':score>=55?'B':'C'
   const stopMult=reg.regime==='volatile_expansion'?2.2:1.5
-  // Minimum R ratio: each TP must be at least this far in R terms
-  const MIN_TP_R=1.0
   let entry=price,sl,tp1,tp2,tp3
-
-  if(dir==='BUY'){
-    // --- Stop loss ---
-    let base=liq.sweepBull&&liq.prevLow?liq.prevLow-atr*0.3:str.rL?str.rL.close-atr*0.3:price-atr*stopMult
-    if(base>=entry)base=price-atr*stopMult; sl=+Math.max(base,price-atr*5).toFixed(2)
-    const R=entry-sl
-    // --- Structure-based TPs for BUY: target swing highs above entry ---
-    // Collect swing highs above entry+MIN_TP_R, sorted ascending
-    const upTargets=[
-      ...str.H.map(h=>h.close).filter(p=>p>entry+R*MIN_TP_R),  // recent swing highs
-      liq.prevHigh && liq.prevHigh>entry+R*MIN_TP_R ? liq.prevHigh : null,  // prior-session high (liquidity)
-    ].filter(Boolean).sort((a,b)=>a-b)
-    // Fill TP slots from structural levels; fall back to R-multiple if not enough
-    tp1=upTargets[0]??+(entry+R*1.5).toFixed(2)
-    tp2=upTargets[1]??+(entry+R*2.5).toFixed(2)
-    tp3=upTargets[2]??+(entry+R*4.0).toFixed(2)
-    // Enforce ascending order and minimum R distance
-    if(tp2<=tp1) tp2=+(tp1+(entry+R*2.5-tp1)*0.5||entry+R*2.5).toFixed(2)
-    if(tp3<=tp2) tp3=+(tp2+(entry+R*4.0-tp2)*0.5||entry+R*4.0).toFixed(2)
-    // If TP1 is less than MIN_TP_R away, skip — no valid structure
-    if((tp1-entry)<R*MIN_TP_R) return wait('no qualifying structure TP (BUY)',reg,cfg,{net,bull,bear})
-    tp1=+tp1.toFixed(2); tp2=+tp2.toFixed(2); tp3=+tp3.toFixed(2)
-  } else {
-    // --- Stop loss ---
-    let base=liq.sweepBear&&liq.prevHigh?liq.prevHigh+atr*0.3:str.rH?str.rH.close+atr*0.3:price+atr*stopMult
-    if(base<=entry)base=price+atr*stopMult; sl=+Math.min(base,price+atr*5).toFixed(2)
-    const R=sl-entry
-    // --- Structure-based TPs for SELL: target swing lows below entry ---
-    const downTargets=[
-      ...str.L.map(l=>l.close).filter(p=>p<entry-R*MIN_TP_R),  // recent swing lows
-      liq.prevLow && liq.prevLow<entry-R*MIN_TP_R ? liq.prevLow : null,  // prior-session low
-    ].filter(Boolean).sort((a,b)=>b-a)  // descending — closest first
-    tp1=downTargets[0]??+(entry-R*1.5).toFixed(2)
-    tp2=downTargets[1]??+(entry-R*2.5).toFixed(2)
-    tp3=downTargets[2]??+(entry-R*4.0).toFixed(2)
-    if(tp2>=tp1) tp2=+(tp1-(tp1-(entry-R*2.5))*0.5||entry-R*2.5).toFixed(2)
-    if(tp3>=tp2) tp3=+(tp2-(tp2-(entry-R*4.0))*0.5||entry-R*4.0).toFixed(2)
-    if((entry-tp1)<R*MIN_TP_R) return wait('no qualifying structure TP (SELL)',reg,cfg,{net,bull,bear})
-    tp1=+tp1.toFixed(2); tp2=+tp2.toFixed(2); tp3=+tp3.toFixed(2)
-  }
+  if(dir==='BUY'){ let base=liq.sweepBull&&liq.prevLow?liq.prevLow-atr*0.3:str.rL?str.rL.close-atr*0.3:price-atr*stopMult
+    if(base>=entry)base=price-atr*stopMult; sl=+Math.max(base,price-atr*5).toFixed(2); const r=entry-sl
+    tp1=+(entry+r*1.5).toFixed(2);tp2=+(entry+r*2.5).toFixed(2);tp3=+(entry+r*4).toFixed(2)
+  } else { let base=liq.sweepBear&&liq.prevHigh?liq.prevHigh+atr*0.3:str.rH?str.rH.close+atr*0.3:price+atr*stopMult
+    if(base<=entry)base=price+atr*stopMult; sl=+Math.min(base,price+atr*5).toFixed(2); const r=sl-entry
+    tp1=+(entry-r*1.5).toFixed(2);tp2=+(entry-r*2.5).toFixed(2);tp3=+(entry-r*4).toFixed(2) }
   // OANDA XAU_USD is priced in UNITS (ounces). $1 move = $1/unit.
   const riskUSD=ACCT*(RISK/100), units=riskUSD/Math.abs(entry-sl)
   return { tframe:cfg.tframe, direction:dir,score,tier,net,bull,bear,conflict:+conflict.toFixed(2),
@@ -413,161 +379,40 @@ function fullReport(bt){
     report:{ bestRegime:pick(byRegime,1),worstRegime:pick(byRegime,0),bestSession:pick(bySession,1),worstSession:pick(bySession,0),bestScoreBucket:pick(byScore,1),worstScoreBucket:pick(byScore,0) } }
 }
 
-// ── TELEGRAM / live check (multi-TF + full signal lifecycle) ─────
-
-async function sendTelegram(text,replyToMsgId=null){
-  if(!TG_TOKEN||!TG_CHAT){ console.log('[telegram disabled]\n'+text); return null }
-  const body={chat_id:TG_CHAT,text,parse_mode:'HTML'}
-  if(replyToMsgId) body.reply_to_message_id=replyToMsgId
-  const res=await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-  if(!res.ok){ console.error('Telegram error',res.status,await res.text()); return null }
-  const j=await res.json(); return j.result?.message_id||null
-}
-
-// ── Per-TF state: active signal tracking ─────────────────────────
-// State shape per TF key in bot_state.json:
-// { barKey, direction, entry, sl, tp1, tp2, tp3,
-//   tp1Hit, tp2Hit, tp3Hit, msgId, live }
-function loadState(tf){ try{ return JSON.parse(fs.readFileSync(STATE_FILE,'utf8'))[tf]||null }catch{ return null } }
-function saveState(tf,obj){ let o={}; try{o=JSON.parse(fs.readFileSync(STATE_FILE,'utf8'))}catch{}; o[tf]=obj; o.at=new Date().toISOString(); try{fs.writeFileSync(STATE_FILE,JSON.stringify(o,null,2))}catch(e){console.error(e)} }
+// ── TELEGRAM / live check (now multi-TF + per-TF dedupe) ─────────
+async function sendTelegram(text){ if(!TG_TOKEN||!TG_CHAT){ console.log('[telegram disabled]\n'+text); return }
+  const res=await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:TG_CHAT,text,parse_mode:'HTML'})})
+  if(!res.ok) console.error('Telegram error',res.status,await res.text()) }
+const loadKey=(tf)=>{ try{ return JSON.parse(fs.readFileSync(STATE_FILE,'utf8'))[tf]||null }catch{ return null } }
+const saveKey=(tf,k)=>{ let o={}; try{o=JSON.parse(fs.readFileSync(STATE_FILE,'utf8'))}catch{}; o[tf]=k; o.at=new Date().toISOString(); try{fs.writeFileSync(STATE_FILE,JSON.stringify(o))}catch(e){console.error(e)} }
 const logTrade=o=>{ let a=[];try{a=JSON.parse(fs.readFileSync(TRADE_LOG,'utf8'))}catch{};a.push(o);fs.writeFileSync(TRADE_LOG,JSON.stringify(a,null,2)) }
 
-// run ONE timeframe's live check — full lifecycle
+// run ONE timeframe's live check (returns nothing; sends/logs as needed)
 async function checkOne(tframe){
-  const cfg=cfgFor(tframe), ts=new Date().toISOString(), nowMs=Date.now()
-
-  // ── 1. Weekend blackout ──────────────────────────────────────
-  if(isWeekend(nowMs)){
-    console.log(`[${ts}] ${tframe} SKIP: weekend — market closed`); return
-  }
-
-  // ── 2. Fetch + validate ──────────────────────────────────────
+  const cfg=cfgFor(tframe), ts=new Date().toISOString()
   let candles
   try{ candles=await fetchCandles(500,cfg) }
   catch(e){ console.error(`[${ts}] ${tframe} fetch failed: ${e.message}`); return }
   const v=validateData(candles,cfg); candles=v.clean
   if(candles.length<50){ console.log(`[${ts}] ${tframe} too few bars`); return }
-
-  const closed=candles.slice(0,-1)
-  const forming=candles[candles.length-1]
-  const live=forming.close
-  const lastClosedBar=closed[closed.length-1]
-  const barKey=`${tframe}|${lastClosedBar.timestamp}`
-
-  // ── 3. Load prior state for this TF ─────────────────────────
-  let state=loadState(tframe)  // null or prior active signal
-
-  // ── 4. If there IS an active signal — check TP/SL hits first ─
-  if(state){
-    const {direction:aDir,entry:aEntry,sl:aSL,tp1:aTp1,tp2:aTp2,tp3:aTp3,msgId,
-           tp1Hit=false,tp2Hit=false,tp3Hit=false}=state
-    const R=Math.abs(aEntry-aSL)
-
-    // Check TP & SL hits using the FORMING bar's high/low (live)
-    const barHigh=forming.high, barLow=forming.low
-    let updated=false
-
-    if(!tp1Hit&&(aDir==='BUY'?barHigh>=aTp1:barLow<=aTp1)){
-      const pips=toPips(aTp1-aEntry)*(aDir==='BUY'?1:-1)
-      await sendTelegram(`✅ <b>GOLD ${tframe.toUpperCase()} — TP1 HIT</b>\n+${Math.abs(pips)} pips @ $${aTp1}\nRemaining position: ride to TP2 $${aTp2} · SL moved to BE`,msgId)
-      state={...state,tp1Hit:true}; updated=true
-    }
-    if(!tp2Hit&&(state.tp1Hit)&&(aDir==='BUY'?barHigh>=aTp2:barLow<=aTp2)){
-      const pips=toPips(aTp2-aEntry)*(aDir==='BUY'?1:-1)
-      await sendTelegram(`✅ <b>GOLD ${tframe.toUpperCase()} — TP2 HIT</b>\n+${Math.abs(pips)} pips @ $${aTp2}\nRemainder riding to TP3 $${aTp3}`,msgId)
-      state={...state,tp2Hit:true}; updated=true
-    }
-    if(!tp3Hit&&(state.tp2Hit)&&(aDir==='BUY'?barHigh>=aTp3:barLow<=aTp3)){
-      const pips=toPips(aTp3-aEntry)*(aDir==='BUY'?1:-1)
-      await sendTelegram(`🏆 <b>GOLD ${tframe.toUpperCase()} — TP3 HIT — FULL TARGET</b>\n+${Math.abs(pips)} pips @ $${aTp3}\nTrade complete.`,msgId)
-      state=null; saveState(tframe,null); logTrade({ts,tframe,event:'TP3',live,...state}); return
-    }
-    // SL hit
-    if((aDir==='BUY'?barLow<=aSL:barHigh>=aSL)){
-      const pips=toPips(aSL-aEntry)*(aDir==='BUY'?-1:1)
-      await sendTelegram(`🔴 <b>GOLD ${tframe.toUpperCase()} — STOP LOSS HIT</b>\n${pips} pips @ $${aSL}\nSignal closed.`,msgId)
-      state=null; saveState(tframe,null); logTrade({ts,tframe,event:'SL',live}); return
-    }
-    if(updated) saveState(tframe,state)
-  }
-
-  // ── 5. Analyse the latest completed bar ─────────────────────
-  const sig=analyse(closed,lastClosedBar.timestamp,cfg)
-
-  // ── 6. If signal is WAIT/skipped ────────────────────────────
-  if(sig.skipped){
-    // If there was an active signal and it just turned WAIT → invalidation
-    if(state){
-      const {direction:aDir,msgId,entry:aEntry,sl:aSL}=state
-      // Only invalidate if the signal direction has genuinely flipped/disappeared
-      console.log(`[${ts}] ${tframe} WAIT while active ${aDir} — sending invalidation`)
-      await sendTelegram(
-`⚠️ <b>GOLD ${tframe.toUpperCase()} — SIGNAL INVALIDATED</b>
-The ${aDir} confluence has disappeared (${sig.why}).
-→ Consider closing manually if not at BE. SL $${aSL}`,msgId)
-      state=null; saveState(tframe,null)
-    } else {
-      console.log(`[${ts}] ${tframe} WAIT · ${sig.regime} · ${sig.why}`)
-    }
-    return
-  }
-
-  // ── 7. Live price sanity checks ─────────────────────────────
-  const R=Math.abs(sig.entry-sig.sl)
-  if((sig.direction==='BUY'?live<=sig.sl:live>=sig.sl)){
-    console.log(`[${ts}] ${tframe} SKIP: live past stop`); return
-  }
-  if((sig.direction==='BUY'?sig.entry-live:live-sig.entry)>0.5*R){
-    console.log(`[${ts}] ${tframe} SKIP: stale (>0.5R drift)`); return
-  }
+  const closed=candles.slice(0,-1), forming=candles[candles.length-1]
+  const sig=analyse(closed,closed[closed.length-1].timestamp,cfg)
+  if(sig.skipped){ console.log(`[${ts}] ${tframe} WAIT · ${sig.regime} · ${sig.why}`); return }
+  const live=forming.close, R=Math.abs(sig.entry-sig.sl)
+  if((sig.direction==='BUY'?live<=sig.sl:live>=sig.sl)){ console.log(`[${ts}] ${tframe} SKIP: live past stop`); return }
+  if((sig.direction==='BUY'?sig.entry-live:live-sig.entry)>0.5*R){ console.log(`[${ts}] ${tframe} SKIP: stale (>0.5R drift)`); return }
   const slip=+(live-sig.entry).toFixed(2)
-
-  // ── 8. Is this the SAME bar we already alerted? ─────────────
-  if(state&&state.barKey===barKey){
-    console.log(`[${ts}] ${tframe} already alerted this bar`); return
-  }
-
-  // ── 9. Is this a "keep holding" update? ─────────────────────
-  // Same direction as active signal, different bar
-  if(state&&state.direction===sig.direction){
-    await sendTelegram(
-`🔄 <b>GOLD ${tframe.toUpperCase()} — KEEP HOLDING ${sig.direction}</b> (score ${sig.score}/100 ${sig.tier})
-Confluence still active · live $${live}
-SL $${sig.sl} · TP1 $${sig.tp1} · TP2 $${sig.tp2} · TP3 $${sig.tp3}`,state.msgId)
-    saveState(tframe,{...state,barKey,live})
-    console.log(`[${ts}] ✅ ${tframe} KEEP HOLDING ${sig.direction} · live $${live}`)
-    return
-  }
-
-  // ── 10. NEW signal (or direction flip) ──────────────────────
-  // If there was an opposite active signal, send a close notice first
-  if(state&&state.direction!==sig.direction){
-    await sendTelegram(
-`⚠️ <b>GOLD ${tframe.toUpperCase()} — DIRECTION FLIP</b>
-Previous ${state.direction} signal superseded.
-→ Close prior trade before entering new ${sig.direction}.`,state.msgId)
-  }
-
-  const msgId=await sendTelegram(
+  const barTs=closed[closed.length-1].timestamp, key=`${tframe}|${sig.direction}|${barTs}`
+  if(key===loadKey(tframe)){ console.log(`[${ts}] ${tframe} already alerted this bar`); return }
+  saveKey(tframe,key); logTrade({ts,tframe,live,slip,...sig})
+  await sendTelegram(
 `🟡 <b>GOLD ${tframe.toUpperCase()} — ${sig.direction}</b> (score ${sig.score}/100 ${sig.tier})
-Net ${sig.net} (bull ${sig.bull}/bear ${sig.bear}) · H1 ${sig.h1Trend} · ${sig.session}
+Net ${sig.net} (bull ${sig.bull}/bear ${sig.bear}) · H1 ${sig.h1Trend} · ${SESSION_LABEL[sig.session]||sig.session}
 Planned $${sig.entry} · live $${live} (drift ${slip>=0?'+':''}${slip})
-SL $${sig.sl}
-TP1 $${sig.tp1} (+${toPips(sig.tp1-sig.entry)} pips)
-TP2 $${sig.tp2} (+${toPips(sig.tp2-sig.entry)} pips)
-TP3 $${sig.tp3} (+${toPips(sig.tp3-sig.entry)} pips)
+SL $${sig.sl}  TP1 $${sig.tp1} TP2 $${sig.tp2} TP3 $${sig.tp3}
 Size ${sig.posSize}
-⚠️ Source ${SOURCE} — trust the report, not this tier.`)
-
-  const newState={
-    barKey, direction:sig.direction,
-    entry:sig.entry, sl:sig.sl, tp1:sig.tp1, tp2:sig.tp2, tp3:sig.tp3,
-    tp1Hit:false, tp2Hit:false, tp3Hit:false,
-    msgId, live, ts
-  }
-  saveState(tframe,newState)
-  logTrade({ts,tframe,live,slip,...sig})
-  console.log(`[${ts}] ✅ ${tframe} NEW ${sig.direction} net ${sig.net} · live $${live}`)
+⚠️ Source ${SOURCE} — must equal your execution venue. Trust the report, not this tier.`)
+  console.log(`[${ts}] ✅ ${tframe} ${sig.direction} net ${sig.net} · live $${live}`)
 }
 
 // run ALL live timeframes (15m + 1h) one after another
