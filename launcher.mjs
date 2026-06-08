@@ -1,18 +1,14 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  launcher.mjs  —  v4
-//  Fixes & features:
-//  • ONE signal message only (admin gets same as subscribers, no duplicate)
-//  • TP/SL alerts reply to the original signal message
-//  • SL alert shows pips lost
-//  • 🟢 BUY / 🔴 SELL color icons
-//  • Daily summary at midnight: total pips won/lost, trade breakdown
-//  • Invalidation alert shows if trade was profitable or at a loss + adds to daily report
+//  launcher.mjs  —  v5
+//  Candle-close sync: fires signal check exactly when each TF candle closes,
+//  not on a fixed timer. Works for any mix of timeframes (15m, 1h, 4h…).
+//  Price watcher still runs every 30s for instant TP/SL alerts.
 // ─────────────────────────────────────────────────────────────────────────────
 import { broadcastSignal } from './bot-subscription.mjs'
 import fs from 'fs'
 
-const CHECK_EVERY_MS = (parseInt(process.env.CHECK_MIN) || 15) * 60 * 1000
 const PRICE_CHECK_MS = (parseInt(process.env.PRICE_CHECK_SEC) || 30) * 1000
+const CANDLE_DELAY_MS = 1500   // wait 1.5s after close for API to update
 
 const TG_TOKEN       = process.env.TG_TOKEN        || '8970765755:AAHexBHcEKLnnBsly5AIOUAPgftnEl6_9Hg'
 const TWELVEDATA_KEY = process.env.TWELVEDATA_KEY  || 'dbf374976088424aa703db6034942e19'
@@ -23,10 +19,40 @@ const STATE_FILE     = './bot_state.json'
 const TRADE_LOG      = './trade_log.json'
 const DAILY_FILE     = './daily_report.json'
 
-const dirIcon   = dir => dir === 'BUY' ? '🟢' : '🔴'
-const toPips    = d => Math.round(Math.abs(d) * 10)
-const signedPips = (d, dir, level) =>
-  dir === 'BUY' ? toPips(level - d) : toPips(d - level)
+// TF minutes map
+const TF_MINUTES = { '1m':1, '3m':3, '5m':5, '15m':15, '30m':30, '1h':60, '2h':120, '4h':240, '1d':1440 }
+
+const dirIcon  = dir => dir === 'BUY' ? '🟢' : '🔴'
+const toPips   = d => Math.round(Math.abs(d) * 10)
+
+// ── Candle close scheduler ────────────────────────────────────────────────────
+// For a given TF, calculates exactly how many ms until the NEXT candle closes.
+// Example: for 15m, candles close at :00, :15, :30, :45 of every hour.
+// We schedule a one-shot setTimeout for each close, then reschedule the next.
+
+function msUntilNextClose(tfMinutes) {
+  const now = Date.now()
+  const periodMs = tfMinutes * 60 * 1000
+  const nextClose = Math.ceil(now / periodMs) * periodMs
+  return nextClose - now
+}
+
+function scheduleCandle(tf, callback) {
+  const mins = TF_MINUTES[tf]
+  if (!mins) { console.error(`Unknown TF: ${tf}`); return }
+
+  const wait = msUntilNextClose(mins)
+  const closeAt = new Date(Date.now() + wait).toISOString()
+  console.log(`[scheduler] ${tf} next candle close in ${(wait/1000).toFixed(1)}s (at ${closeAt})`)
+
+  setTimeout(async () => {
+    // Small delay so the API has the closed candle available
+    await new Promise(r => setTimeout(r, CANDLE_DELAY_MS))
+    await callback(tf)
+    // Schedule the next one
+    scheduleCandle(tf, callback)
+  }, wait)
+}
 
 // ── State helpers ─────────────────────────────────────────────────────────────
 function loadState() {
@@ -44,7 +70,6 @@ function loadDaily() {
 }
 function saveDaily(d) { fs.writeFileSync(DAILY_FILE, JSON.stringify(d, null, 2)) }
 function addToDaily(trade) {
-  // trade = { tf, dir, result: 'TP1'|'TP2'|'TP3'|'SL'|'INVALIDATED', pips, sign: +/- }
   const key = todayKey()
   const daily = loadDaily()
   if (!daily[key]) daily[key] = { trades: [], totalPips: 0 }
@@ -53,10 +78,8 @@ function addToDaily(trade) {
   saveDaily(daily)
 }
 
-// ── Telegram: send to EVERYONE (admin + all subscribers) ─────────────────────
-// Returns the message_id from admin chat (used as reply anchor for subscribers too)
+// ── Send to admin + all subscribers ──────────────────────────────────────────
 async function sendAll(text, replyToMsgId = null) {
-  // 1. Send to admin chat — get message_id back
   let adminMsgId = null
   try {
     const body = { chat_id: TG_CHAT, text, parse_mode: 'HTML' }
@@ -69,13 +92,12 @@ async function sendAll(text, replyToMsgId = null) {
     if (j.ok) adminMsgId = j.result.message_id
   } catch (e) { console.error('[sendAll admin]', e.message) }
 
-  // 2. Broadcast to all active subscribers
   const result = await broadcastSignal(text, replyToMsgId)
-  console.log(`[sendAll] admin msgId=${adminMsgId} · subs sent=${result.sent} failed=${result.failed}`)
+  console.log(`[sendAll] adminMsgId=${adminMsgId} subs sent=${result.sent} failed=${result.failed}`)
   return adminMsgId
 }
 
-// ── Live price fetch (lightweight — no candles) ───────────────────────────────
+// ── Live price (lightweight, no candles) ─────────────────────────────────────
 async function fetchLivePrice() {
   try {
     const res = await fetch(
@@ -96,7 +118,7 @@ async function fetchLivePrice() {
   return null
 }
 
-// ── FAST PRICE WATCHER — every 30s, instant TP/SL detection ──────────────────
+// ── FAST PRICE WATCHER — every 30s, instant TP/SL ───────────────────────────
 async function fastPriceCheck() {
   const livePrice = await fetchLivePrice()
   if (!livePrice) return
@@ -125,7 +147,7 @@ Trade closed. ✅`
       await sendAll(msg, msgId)
       addToDaily({ tf, dir, result: 'SL', pips, sign: -1 })
       state[tf] = null; changed = true
-      console.log(`[${ts}] [${tf}] 🔴 SL hit`)
+      console.log(`[${ts}] [${tf}] 🔴 SL hit -${pips} pips`)
       continue
     }
 
@@ -141,9 +163,8 @@ Live: $${livePrice.toFixed(2)}
       const newMsgId = await sendAll(msg, msgId)
       addToDaily({ tf, dir, result: 'TP1', pips, sign: +1 })
       state[tf] = { ...sig, tp1Hit: true, sl: entry, msgId: newMsgId || msgId }
-      changed = true
-      sig.tp1Hit = true; sig.sl = entry
-      console.log(`[${ts}] [${tf}] ✅ TP1 hit`)
+      changed = true; sig.tp1Hit = true; sig.sl = entry
+      console.log(`[${ts}] [${tf}] ✅ TP1 hit +${pips} pips`)
     }
 
     // ── TP2 ───────────────────────────────────────────────────────────────────
@@ -159,7 +180,7 @@ Live: $${livePrice.toFixed(2)}
       addToDaily({ tf, dir, result: 'TP2', pips, sign: +1 })
       state[tf] = { ...state[tf], tp2Hit: true, msgId: newMsgId || msgId }
       changed = true; sig.tp2Hit = true
-      console.log(`[${ts}] [${tf}] ✅ TP2 hit`)
+      console.log(`[${ts}] [${tf}] ✅ TP2 hit +${pips} pips`)
     }
 
     // ── TP3 ───────────────────────────────────────────────────────────────────
@@ -174,70 +195,64 @@ All targets reached! 🎯`
       await sendAll(msg, msgId)
       addToDaily({ tf, dir, result: 'TP3', pips, sign: +1 })
       state[tf] = null; changed = true
-      console.log(`[${ts}] [${tf}] 🏆 TP3 hit`)
+      console.log(`[${ts}] [${tf}] 🏆 TP3 hit +${pips} pips`)
     }
   }
 
   if (changed) saveState(state)
 }
 
-// ── SIGNAL CYCLE — every 15m ──────────────────────────────────────────────────
-async function runSignalCycle() {
+// ── SIGNAL CYCLE — runs on candle close ──────────────────────────────────────
+async function runSignalCycle(tf) {
   const ts = new Date().toISOString()
-  console.log(`[${ts}] 🔍 Signal cycle: ${LIVE_TFS.join(', ')}`)
+  console.log(`[${ts}] 🕯️  Candle closed: ${tf} — running signal check`)
 
-  for (const tf of LIVE_TFS) {
-    try {
-      const { execFile } = await import('child_process')
-      const { promisify } = await import('util')
-      const exec = promisify(execFile)
+  try {
+    const { execFile } = await import('child_process')
+    const { promisify } = await import('util')
+    const exec = promisify(execFile)
 
-      const env = {
-        ...process.env,
-        LIVE_TFS: tf,
-        TWELVEDATA_KEY,
-        TG_TOKEN: '',           // ← BLANK: stop gold-ai.mjs from sending its own message
-        GOLD_SOURCE: SOURCE,
-        TG_CHAT,
-      }
+    const env = {
+      ...process.env,
+      LIVE_TFS: tf,
+      TWELVEDATA_KEY,
+      TG_TOKEN: '',        // blank — launcher sends, not gold-ai.mjs
+      GOLD_SOURCE: SOURCE,
+      TG_CHAT,
+    }
 
-      const { stdout, stderr } = await exec('node', ['gold-ai.mjs', 'check'], {
-        env, timeout: 60000,
-      })
+    const { stdout, stderr } = await exec('node', ['gold-ai.mjs', 'check'], {
+      env, timeout: 60000,
+    })
 
-      if (stdout) console.log(`[${tf}]`, stdout.trim())
-      if (stderr) console.error(`[${tf} err]`, stderr.trim())
+    if (stdout) console.log(`[${tf}]`, stdout.trim())
+    if (stderr) console.error(`[${tf} err]`, stderr.trim())
 
-      const lines = stdout.split('\n')
-      for (const line of lines) {
-        if (!line.includes('✅')) continue
-        const isNew  = line.includes('NEW')
-        const isHold = line.includes('KEEP HOLDING')
-        if (!isNew && !isHold) continue
+    const lines = stdout.split('\n')
+    for (const line of lines) {
+      if (!line.includes('✅')) continue
+      const isNew  = line.includes('NEW')
+      const isHold = line.includes('KEEP HOLDING')
+      if (!isNew && !isHold) continue
 
-        // Read latest signal from trade_log (written by gold-ai.mjs)
-        const log = (() => { try { return JSON.parse(fs.readFileSync(TRADE_LOG, 'utf8')) } catch { return [] } })()
-        const latest = log.filter(e => e.tframe === tf && !e.event).pop()
-        if (!latest) continue
-        if (Date.now() - new Date(latest.ts).getTime() > 5 * 60000) continue
+      const log = (() => { try { return JSON.parse(fs.readFileSync(TRADE_LOG, 'utf8')) } catch { return [] } })()
+      const latest = log.filter(e => e.tframe === tf && !e.event).pop()
+      if (!latest) continue
+      if (Date.now() - new Date(latest.ts).getTime() > 5 * 60000) continue
 
-        const sig = latest
-        let msgText
+      const sig = latest
+      let msgText
 
-        if (isHold) {
-          msgText =
+      if (isHold) {
+        msgText =
 `${dirIcon(sig.direction)} <b>GOLD ${tf.toUpperCase()} — KEEP HOLDING ${sig.direction}</b> (score ${sig.score}/100 ${sig.tier})
 Confluence still active · live $${sig.live}
 SL $${sig.sl} · TP1 $${sig.tp1} · TP2 $${sig.tp2} · TP3 $${sig.tp3}`
-
-          // Reply to original signal message
-          const state = loadState()
-          const replyId = state[tf]?.msgId || null
-          await sendAll(msgText, replyId)
-
-        } else {
-          // NEW signal
-          msgText =
+        const state = loadState()
+        const replyId = state[tf]?.msgId || null
+        await sendAll(msgText, replyId)
+      } else {
+        msgText =
 `${dirIcon(sig.direction)} <b>GOLD ${tf.toUpperCase()} — ${sig.direction}</b> (score ${sig.score}/100 ${sig.tier})
 Net ${sig.net} · H1 ${sig.h1Trend} · ${sig.session}
 Entry $${sig.entry} · live $${sig.live}
@@ -247,61 +262,46 @@ TP2 $${sig.tp2} (+${toPips(sig.tp2 - sig.entry)} pips)
 TP3 $${sig.tp3} (+${toPips(sig.tp3 - sig.entry)} pips)
 Size: ${sig.posSize}
 ⚠️ Manage risk. Not financial advice.`
-
-          const newMsgId = await sendAll(msgText)
-
-          // Save msgId into state so replies work for TP/SL
-          const state = loadState()
-          if (state[tf]) {
-            state[tf].msgId = newMsgId
-            saveState(state)
-          }
-        }
-
-        console.log(`[${tf}] 📡 Sent ${isHold ? 'KEEP HOLDING' : 'NEW'} signal`)
-      }
-
-      // ── Invalidation detection ─────────────────────────────────────────────
-      for (const line of lines) {
-        if (!line.includes('invalidation') && !line.includes('SIGNAL INVALIDATED')) continue
-
+        const newMsgId = await sendAll(msgText)
+        // Save msgId so TP/SL replies work
         const state = loadState()
-        const sig = state[tf]
-        const livePrice = await fetchLivePrice()
-
-        if (sig && sig.entry && livePrice) {
-          const dir = sig.direction
-          const pipDiff = dir === 'BUY'
-            ? (livePrice - sig.entry) * 10
-            : (sig.entry - livePrice) * 10
-          const profitable = pipDiff > 0
-          const pipAbs = Math.round(Math.abs(pipDiff))
-          const profitStr = profitable
-            ? `+${pipAbs} pips in profit`
-            : `-${pipAbs} pips at a loss`
-
-          const msg =
-`⚠️ <b>GOLD ${tf.toUpperCase()} — SIGNAL INVALIDATED</b>
-Confluence has disappeared.
-→ Consider closing manually.
-
-Current P&L: <b>${profitStr}</b> (live $${livePrice.toFixed(2)} vs entry $${sig.entry})`
-
-          await sendAll(msg, sig.msgId)
-          addToDaily({ tf, dir, result: 'INVALIDATED', pips: pipAbs, sign: profitable ? +1 : -1 })
-          state[tf] = null
-          saveState(state)
-          console.log(`[${tf}] ⚠️ Invalidation sent (${profitStr})`)
-        }
+        if (state[tf]) { state[tf].msgId = newMsgId; saveState(state) }
       }
 
-    } catch (e) {
-      console.error(`[${tf}] cycle error: ${e.message}`)
+      console.log(`[${tf}] 📡 Sent ${isHold ? 'KEEP HOLDING' : 'NEW'} signal`)
     }
+
+    // ── Invalidation ──────────────────────────────────────────────────────────
+    for (const line of lines) {
+      if (!line.includes('invalidation') && !line.includes('SIGNAL INVALIDATED')) continue
+      const state = loadState()
+      const sig = state[tf]
+      const livePrice = await fetchLivePrice()
+      if (sig && sig.entry && livePrice) {
+        const dir = sig.direction
+        const pipDiff = dir === 'BUY' ? (livePrice - sig.entry) * 10 : (sig.entry - livePrice) * 10
+        const profitable = pipDiff > 0
+        const pipAbs = Math.round(Math.abs(pipDiff))
+        const profitStr = profitable ? `+${pipAbs} pips in profit` : `-${pipAbs} pips at a loss`
+        const msg =
+`⚠️ <b>GOLD ${tf.toUpperCase()} — SIGNAL INVALIDATED</b>
+Confluence has disappeared. Consider closing manually.
+
+Current P&L: <b>${profitStr}</b>
+Live $${livePrice.toFixed(2)} vs entry $${sig.entry}`
+        await sendAll(msg, sig.msgId)
+        addToDaily({ tf, dir, result: 'INVALIDATED', pips: pipAbs, sign: profitable ? +1 : -1 })
+        state[tf] = null; saveState(state)
+        console.log(`[${tf}] ⚠️ Invalidation (${profitStr})`)
+      }
+    }
+
+  } catch (e) {
+    console.error(`[${tf}] cycle error: ${e.message}`)
   }
 }
 
-// ── DAILY SUMMARY — sent at midnight UTC ─────────────────────────────────────
+// ── DAILY SUMMARY — sent at UTC midnight ─────────────────────────────────────
 function scheduleDailySummary() {
   function msUntilMidnight() {
     const now = new Date()
@@ -314,58 +314,51 @@ function scheduleDailySummary() {
     const daily = loadDaily()
     const day = daily[key]
 
-    if (!day || !day.trades || day.trades.length === 0) {
-      // Schedule next midnight
-      setTimeout(() => { sendDailySummary(); scheduleDailySummary() }, 86400000)
-      return
-    }
-
-    const trades = day.trades
-    const totalPips = Math.round(day.totalPips)
-    const wins = trades.filter(t => t.sign > 0)
-    const losses = trades.filter(t => t.sign < 0)
-
-    // Build per-trade lines
-    const lines = trades.map(t => {
-      const icon = t.sign > 0 ? '✅' : '❌'
-      const sign = t.sign > 0 ? '+' : '-'
-      return `${icon} ${t.tf.toUpperCase()} ${t.dir} → ${t.result}: ${sign}${t.pips} pips`
-    })
-
-    const summaryIcon = totalPips >= 0 ? '📈' : '📉'
-    const summaryLine = totalPips >= 0
-      ? `+${totalPips} pips profit`
-      : `${totalPips} pips loss`
-
-    const msg =
+    if (day && day.trades && day.trades.length > 0) {
+      const trades = day.trades
+      const totalPips = Math.round(day.totalPips)
+      const wins = trades.filter(t => t.sign > 0)
+      const losses = trades.filter(t => t.sign < 0)
+      const lines = trades.map(t => {
+        const icon = t.sign > 0 ? '✅' : '❌'
+        const sign = t.sign > 0 ? '+' : '-'
+        return `${icon} ${t.tf.toUpperCase()} ${t.dir} → ${t.result}: ${sign}${t.pips} pips`
+      })
+      const summaryIcon = totalPips >= 0 ? '📈' : '📉'
+      const summaryLine = totalPips >= 0 ? `+${totalPips} pips profit` : `${totalPips} pips loss`
+      const msg =
 `${summaryIcon} <b>GOLD AI — Daily Summary (${key})</b>
 
 ${lines.join('\n')}
 
-──────────────────
+──────────────
 Trades: ${trades.length} | Wins: ${wins.length} | Losses: ${losses.length}
 <b>Total: ${summaryLine}</b>`
+      await sendAll(msg)
+      console.log(`[daily] Summary sent: ${summaryLine}`)
+    }
 
-    await sendAll(msg)
-    console.log(`[daily] Summary sent for ${key}: ${summaryLine}`)
-
-    // Schedule next day
-    setTimeout(() => { sendDailySummary(); }, msUntilMidnight() + 1000)
+    setTimeout(sendDailySummary, msUntilMidnight() + 1000)
   }
 
   setTimeout(sendDailySummary, msUntilMidnight() + 1000)
-  console.log(`   📅 Daily summary: scheduled at UTC midnight (in ${Math.round(msUntilMidnight()/60000)} min)`)
+  console.log(`   📅 Daily summary: in ${Math.round(msUntilMidnight()/60000)} min`)
 }
 
 // ── START ─────────────────────────────────────────────────────────────────────
-console.log('🚀 Gold AI Launcher v4 started')
-console.log(`   📊 Signal cycle:  every ${CHECK_EVERY_MS / 60000} min`)
-console.log(`   ⚡ Price watcher: every ${PRICE_CHECK_MS / 1000}s (instant TP/SL)`)
+console.log('🚀 Gold AI Launcher v5 — candle-sync mode')
 console.log(`   📈 Timeframes:    ${LIVE_TFS.join(', ')}`)
+console.log(`   ⚡ Price watcher: every ${PRICE_CHECK_MS / 1000}s`)
 console.log(`   🔌 Data source:   ${SOURCE}`)
+console.log(`   ⏱️  Candle delay:  ${CANDLE_DELAY_MS}ms after close`)
 
 scheduleDailySummary()
-runSignalCycle()
-setInterval(runSignalCycle, CHECK_EVERY_MS)
+
+// Schedule each TF independently on its own candle close timing
+for (const tf of LIVE_TFS) {
+  scheduleCandle(tf, runSignalCycle)
+}
+
+// Price watcher: instant TP/SL
 fastPriceCheck()
 setInterval(fastPriceCheck, PRICE_CHECK_MS)
