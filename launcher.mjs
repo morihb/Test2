@@ -285,31 +285,38 @@ async function runSignalCycle(tf) {
     throw new Error(stderr.trim().slice(0, 120))
   }
 
-    const lines = stdout.split('\n')
-    for (const line of lines) {
-      if (!line.includes('✅')) continue
-      const isNew  = line.includes('NEW')
-      const isHold = line.includes('KEEP HOLDING')
-      if (!isNew && !isHold) continue
+  const lines = stdout.split('\n')
 
-      const log = (() => { try { return JSON.parse(fs.readFileSync(TRADE_LOG, 'utf8')) } catch { return [] } })()
-      const latest = log.filter(e => e.tframe === tf && !e.event).pop()
-      if (!latest) continue
-      if (Date.now() - new Date(latest.ts).getTime() > 5 * 60000) continue
+  // ── Detect signal type from stdout markers ──────────────────────────────────
+  // gold-ai.mjs logs:
+  //   "✅ {tf} NEW {dir} net …"        → new signal
+  //   "✅ {tf} KEEP HOLDING {dir} …"   → keep holding
+  //   "⚠️ {tf} WAIT while active …"    → invalidation
 
-      const sig = latest
-      let msgText
+  const hasNew        = lines.some(l => l.includes('✅') && l.includes('NEW'))
+  const hasHold       = lines.some(l => l.includes('✅') && l.includes('KEEP HOLDING'))
+  const hasInvalid    = lines.some(l => l.includes('invalidation') || l.includes('SIGNAL INVALIDATED'))
 
-      if (isHold) {
-        msgText =
+  // Read latest trade_log entry for this TF (written by gold-ai.mjs on every signal)
+  const log = (() => { try { return JSON.parse(fs.readFileSync(TRADE_LOG, 'utf8')) } catch { return [] } })()
+  const latest = log.filter(e => e.tframe === tf && !e.event).pop()
+  const fresh  = latest && (Date.now() - new Date(latest.ts).getTime() < 5 * 60000)
+
+  if ((hasNew || hasHold) && latest && fresh) {
+    const sig = latest
+
+    if (hasHold) {
+      const state = loadState()
+      const replyId = state[tf]?.msgId || null
+      const msgText =
 `${dirIcon(sig.direction)} <b>GOLD ${tf.toUpperCase()} — KEEP HOLDING ${sig.direction}</b> (score ${sig.score}/100 ${sig.tier})
 Confluence still active · live $${sig.live}
 SL $${sig.sl} · TP1 $${sig.tp1} · TP2 $${sig.tp2} · TP3 $${sig.tp3}`
-        const state = loadState()
-        const replyId = state[tf]?.msgId || null
-        await sendAll(msgText, replyId)
-      } else {
-        msgText =
+      await sendAll(msgText, replyId)
+      console.log(`[${tf}] 📡 Sent KEEP HOLDING`)
+
+    } else {
+      const msgText =
 `${dirIcon(sig.direction)} <b>GOLD ${tf.toUpperCase()} — ${sig.direction}</b> (score ${sig.score}/100 ${sig.tier})
 Net ${sig.net} · H1 ${sig.h1Trend} · ${sig.session}
 Entry $${sig.entry} · live $${sig.live}
@@ -319,39 +326,37 @@ TP2 $${sig.tp2} (+${toPips(sig.tp2 - sig.entry)} pips)
 TP3 $${sig.tp3} (+${toPips(sig.tp3 - sig.entry)} pips)
 Size: ${sig.posSize}
 ⚠️ Manage risk. Not financial advice.`
-        const newMsgId = await sendAll(msgText)
-        // Save msgId so TP/SL replies work
-        const state = loadState()
-        if (state[tf]) { state[tf].msgId = newMsgId; saveState(state) }
-      }
-
-      console.log(`[${tf}] 📡 Sent ${isHold ? 'KEEP HOLDING' : 'NEW'} signal`)
-    }
-
-    // ── Invalidation ──────────────────────────────────────────────────────────
-    for (const line of lines) {
-      if (!line.includes('invalidation') && !line.includes('SIGNAL INVALIDATED')) continue
+      const newMsgId = await sendAll(msgText)
+      // Save msgId into state so TP/SL alerts can reply to this message
       const state = loadState()
-      const sig = state[tf]
-      const livePrice = await fetchLivePrice()
-      if (sig && sig.entry && livePrice) {
-        const dir = sig.direction
-        const pipDiff = dir === 'BUY' ? (livePrice - sig.entry) * 10 : (sig.entry - livePrice) * 10
-        const profitable = pipDiff > 0
-        const pipAbs = Math.round(Math.abs(pipDiff))
-        const profitStr = profitable ? `+${pipAbs} pips in profit` : `-${pipAbs} pips at a loss`
-        const msg =
+      if (state[tf]) { state[tf].msgId = newMsgId; saveState(state) }
+      console.log(`[${tf}] 📡 Sent NEW signal`)
+    }
+  }
+
+  // ── Invalidation ─────────────────────────────────────────────────────────────
+  if (hasInvalid) {
+    const state = loadState()
+    const sig   = state[tf]
+    const livePrice = await fetchLivePrice()
+    if (sig && sig.entry && livePrice) {
+      const dir  = sig.direction
+      const pipDiff   = dir === 'BUY' ? (livePrice - sig.entry) * 10 : (sig.entry - livePrice) * 10
+      const profitable = pipDiff > 0
+      const pipAbs    = Math.round(Math.abs(pipDiff))
+      const profitStr = profitable ? `+${pipAbs} pips in profit` : `-${pipAbs} pips at a loss`
+      const msg =
 `⚠️ <b>GOLD ${tf.toUpperCase()} — SIGNAL INVALIDATED</b>
 Confluence has disappeared. Consider closing manually.
 
 Current P&L: <b>${profitStr}</b>
 Live $${livePrice.toFixed(2)} vs entry $${sig.entry}`
-        await sendAll(msg, sig.msgId)
-        addToDaily({ tf, dir, result: 'INVALIDATED', pips: pipAbs, sign: profitable ? +1 : -1 })
-        state[tf] = null; saveState(state)
-        console.log(`[${tf}] ⚠️ Invalidation (${profitStr})`)
-      }
+      await sendAll(msg, sig.msgId)
+      addToDaily({ tf, dir, result: 'INVALIDATED', pips: pipAbs, sign: profitable ? +1 : -1 })
+      state[tf] = null; saveState(state)
+      console.log(`[${tf}] ⚠️ Invalidation sent (${profitStr})`)
     }
+  }
 }
 
 // ── DAILY SUMMARY — sent at UTC midnight ─────────────────────────────────────
