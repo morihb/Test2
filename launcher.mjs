@@ -412,10 +412,17 @@ console.log(`   ⏱️  Candle delay:  ${CANDLE_DELAY_MS}ms after close`)
 
 scheduleDailySummary()
 
-// Schedule each TF independently on its own candle close timing
-for (const tf of LIVE_TFS) {
-  scheduleCandle(tf, runSignalCycle)
-}
+// Run once immediately on startup, then sync to candle closes
+;(async () => {
+  for (const tf of LIVE_TFS) {
+    console.log(`[startup] Running initial check for ${tf}…`)
+    try { await runSignalCycle(tf) } catch (e) { console.error(`[startup] ${tf} error: ${e.message}`) }
+  }
+  // Now schedule all TFs on candle-close timing
+  for (const tf of LIVE_TFS) {
+    scheduleCandle(tf, runSignalCycle)
+  }
+})()
 
 // Price watcher: instant TP/SL
 fastPriceCheck()
