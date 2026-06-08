@@ -1,3 +1,4 @@
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  launcher.mjs  —  v5
 //  Candle-close sync: fires signal check exactly when each TF candle closes,
@@ -18,8 +19,9 @@ const TG_TOKEN       = process.env.TG_TOKEN        || '8970765755:AAHexBHcEKLnnB
 // Primary and fallback TwelveData API keys
 // Fallback activates automatically when primary hits rate limit (429)
 const TWELVEDATA_KEYS = [
-  process.env.TWELVEDATA_KEY  || 'dbf374976088424aa703db6034942e19',  // primary
-  'da16adf775b04e31a6a33386689e38c8',                                   // fallback
+  process.env.TWELVEDATA_KEY  || 'dbf374976088424aa703db6034942e19',  // key 1
+  'da16adf775b04e31a6a33386689e38c8',                                   // key 2
+  '34034261d78440e28ece3d43ddd64955',                                   // key 3
 ]
 let activeKeyIndex = 0
 let TWELVEDATA_KEY = TWELVEDATA_KEYS[0]
@@ -256,9 +258,9 @@ All targets reached! 🎯`
 }
 
 // ── SIGNAL CYCLE — runs on candle close ──────────────────────────────────────
-async function runSignalCycle(tf) {
+async function runSignalCycle(tf, isStartup = false) {
   const ts = new Date().toISOString()
-  console.log(`[${ts}] 🕯️  Candle closed: ${tf} — running signal check`)
+  console.log(`[${ts}] 🕯️  Candle closed: ${tf} — running signal check${isStartup ? ' (startup)' : ''}`)
 
   const { execFile } = await import('child_process')
   const { promisify } = await import('util')
@@ -295,16 +297,21 @@ async function runSignalCycle(tf) {
   const log     = (() => { try { return JSON.parse(fs.readFileSync(TRADE_LOG, 'utf8')) } catch { return [] } })()
   const entries = log.filter(e => e.tframe === tf && !e.event)
   const latest  = entries[entries.length - 1]
-  const fresh   = latest && (Date.now() - new Date(latest.ts).getTime() < 5 * 60000)
 
   // Also check if stdout has a "already alerted" or "WAIT" to detect hold vs new
   const alreadyAlerted = lines.some(l => l.includes('already alerted'))
   const isWait         = lines.some(l => l.includes('WAIT') || l.includes('SKIP'))
   const hasSignal      = lines.some(l => l.includes('✅'))
 
-  console.log(`[${tf}] stdout markers: hasSignal=${hasSignal} already=${alreadyAlerted} wait=${isWait} fresh=${fresh}`)
+  // On startup: extend freshness to 2h and ignore alreadyAlerted
+  // (signal may have fired before launcher started)
+  const freshnessMs = isStartup ? 2 * 60 * 60000 : 5 * 60000
+  const fresh       = latest && (Date.now() - new Date(latest.ts).getTime() < freshnessMs)
+  const shouldSend  = (hasSignal || isStartup) && fresh && (!alreadyAlerted || isStartup)
 
-  if (hasSignal && fresh && !alreadyAlerted) {
+  console.log(`[${tf}] markers: signal=${hasSignal} already=${alreadyAlerted} wait=${isWait} fresh=${fresh} startup=${isStartup} → send=${shouldSend}`)
+
+  if (shouldSend) {
     const sig = latest
 
     // Is this a keep-holding (same direction already in state)?
@@ -424,7 +431,27 @@ scheduleDailySummary()
 ;(async () => {
   for (const tf of LIVE_TFS) {
     console.log(`[startup] Running initial check for ${tf}…`)
-    try { await runSignalCycle(tf) } catch (e) { console.error(`[startup] ${tf} error: ${e.message}`) }
+    // Retry on 429 at startup — both keys may need a moment to reset
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        await runSignalCycle(tf, true)  // isStartup=true
+        break
+      } catch (e) {
+        const is429 = e.message?.includes('429') || e.message?.includes('fetch failed')
+        if (is429 && attempt < MAX_RETRIES) {
+          switchToNextKey()
+          console.log(`[startup] ${tf} 429 on attempt ${attempt} — waiting 65s then retrying…`)
+          await new Promise(r => setTimeout(r, 65000))
+        } else {
+          console.error(`[startup] ${tf} gave up: ${e.message}`)
+          break
+        }
+      }
+    }
+    // Small gap between TFs to avoid simultaneous API calls
+    if (LIVE_TFS.indexOf(tf) < LIVE_TFS.length - 1) {
+      await new Promise(r => setTimeout(r, 5000))
+    }
   }
   // Now schedule all TFs on candle-close timing
   for (const tf of LIVE_TFS) {
