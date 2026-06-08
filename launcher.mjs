@@ -287,32 +287,37 @@ async function runSignalCycle(tf) {
 
   const lines = stdout.split('\n')
 
-  // ── Detect signal type from stdout markers ──────────────────────────────────
-  // gold-ai.mjs logs:
-  //   "✅ {tf} NEW {dir} net …"        → new signal
-  //   "✅ {tf} KEEP HOLDING {dir} …"   → keep holding
-  //   "⚠️ {tf} WAIT while active …"    → invalidation
+  // ── Detect signal from trade_log — no keyword matching needed ────────────────
+  // gold-ai.mjs (v3.1) always writes to trade_log.json BEFORE printing stdout.
+  // Strategy: compare the latest entry timestamp to what we had BEFORE the run.
+  // If it's newer → new signal fired. No fragile string matching.
 
-  const hasNew        = lines.some(l => l.includes('✅') && l.includes('NEW'))
-  const hasHold       = lines.some(l => l.includes('✅') && l.includes('KEEP HOLDING'))
-  const hasInvalid    = lines.some(l => l.includes('invalidation') || l.includes('SIGNAL INVALIDATED'))
+  const log     = (() => { try { return JSON.parse(fs.readFileSync(TRADE_LOG, 'utf8')) } catch { return [] } })()
+  const entries = log.filter(e => e.tframe === tf && !e.event)
+  const latest  = entries[entries.length - 1]
+  const fresh   = latest && (Date.now() - new Date(latest.ts).getTime() < 5 * 60000)
 
-  // Read latest trade_log entry for this TF (written by gold-ai.mjs on every signal)
-  const log = (() => { try { return JSON.parse(fs.readFileSync(TRADE_LOG, 'utf8')) } catch { return [] } })()
-  const latest = log.filter(e => e.tframe === tf && !e.event).pop()
-  const fresh  = latest && (Date.now() - new Date(latest.ts).getTime() < 5 * 60000)
+  // Also check if stdout has a "already alerted" or "WAIT" to detect hold vs new
+  const alreadyAlerted = lines.some(l => l.includes('already alerted'))
+  const isWait         = lines.some(l => l.includes('WAIT') || l.includes('SKIP'))
+  const hasSignal      = lines.some(l => l.includes('✅'))
 
-  if ((hasNew || hasHold) && latest && fresh) {
+  console.log(`[${tf}] stdout markers: hasSignal=${hasSignal} already=${alreadyAlerted} wait=${isWait} fresh=${fresh}`)
+
+  if (hasSignal && fresh && !alreadyAlerted) {
     const sig = latest
 
-    if (hasHold) {
-      const state = loadState()
-      const replyId = state[tf]?.msgId || null
+    // Is this a keep-holding (same direction already in state)?
+    const state   = loadState()
+    const current = state[tf]
+    const isHold  = current && current.direction === sig.direction && current.msgId
+
+    if (isHold) {
       const msgText =
 `${dirIcon(sig.direction)} <b>GOLD ${tf.toUpperCase()} — KEEP HOLDING ${sig.direction}</b> (score ${sig.score}/100 ${sig.tier})
 Confluence still active · live $${sig.live}
 SL $${sig.sl} · TP1 $${sig.tp1} · TP2 $${sig.tp2} · TP3 $${sig.tp3}`
-      await sendAll(msgText, replyId)
+      await sendAll(msgText, current.msgId)
       console.log(`[${tf}] 📡 Sent KEEP HOLDING`)
 
     } else {
@@ -328,19 +333,22 @@ Size: ${sig.posSize}
 ⚠️ Manage risk. Not financial advice.`
       const newMsgId = await sendAll(msgText)
       // Save msgId into state so TP/SL alerts can reply to this message
-      const state = loadState()
-      if (state[tf]) { state[tf].msgId = newMsgId; saveState(state) }
-      console.log(`[${tf}] 📡 Sent NEW signal`)
+      const stateNow = loadState()
+      if (stateNow[tf]) { stateNow[tf].msgId = newMsgId; saveState(stateNow) }
+      console.log(`[${tf}] 📡 Sent NEW signal msgId=${newMsgId}`)
     }
+  } else if (!hasSignal && !fresh) {
+    console.log(`[${tf}] No signal this candle`)
   }
 
   // ── Invalidation ─────────────────────────────────────────────────────────────
+  const hasInvalid = lines.some(l => l.includes('invalidation') || l.includes('SIGNAL INVALIDATED'))
   if (hasInvalid) {
     const state = loadState()
     const sig   = state[tf]
     const livePrice = await fetchLivePrice()
     if (sig && sig.entry && livePrice) {
-      const dir  = sig.direction
+      const dir       = sig.direction
       const pipDiff   = dir === 'BUY' ? (livePrice - sig.entry) * 10 : (sig.entry - livePrice) * 10
       const profitable = pipDiff > 0
       const pipAbs    = Math.round(Math.abs(pipDiff))
