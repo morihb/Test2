@@ -1,15 +1,21 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  launcher.mjs  —  v6
+//  launcher.mjs  —  v7
 //  Candle-close sync: fires signal check exactly when each TF candle closes.
 //  Price watcher runs every 30s for instant TP alerts.
 //
-//  v6 changes:
-//   • SL is now CONFIRMED ON CANDLE CLOSE, not on a wick. A wick that pierces
-//     the SL but closes back inside keeps the trade valid. SL is checked at
-//     each TF's candle close using that candle's CLOSE price.
-//   • TP1/TP2/TP3 still fire instantly on the 30s price watcher (reply + pips).
-//   • Same-direction repeat signal on a TF → "KEEP HOLDING" reply (no new trade).
-//   • NEW signal messages carry the SL-on-close disclaimer.
+//  v7 fix (the important one):
+//   • gold-ai.mjs writes its OWN string dedupe key into bot_state.json[tf],
+//     which clobbers the launcher's trade OBJECT every candle. That made the
+//     `isHold` check fail (object → string) so every repeat fired as a NEW
+//     signal and KEEP HOLDING never triggered.
+//   • Fix: snapshot the open trade BEFORE running gold-ai, decide NEW vs HOLD
+//     from that snapshot, and re-write our object afterward (gold-ai's string
+//     is always restored back to our object). KEEP HOLDING now works.
+//
+//  v6 carried over:
+//   • SL confirmed ON CANDLE CLOSE (a wick through SL keeps the trade valid).
+//   • TP1/TP2/TP3 fire instantly on the 30s watcher (reply + pips).
+//   • NEW signals carry the SL-on-close disclaimer.
 // ─────────────────────────────────────────────────────────────────────────────
 import { broadcastSignal } from './bot-subscription.mjs'
 import fs from 'fs'
@@ -58,11 +64,13 @@ const TD_INTERVAL = { '1m':'1min','3m':'3min','5m':'5min','15m':'15min','30m':'3
 const dirIcon  = dir => dir === 'BUY' ? '🟢' : '🔴'
 const toPips   = d => Math.round(Math.abs(d) * 10)
 
-// ── Candle close scheduler ────────────────────────────────────────────────────
-// For a given TF, calculates exactly how many ms until the NEXT candle closes.
-// Example: for 15m, candles close at :00, :15, :30, :45 of every hour.
-// We schedule a one-shot setTimeout for each close, then reschedule the next.
+// Read an active trade object for a TF, ignoring gold-ai's string dedupe keys.
+function openTrade(state, tf) {
+  const s = state[tf]
+  return (s && typeof s === 'object' && s.direction) ? s : null
+}
 
+// ── Candle close scheduler ────────────────────────────────────────────────────
 function msUntilNextClose(tfMinutes) {
   const now = Date.now()
   const periodMs = tfMinutes * 60 * 1000
@@ -82,7 +90,6 @@ function scheduleCandle(tf, callback) {
   setTimeout(async () => {
     await new Promise(r => setTimeout(r, CANDLE_DELAY_MS))
 
-    // Retry loop — on 429 or fetch error, wait 60s and try again (up to MAX_RETRIES)
     let success = false
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
@@ -107,7 +114,6 @@ function scheduleCandle(tf, callback) {
       }
     }
 
-    // Schedule next candle regardless of success
     scheduleCandle(tf, callback)
   }, wait)
 }
@@ -182,8 +188,6 @@ async function fetchLivePrice() {
 }
 
 // ── Fetch the just-CLOSED candle for a TF (used for SL-on-close confirmation) ─
-// Matches the candle whose OPEN time == the close boundary minus one period.
-// Falls back to the most recent fully-closed bar if no exact timestamp match.
 async function fetchClosedBar(tf) {
   const interval = TD_INTERVAL[tf]
   if (!interval) return null
@@ -212,7 +216,6 @@ async function fetchClosedBar(tf) {
 
       const exact = bars.find(b => b.ts === expectedOpen)
       if (exact) return exact
-      // fallback: latest bar that has fully closed already
       const closed = bars.filter(b => b.ts + periodMs <= Date.now()).sort((a, b) => b.ts - a.ts)
       return closed[0] || null
     } catch {}
@@ -221,22 +224,18 @@ async function fetchClosedBar(tf) {
 }
 
 // ── SL CONFIRMATION ON CANDLE CLOSE ──────────────────────────────────────────
-// Runs at each TF's candle close. SL is only triggered if the candle CLOSED
-// beyond the SL level. A wick that pierces SL but closes back inside = valid.
 async function checkStopOnClose(tf) {
   const state = loadState()
-  const sig = state[tf]
-  if (!sig || typeof sig !== 'object' || !sig.direction || sig.sl == null) return
+  const sig = openTrade(state, tf)
+  if (!sig || sig.sl == null) return
 
   const bar = await fetchClosedBar(tf)
   if (!bar) { console.log(`[${tf}] SL-on-close: no closed bar available, skipping`); return }
 
   const { direction: dir, entry, sl, msgId } = sig
-  // BUY  → confirmed only if close <= SL ; SELL → confirmed only if close >= SL
   const closedBeyond = dir === 'BUY' ? bar.close <= sl : bar.close >= sl
 
   if (!closedBeyond) {
-    // Wick may have pierced SL intra-candle, but it closed back inside → still valid.
     const wicked = dir === 'BUY' ? bar.low <= sl : bar.high >= sl
     if (wicked) console.log(`[${tf}] SL wick @ $${sl} but candle closed at $${bar.close} — trade still valid`)
     return
@@ -267,15 +266,14 @@ async function fastPriceCheck() {
   const ts = new Date().toISOString()
 
   for (const tf of LIVE_TFS) {
-    const sig = state[tf]
-    if (!sig || typeof sig !== 'object' || !sig.direction || !sig.entry) continue
+    const sig = openTrade(state, tf)
+    if (!sig || !sig.entry) continue
 
     const { direction: dir, entry, tp1, tp2, tp3,
             tp1Hit = false, tp2Hit = false, tp3Hit = false,
             msgId = null } = sig
 
-    // NOTE: SL is intentionally NOT checked here. SL is confirmed on candle
-    // close in checkStopOnClose() so a wick through SL does not close the trade.
+    // SL is intentionally NOT checked here — confirmed on candle close instead.
 
     // ── TP1 ───────────────────────────────────────────────────────────────────
     const tp1Cross = dir === 'BUY' ? livePrice >= tp1 : livePrice <= tp1
@@ -336,6 +334,12 @@ async function runSignalCycle(tf, isStartup = false) {
   // 1) Confirm SL on the candle that just closed (closes the trade if breached)
   await checkStopOnClose(tf)
 
+  // 2) Snapshot our OPEN trade BEFORE running gold-ai.mjs.
+  //    gold-ai writes a string dedupe key into bot_state.json[tf] when it fires,
+  //    which clobbers our object. Reading state AFTER gold-ai would therefore
+  //    break the NEW-vs-HOLD decision. So we decide from this pre-run snapshot.
+  const heldBefore = openTrade(loadState(), tf)
+
   const { execFile } = await import('child_process')
   const { promisify } = await import('util')
   const exec = promisify(execFile)
@@ -356,14 +360,13 @@ async function runSignalCycle(tf, isStartup = false) {
   if (stdout) console.log(`[${tf}]`, stdout.trim())
   if (stderr) console.error(`[${tf} err]`, stderr.trim())
 
-  // Throw on rate limit or fetch failure so retry loop in scheduleCandle kicks in
   if (stderr && (stderr.includes('429') || stderr.includes('fetch failed'))) {
     throw new Error(stderr.trim().slice(0, 120))
   }
 
   const lines = stdout.split('\n')
 
-  // ── Detect signal from trade_log — no keyword matching needed ────────────────
+  // ── Detect signal from trade_log ─────────────────────────────────────────────
   const log     = (() => { try { return JSON.parse(fs.readFileSync(TRADE_LOG, 'utf8')) } catch { return [] } })()
   const entries = log.filter(e => e.tframe === tf && !e.event)
   const latest  = entries[entries.length - 1]
@@ -372,29 +375,21 @@ async function runSignalCycle(tf, isStartup = false) {
   const isWait         = lines.some(l => l.includes('WAIT') || l.includes('SKIP'))
   const hasSignal      = lines.some(l => l.includes('✅'))
 
-  // On startup: extend freshness to 2h and ignore alreadyAlerted
   const freshnessMs = isStartup ? 2 * 60 * 60000 : 5 * 60000
   const fresh       = latest && (Date.now() - new Date(latest.ts).getTime() < freshnessMs)
-  // isWait ALWAYS blocks. isStartup only overrides the alreadyAlerted dedupe.
-  const shouldSend = fresh && !isWait && (hasSignal || (isStartup && latest)) && (!alreadyAlerted || isStartup)
+  const shouldSend  = fresh && !isWait && (hasSignal || (isStartup && latest)) && (!alreadyAlerted || isStartup)
 
-  console.log(`[${tf}] markers: signal=${hasSignal} already=${alreadyAlerted} wait=${isWait} fresh=${fresh} startup=${isStartup} → send=${shouldSend}`)
+  console.log(`[${tf}] markers: signal=${hasSignal} already=${alreadyAlerted} wait=${isWait} fresh=${fresh} startup=${isStartup} held=${heldBefore?.direction || 'none'} → send=${shouldSend}`)
 
   if (shouldSend) {
     const sig = latest
 
-    // KEEP HOLDING = same direction already open on this TF → reply, no new trade.
-    // NEW = direction changed or nothing open.
-    const state   = loadState()
-    const current = state[tf]
-
-    const isHold = current &&
-      typeof current === 'object' &&
-      current.direction === sig.direction
+    // KEEP HOLDING = a trade in the SAME direction is already open on this TF.
+    // Decided from the PRE-RUN snapshot (gold-ai may have clobbered state since).
+    const isHold = heldBefore && heldBefore.direction === sig.direction
 
     if (isHold) {
-      // Show the ORIGINAL trade's levels (and any TP progress), not recomputed ones.
-      const held = current
+      const held = heldBefore
       const tp1L = `${held.tp1Hit ? '✅ ' : ''}TP1 $${held.tp1}`
       const tp2L = `${held.tp2Hit ? '✅ ' : ''}TP2 $${held.tp2}`
       const tp3L = `${held.tp3Hit ? '✅ ' : ''}TP3 $${held.tp3}`
@@ -404,6 +399,9 @@ Confluence still active — original trade stays open.
 Entry $${held.entry} · SL $${held.sl}
 ${tp1L} · ${tp2L} · ${tp3L}`
       await sendAll(msgText, held.msgId)
+
+      // Restore our object — gold-ai overwrote state[tf] with its string key.
+      const s = loadState(); s[tf] = held; saveState(s)
       console.log(`[${tf}] 📡 Sent KEEP HOLDING (reply to msgId=${held.msgId})`)
 
     } else {
@@ -440,7 +438,7 @@ Size: ${sig.posSize}
   const hasInvalid = lines.some(l => l.includes('invalidation') || l.includes('SIGNAL INVALIDATED'))
   if (hasInvalid) {
     const state = loadState()
-    const sig   = state[tf]
+    const sig   = openTrade(state, tf)
     const livePrice = await fetchLivePrice()
     if (sig && sig.entry && livePrice) {
       const dir       = sig.direction
@@ -507,7 +505,7 @@ Trades: ${trades.length} | Wins: ${wins.length} | Losses: ${losses.length}
 }
 
 // ── START ─────────────────────────────────────────────────────────────────────
-console.log('🚀 Gold AI Launcher v6 — candle-sync mode (SL confirmed on close)')
+console.log('🚀 Gold AI Launcher v7 — candle-sync (SL on close · KEEP HOLDING fixed)')
 console.log(`   📈 Timeframes:    ${LIVE_TFS.join(', ')}`)
 console.log(`   ⚡ Price watcher: every ${PRICE_CHECK_MS / 1000}s (TP only)`)
 console.log(`   🛡️  SL:           confirmed on candle close`)
@@ -553,7 +551,6 @@ scheduleDailySummary()
       await new Promise(r => setTimeout(r, 5000))
     }
   }
-  // Now schedule all TFs on candle-close timing
   for (const tf of LIVE_TFS) {
     scheduleCandle(tf, runSignalCycle)
   }
