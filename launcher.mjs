@@ -1,4 +1,3 @@
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  launcher.mjs  —  v5
 //  Candle-close sync: fires signal check exactly when each TF candle closes,
@@ -307,7 +306,9 @@ async function runSignalCycle(tf, isStartup = false) {
   // (signal may have fired before launcher started)
   const freshnessMs = isStartup ? 2 * 60 * 60000 : 5 * 60000
   const fresh       = latest && (Date.now() - new Date(latest.ts).getTime() < freshnessMs)
-  const shouldSend  = (hasSignal || isStartup) && fresh && (!alreadyAlerted || isStartup)
+  // isWait ALWAYS blocks — never send a WAIT signal regardless of startup
+  // isStartup only overrides the alreadyAlerted dedupe check
+  const shouldSend = fresh && !isWait && (hasSignal || (isStartup && latest)) && (!alreadyAlerted || isStartup)
 
   console.log(`[${tf}] markers: signal=${hasSignal} already=${alreadyAlerted} wait=${isWait} fresh=${fresh} startup=${isStartup} → send=${shouldSend}`)
 
@@ -341,7 +342,10 @@ Size: ${sig.posSize}
       const newMsgId = await sendAll(msgText)
       // Save msgId into state so TP/SL alerts can reply to this message
       const stateNow = loadState()
-      if (stateNow[tf]) { stateNow[tf].msgId = newMsgId; saveState(stateNow) }
+      if (stateNow[tf] && typeof stateNow[tf] === 'object') {
+        stateNow[tf].msgId = newMsgId
+        saveState(stateNow)
+      }
       console.log(`[${tf}] 📡 Sent NEW signal msgId=${newMsgId}`)
     }
   } else if (!hasSignal && !fresh) {
@@ -427,7 +431,20 @@ console.log(`   ⏱️  Candle delay:  ${CANDLE_DELAY_MS}ms after close`)
 
 scheduleDailySummary()
 
-// Run once immediately on startup, then sync to candle closes
+// ── Migrate old bot_state.json (v3.1 stored strings, v4+ needs objects) ──────
+;(()=>{
+  const state = loadState()
+  let changed = false
+  for (const key of Object.keys(state)) {
+    if (key === 'at') continue
+    if (typeof state[key] === 'string' || (state[key] && typeof state[key] !== 'object')) {
+      console.log(`[startup] Clearing old state for ${key}: ${state[key]}`)
+      state[key] = null; changed = true
+    }
+  }
+  if (changed) saveState(state)
+  console.log('[startup] State OK:', JSON.stringify(state))
+})()
 ;(async () => {
   for (const tf of LIVE_TFS) {
     console.log(`[startup] Running initial check for ${tf}…`)
