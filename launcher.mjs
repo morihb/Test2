@@ -12,7 +12,7 @@ const CANDLE_DELAY_MS = 2000   // wait 2s after close for API to finalize bar
 const RETRY_DELAY_MS  = 60000  // retry after 60s on 429 / fetch failure
 const MAX_RETRIES     = 3      // max retries per candle before giving up
 // Stagger: offset each TF so they never fire at the same second → avoids 429
-const TF_STAGGER_MS   = { '15m':0, '1h':30000, '4h':45000, '1d':60000 }
+const TF_STAGGER_MS   = { '15m':0, '1h':4*60000, '4h':45000, '1d':60000 }
 
 const TG_TOKEN       = process.env.TG_TOKEN        || '8970765755:AAHexBHcEKLnnBsly5AIOUAPgftnEl6_9Hg'
 // Primary and fallback TwelveData API keys
