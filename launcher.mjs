@@ -315,10 +315,14 @@ async function runSignalCycle(tf, isStartup = false) {
   if (shouldSend) {
     const sig = latest
 
-    // Is this a keep-holding (same direction already in state)?
+    // KEEP HOLDING = same direction on this TF, regardless of entry price
+    // NEW = direction changed or no previous signal
     const state   = loadState()
     const current = state[tf]
-    const isHold  = current && current.direction === sig.direction && current.msgId
+
+    const isHold = current &&
+      typeof current === 'object' &&
+      current.direction === sig.direction
 
     if (isHold) {
       const msgText =
@@ -340,12 +344,18 @@ TP3 $${sig.tp3} (+${toPips(sig.tp3 - sig.entry)} pips)
 Size: ${sig.posSize}
 ⚠️ Manage risk. Not financial advice.`
       const newMsgId = await sendAll(msgText)
-      // Save msgId into state so TP/SL alerts can reply to this message
+      // Always save full state object so next candle knows direction for KEEP HOLDING
       const stateNow = loadState()
-      if (stateNow[tf] && typeof stateNow[tf] === 'object') {
-        stateNow[tf].msgId = newMsgId
-        saveState(stateNow)
+      stateNow[tf] = {
+        direction: sig.direction,
+        entry: sig.entry,
+        sl: sig.sl,
+        tp1: sig.tp1, tp2: sig.tp2, tp3: sig.tp3,
+        tp1Hit: false, tp2Hit: false, tp3Hit: false,
+        msgId: newMsgId,
+        ts: sig.ts
       }
+      saveState(stateNow)
       console.log(`[${tf}] 📡 Sent NEW signal msgId=${newMsgId}`)
     }
   } else if (!hasSignal && !fresh) {
