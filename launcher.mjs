@@ -286,13 +286,12 @@ async function runSignalCycle(tf, isStartup = false) {
     } else {
       const msgText =
 `${dirIcon(sig.direction)} <b>GOLD ${tf.toUpperCase()} — ${sig.direction}</b> (score ${sig.score}/100 ${sig.tier})
-Net ${sig.net} · H1 ${sig.h1Trend} · ${sig.session}
-Entry $${sig.entry} · live $${sig.live}
-SL $${sig.sl}
-TP1 $${sig.tp1} (+${toPips(sig.tp1 - sig.entry)} pips)
-TP2 $${sig.tp2} (+${toPips(sig.tp2 - sig.entry)} pips)
-TP3 $${sig.tp3} (+${toPips(sig.tp3 - sig.entry)} pips)
-Size: ${sig.posSize}
+ H1 ${sig.h1Trend} · ${sig.session}
+🔰 Entry $${sig.entry} · live $${sig.live}
+❌️ SL $${sig.sl}
+✅ TP1 $${sig.tp1} (+${toPips(sig.tp1 - sig.entry)} pips)
+✅ TP2 $${sig.tp2} (+${toPips(sig.tp2 - sig.entry)} pips)
+✅ TP3 $${sig.tp3} (+${toPips(sig.tp3 - sig.entry)} pips)
 🛡️ SL triggers on candle CLOSE beyond $${sig.sl} — a wick touch keeps the trade valid.
 ⚠️ Manage risk. Not financial advice.`
       const newMsgId = await sendAll(msgText)
