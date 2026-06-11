@@ -280,7 +280,7 @@ async function runSignalCycle(tf, isStartup = false) {
       const tp1L = `${held.tp1Hit?'✅ ':''}TP1 $${held.tp1}`
       const tp2L = `${held.tp2Hit?'✅ ':''}TP2 $${held.tp2}`
       const tp3L = `${held.tp3Hit?'✅ ':''}TP3 $${held.tp3}`
-      await sendAll(`${dirIcon(held.direction)} <b>GOLD ${tf.toUpperCase()} — KEEP HOLDING ${held.direction}</b>\nConfluence still active — original trade stays open.\nEntry $${held.entry} · SL $${held.sl}\n${tp1L} · ${tp2L} · ${tp3L}`, held.msgId)
+      await sendAll(`${dirIcon(held.direction)} <b>GOLD ${tf.toUpperCase()} — KEEP HOLDING ${held.direction}</b>\nConfluence still active — original trade stays open.\nEntry $${held.entry} · SL $${held.sl}\n${tp1L} · \n${tp2L} · \n${tp3L}`, held.msgId)
       const s = loadState(); s[tf] = held; saveState(s)
       console.log(`[${tf}] 📡 Sent KEEP HOLDING (reply to msgId=${held.msgId})`)
     } else {
