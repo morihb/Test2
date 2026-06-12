@@ -1,65 +1,63 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  launcher.mjs  —  v7
-//  Candle-close sync: fires signal check exactly when each TF candle closes.
-//  Price watcher runs every 30s for instant TP alerts.
+//  launcher.mjs  —  v8 (Fully Dynamic Config)
 //
-//  v7 fix (the important one):
-//   • gold-ai.mjs writes its OWN string dedupe key into bot_state.json[tf],
-//     which clobbers the launcher's trade OBJECT every candle. That made the
-//     `isHold` check fail (object → string) so every repeat fired as a NEW
-//     signal and KEEP HOLDING never triggered.
-//   • Fix: snapshot the open trade BEFORE running gold-ai, decide NEW vs HOLD
-//     from that snapshot, and re-write our object afterward (gold-ai's string
-//     is always restored back to our object). KEEP HOLDING now works.
+//  All previously hardcoded values are now read live from settings.json
+//  (managed via Telegram admin panel). Changes take effect on the next
+//  candle cycle — no restart needed for most settings.
 //
-//  v6 carried over:
-//   • SL confirmed ON CANDLE CLOSE (a wick through SL keeps the trade valid).
-//   • TP1/TP2/TP3 fire instantly on the 30s watcher (reply + pips).
-//   • NEW signals carry the SL-on-close disclaimer.
+//  Dynamic at runtime (no restart needed):
+//    • API keys & rotation order  (settings.json → twelvedata_keys)
+//    • Active timeframes           (settings.json → live_timeframes)
+//    • Account size & risk %       (settings.json → account_size / risk_pct)
+//    • Price-check interval        (settings.json → price_check_sec)
+//    • Data source                 (settings.json → data_source)
+//
+//  Requires restart to apply:
+//    • Price-check interval (restarts the setInterval)
+//    • TF additions/removals (scheduleCandle is set once at startup)
+//
+//  v8 vs v7: no logic changes, only config is read dynamically.
 // ─────────────────────────────────────────────────────────────────────────────
-import { broadcastSignal } from './bot-subscription.mjs'
+import { broadcastSignal, getActiveApiKeys, getActiveTimeframes, getDataSource, getAccountSize, getRiskPct, getPriceCheckSec, getOandaToken, getOandaEnv } from './bot-subscription.mjs'
 import fs from 'fs'
 
-const PRICE_CHECK_MS  = (parseInt(process.env.PRICE_CHECK_SEC) || 30) * 1000
+// ── BOOTSTRAP CONSTANTS (never change at runtime) ─────────────────────────
+const TG_TOKEN    = process.env.TG_TOKEN    || '8970765755:AAHexBHcEKLnnBsly5AIOUAPgftnEl6_9Hg'
+const TG_CHAT     = process.env.TG_CHAT     || '1408577116'
+const STATE_FILE  = './bot_state.json'
+const TRADE_LOG   = './trade_log.json'
+const DAILY_FILE  = './daily_report.json'
 const CANDLE_DELAY_MS = 2000
 const RETRY_DELAY_MS  = 60000
 const MAX_RETRIES     = 3
 const TF_STAGGER_MS   = { '15m':0, '1h':4*60000, '4h':45000, '1d':60000 }
+const TF_MINUTES      = { '1m':1,'3m':3,'5m':5,'15m':15,'30m':30,'1h':60,'2h':120,'4h':240,'1d':1440 }
+const TD_INTERVAL     = { '1m':'1min','3m':'3min','5m':'5min','15m':'15min','30m':'30min','1h':'1h','2h':'2h','4h':'4h','1d':'1day' }
 
-const TG_TOKEN       = process.env.TG_TOKEN        || '8970765755:AAHexBHcEKLnnBsly5AIOUAPgftnEl6_9Hg'
-const TWELVEDATA_KEYS = [
-  process.env.TWELVEDATA_KEY  || 'dbf374976088424aa703db6034942e19',  // key 1
-  'da16adf775b04e31a6a33386689e38c8',                                   // key 2
-  '34034261d78440e28ece3d43ddd64955',                                   // key 3
-  'ef3ccaeaa4954935b193708cf86fa97d',                                   // key 4
-  '9268e6afa5024f6a97ca03e44dcb59c0',                                   // key 5
-  '78ce7374b05b4e33a3e1bd4c6311ff25',                                   // key 6
-]
+// ── DYNAMIC CONFIG READERS (called fresh each cycle) ──────────────────────
+// These read from settings.json every time they're called, so changes made
+// via Telegram take effect on the next candle without a restart.
+
+function getLiveApiKeys() { return getActiveApiKeys() }
+function getLiveTFs()     { return getActiveTimeframes() }
+function getLiveSource()  { return getDataSource() }
+
+// Current active key index — rotates through getLiveApiKeys()
 let activeKeyIndex = 0
-let TWELVEDATA_KEY = TWELVEDATA_KEYS[0]
-
+function currentKey() {
+  const keys = getLiveApiKeys()
+  if (!keys.length) { console.error('[API] No active API keys!'); return '' }
+  return keys[activeKeyIndex % keys.length]
+}
 function switchToNextKey() {
-  const next = (activeKeyIndex + 1) % TWELVEDATA_KEYS.length
-  if (next === activeKeyIndex) {
-    console.error('[API] No more fallback keys available!')
-    return false
-  }
-  activeKeyIndex = next
-  TWELVEDATA_KEY = TWELVEDATA_KEYS[activeKeyIndex]
-  console.log(`[API] ⚠️ Switched to key #${activeKeyIndex + 1}: ${TWELVEDATA_KEY.slice(0,8)}…`)
+  const keys = getLiveApiKeys()
+  if (keys.length <= 1) { console.error('[API] No more fallback keys!'); return false }
+  activeKeyIndex = (activeKeyIndex + 1) % keys.length
+  console.log(`[API] ⚠️ Switched to key slot #${activeKeyIndex+1}: ${currentKey().slice(0,8)}…`)
   return true
 }
 
-const LIVE_TFS   = (process.env.LIVE_TFS || '15m,1h').split(',').map(s => s.trim()).filter(Boolean)
-const SOURCE     = process.env.GOLD_SOURCE || (process.env.OANDA_TOKEN ? 'oanda' : 'twelvedata')
-const TG_CHAT    = process.env.TG_CHAT || '1408577116'
-const STATE_FILE = './bot_state.json'
-const TRADE_LOG  = './trade_log.json'
-const DAILY_FILE = './daily_report.json'
-
-const TF_MINUTES = { '1m':1,'3m':3,'5m':5,'15m':15,'30m':30,'1h':60,'2h':120,'4h':240,'1d':1440 }
-const TD_INTERVAL = { '1m':'1min','3m':'3min','5m':'5min','15m':'15min','30m':'30min','1h':'1h','2h':'2h','4h':'4h','1d':'1day' }
-
+// ── HELPERS ───────────────────────────────────────────────────────────────
 const dirIcon = dir => dir === 'BUY' ? '🟢' : '🔴'
 const toPips  = d => Math.round(Math.abs(d) * 10)
 
@@ -68,10 +66,9 @@ function openTrade(state, tf) {
   return (s && typeof s === 'object' && s.direction) ? s : null
 }
 
-// ── Candle close scheduler ────────────────────────────────────────────────────
+// ── CANDLE CLOSE SCHEDULER ─────────────────────────────────────────────────
 function msUntilNextClose(tfMinutes) {
-  const now = Date.now()
-  const periodMs = tfMinutes * 60 * 1000
+  const now = Date.now(), periodMs = tfMinutes * 60 * 1000
   return Math.ceil(now / periodMs) * periodMs - now
 }
 
@@ -93,7 +90,7 @@ function scheduleCandle(tf, callback) {
         const isNet = e.message?.includes('fetch') || e.message?.includes('ECONNRESET')
         if ((is429 || isNet) && attempt < MAX_RETRIES) {
           if (is429) { console.log(`[scheduler] ${tf} rate limited — switching key, retrying in ${RETRY_DELAY_MS/1000}s`); switchToNextKey() }
-          else console.log(`[scheduler] ${tf} attempt ${attempt} failed (${e.message}) — retrying in ${RETRY_DELAY_MS/1000}s`)
+          else         console.log(`[scheduler] ${tf} attempt ${attempt} failed (${e.message}) — retrying in ${RETRY_DELAY_MS/1000}s`)
           await new Promise(r => setTimeout(r, RETRY_DELAY_MS))
         } else { console.error(`[scheduler] ${tf} gave up after ${attempt} attempt(s): ${e.message}`); break }
       }
@@ -102,51 +99,53 @@ function scheduleCandle(tf, callback) {
   }, wait)
 }
 
-// ── State helpers ─────────────────────────────────────────────────────────────
+// ── STATE ─────────────────────────────────────────────────────────────────
 function loadState() { try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) } catch { return {} } }
 function saveState(s) { s.at = new Date().toISOString(); fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)) }
 
-// ── Daily report ──────────────────────────────────────────────────────────────
-function todayKey() { return new Date().toISOString().slice(0, 10) }
+// ── DAILY REPORT ──────────────────────────────────────────────────────────
+function todayKey()  { return new Date().toISOString().slice(0, 10) }
 function loadDaily() { try { return JSON.parse(fs.readFileSync(DAILY_FILE, 'utf8')) } catch { return {} } }
-function saveDaily(d) { fs.writeFileSync(DAILY_FILE, JSON.stringify(d, null, 2)) }
+function saveDaily(d){ fs.writeFileSync(DAILY_FILE, JSON.stringify(d, null, 2)) }
 function addToDaily(trade) {
   const key = todayKey(), daily = loadDaily()
-  if (!daily[key]) daily[key] = { trades: [], totalPips: 0 }
+  if (!daily[key]) daily[key] = { trades:[], totalPips:0 }
   daily[key].trades.push({ ...trade, ts: new Date().toISOString() })
   daily[key].totalPips += trade.sign * trade.pips
   saveDaily(daily)
 }
 
-// ── Send to admin + all subscribers ──────────────────────────────────────────
-async function sendAll(text, replyToMsgId = null) {
+// ── TELEGRAM ──────────────────────────────────────────────────────────────
+async function sendAll(text, replyToMsgId=null) {
   let adminMsgId = null
   try {
-    const body = { chat_id: TG_CHAT, text, parse_mode: 'HTML' }
+    const body = { chat_id:TG_CHAT, text, parse_mode:'HTML' }
     if (replyToMsgId) body.reply_to_message_id = replyToMsgId
     const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
     })
     const j = await res.json()
     if (j.ok) adminMsgId = j.result.message_id
-  } catch (e) { console.error('[sendAll admin]', e.message) }
-  const result = await broadcastSignal(text, replyToMsgId)
+  } catch(e) { console.error('[sendAll admin]', e.message) }
+  const result = await broadcastSignal(text)
   console.log(`[sendAll] adminMsgId=${adminMsgId} subs sent=${result.sent} failed=${result.failed}`)
   return adminMsgId
 }
 
-// ── Live price ────────────────────────────────────────────────────────────────
+// ── LIVE PRICE ────────────────────────────────────────────────────────────
 async function fetchLivePrice() {
-  for (let attempt = 0; attempt < TWELVEDATA_KEYS.length; attempt++) {
+  const keys = getLiveApiKeys()
+  for (let attempt = 0; attempt < Math.max(keys.length, 1); attempt++) {
+    const key = currentKey(); if (!key) break
     try {
-      const res = await fetch(`https://api.twelvedata.com/price?symbol=XAU/USD&apikey=${TWELVEDATA_KEY}`, { signal: AbortSignal.timeout(8000) })
+      const res = await fetch(`https://api.twelvedata.com/price?symbol=XAU/USD&apikey=${key}`, { signal: AbortSignal.timeout(8000) })
       if (res.status === 429) { switchToNextKey(); continue }
       const j = await res.json()
       if (j.price) return parseFloat(j.price)
       if (j.code === 429) { switchToNextKey(); continue }
     } catch {}
     try {
-      const res = await fetch(`https://api.twelvedata.com/quote?symbol=XAU/USD&apikey=${TWELVEDATA_KEY}`, { signal: AbortSignal.timeout(8000) })
+      const res = await fetch(`https://api.twelvedata.com/quote?symbol=XAU/USD&apikey=${key}`, { signal: AbortSignal.timeout(8000) })
       if (res.status === 429) { switchToNextKey(); continue }
       const j = await res.json()
       if (j.close) return parseFloat(j.close)
@@ -155,55 +154,57 @@ async function fetchLivePrice() {
   return null
 }
 
-// ── Fetch last closed candle ──────────────────────────────────────────────────
+// ── LAST CLOSED CANDLE ────────────────────────────────────────────────────
 async function fetchClosedBar(tf) {
   const interval = TD_INTERVAL[tf]; if (!interval) return null
   const periodMs = TF_MINUTES[tf] * 60000
   const boundary = Math.floor(Date.now() / periodMs) * periodMs
   const expectedOpen = boundary - periodMs
-  for (let attempt = 0; attempt < TWELVEDATA_KEYS.length; attempt++) {
+  const keys = getLiveApiKeys()
+  for (let attempt = 0; attempt < Math.max(keys.length, 1); attempt++) {
+    const key = currentKey(); if (!key) break
     try {
-      const res = await fetch(`https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=${interval}&outputsize=3&apikey=${TWELVEDATA_KEY}`, { signal: AbortSignal.timeout(8000) })
+      const res = await fetch(`https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=${interval}&outputsize=3&apikey=${key}`, { signal: AbortSignal.timeout(8000) })
       if (res.status === 429) { switchToNextKey(); continue }
       const j = await res.json()
       if (j.code === 429) { switchToNextKey(); continue }
       if (j.status === 'error' || !j.values?.length) return null
-      const bars = j.values.map(v => ({ ts: new Date(v.datetime.replace(' ','T')+'Z').getTime(), open:parseFloat(v.open), high:parseFloat(v.high), low:parseFloat(v.low), close:parseFloat(v.close) }))
-      return bars.find(b => b.ts === expectedOpen) || bars.filter(b => b.ts + periodMs <= Date.now()).sort((a,b) => b.ts - a.ts)[0] || null
+      const bars = j.values.map(v => ({ ts:new Date(v.datetime.replace(' ','T')+'Z').getTime(), open:parseFloat(v.open), high:parseFloat(v.high), low:parseFloat(v.low), close:parseFloat(v.close) }))
+      return bars.find(b => b.ts === expectedOpen) || bars.filter(b => b.ts+periodMs<=Date.now()).sort((a,b)=>b.ts-a.ts)[0] || null
     } catch {}
   }
   return null
 }
 
-// ── SL on candle close ────────────────────────────────────────────────────────
+// ── SL ON CANDLE CLOSE ────────────────────────────────────────────────────
 async function checkStopOnClose(tf) {
   const state = loadState(), sig = openTrade(state, tf)
   if (!sig || sig.sl == null) return
   const bar = await fetchClosedBar(tf)
   if (!bar) { console.log(`[${tf}] SL-on-close: no closed bar, skipping`); return }
-  const { direction: dir, entry, sl, msgId } = sig
-  const closedBeyond = dir === 'BUY' ? bar.close <= sl : bar.close >= sl
+  const { direction:dir, entry, sl, msgId } = sig
+  const closedBeyond = dir==='BUY' ? bar.close<=sl : bar.close>=sl
   if (!closedBeyond) {
-    if (dir === 'BUY' ? bar.low <= sl : bar.high >= sl)
+    if (dir==='BUY' ? bar.low<=sl : bar.high>=sl)
       console.log(`[${tf}] SL wick @ $${sl} but closed at $${bar.close} — trade still valid`)
     return
   }
-  const pips = toPips(Math.abs(sl - entry)), isBE = sl === entry
+  const pips = toPips(Math.abs(sl-entry)), isBE = sl===entry
   const pnlLabel = isBE ? '0 pips (break-even)' : `-${pips} pips`
   await sendAll(`${dirIcon(dir)} <b>GOLD ${tf.toUpperCase()} — STOP LOSS HIT</b>\n${pnlLabel} @ $${sl}\nCandle closed at $${bar.close.toFixed(2)} — confirmed on close.\nTrade closed. ❌`, msgId)
-  addToDaily({ tf, dir, result: isBE ? 'BE' : 'SL', pips, sign: isBE ? 0 : -1 })
-  const s = loadState(); s[tf] = null; saveState(s)
+  addToDaily({ tf, dir, result:isBE?'BE':'SL', pips, sign:isBE?0:-1 })
+  const s = loadState(); s[tf]=null; saveState(s)
   console.log(`[${tf}] 🔴 SL confirmed on close (${pnlLabel})`)
 }
 
-// ── Fast price watcher — TP only ──────────────────────────────────────────────
+// ── FAST PRICE WATCHER — TP ONLY ──────────────────────────────────────────
 async function fastPriceCheck() {
   const livePrice = await fetchLivePrice(); if (!livePrice) return
   const state = loadState(); let changed = false
-  const ts = new Date().toISOString()
-  for (const tf of LIVE_TFS) {
+  const ts = new Date().toISOString(), liveTFs = getLiveTFs()
+  for (const tf of liveTFs) {
     const sig = openTrade(state, tf); if (!sig?.entry) continue
-    const { direction: dir, entry, tp1, tp2, tp3, tp1Hit=false, tp2Hit=false, tp3Hit=false, msgId=null } = sig
+    const { direction:dir, entry, tp1, tp2, tp3, tp1Hit=false, tp2Hit=false, tp3Hit=false, msgId=null } = sig
 
     const tp1Cross = dir==='BUY' ? livePrice>=tp1 : livePrice<=tp1
     if (tp1Cross && !tp1Hit) {
@@ -237,10 +238,10 @@ async function fastPriceCheck() {
   if (changed) saveState(state)
 }
 
-// ── Signal cycle ──────────────────────────────────────────────────────────────
-async function runSignalCycle(tf, isStartup = false) {
+// ── SIGNAL CYCLE ──────────────────────────────────────────────────────────
+async function runSignalCycle(tf, isStartup=false) {
   const ts = new Date().toISOString()
-  console.log(`[${ts}] 🕯️  Candle closed: ${tf} — running signal check${isStartup ? ' (startup)' : ''}`)
+  console.log(`[${ts}] 🕯️  Candle closed: ${tf} — running signal check${isStartup?' (startup)':''}`)
 
   await checkStopOnClose(tf)
 
@@ -250,23 +251,35 @@ async function runSignalCycle(tf, isStartup = false) {
   const { promisify } = await import('util')
   const exec = promisify(execFile)
 
-  const env = { ...process.env, LIVE_TFS: tf, TWELVEDATA_KEY, TG_TOKEN: '', GOLD_SOURCE: SOURCE, TG_CHAT }
-  const { stdout, stderr } = await exec('node', ['gold-ai.mjs', 'check'], { env, timeout: 60000 })
+  // Pass dynamic settings as env vars to gold-ai.mjs
+  const env = {
+    ...process.env,
+    LIVE_TFS:        tf,
+    TWELVEDATA_KEY:  currentKey(),
+    TG_TOKEN:        '',          // gold-ai must NOT send its own TG msgs
+    GOLD_SOURCE:     getLiveSource(),
+    TG_CHAT,
+    ACCT:            String(getAccountSize()),
+    RISK:            String(getRiskPct()),
+    OANDA_TOKEN:     getOandaToken(),
+    OANDA_ENV:       getOandaEnv(),
+  }
+  const { stdout, stderr } = await exec('node', ['gold-ai.mjs', 'check'], { env, timeout:60000 })
 
   if (stdout) console.log(`[${tf}]`, stdout.trim())
   if (stderr) console.error(`[${tf} err]`, stderr.trim())
-  if (stderr && (stderr.includes('429') || stderr.includes('fetch failed'))) throw new Error(stderr.trim().slice(0, 120))
+  if (stderr && (stderr.includes('429') || stderr.includes('fetch failed'))) throw new Error(stderr.trim().slice(0,120))
 
-  const lines = stdout.split('\n')
-  const log     = (() => { try { return JSON.parse(fs.readFileSync(TRADE_LOG, 'utf8')) } catch { return [] } })()
-  const entries = log.filter(e => e.tframe === tf && !e.event)
-  const latest  = entries[entries.length - 1]
+  const lines    = stdout.split('\n')
+  const log      = (()=>{ try { return JSON.parse(fs.readFileSync(TRADE_LOG,'utf8')) } catch { return [] } })()
+  const entries  = log.filter(e => e.tframe===tf && !e.event)
+  const latest   = entries[entries.length-1]
 
   const alreadyAlerted = lines.some(l => l.includes('already alerted'))
   const isWait         = lines.some(l => l.includes('WAIT') || l.includes('SKIP'))
   const hasSignal      = lines.some(l => l.includes('✅'))
-  const freshnessMs    = isStartup ? 2 * 60 * 60000 : 5 * 60000
-  const fresh          = latest && (Date.now() - new Date(latest.ts).getTime() < freshnessMs)
+  const freshnessMs    = isStartup ? 2*60*60000 : 5*60000
+  const fresh          = latest && (Date.now()-new Date(latest.ts).getTime() < freshnessMs)
   const shouldSend     = fresh && !isWait && (hasSignal || (isStartup && latest)) && (!alreadyAlerted || isStartup)
 
   console.log(`[${tf}] markers: signal=${hasSignal} already=${alreadyAlerted} wait=${isWait} fresh=${fresh} startup=${isStartup} held=${heldBefore?.direction||'none'} → send=${shouldSend}`)
@@ -280,18 +293,18 @@ async function runSignalCycle(tf, isStartup = false) {
       const tp1L = `${held.tp1Hit?'✅ ':''}TP1 $${held.tp1}`
       const tp2L = `${held.tp2Hit?'✅ ':''}TP2 $${held.tp2}`
       const tp3L = `${held.tp3Hit?'✅ ':''}TP3 $${held.tp3}`
-      await sendAll(`${dirIcon(held.direction)} <b>GOLD ${tf.toUpperCase()} — KEEP HOLDING ${held.direction}</b>\nConfluence still active — original trade stays open.\nEntry $${held.entry} · SL $${held.sl}\n${tp1L} · \n${tp2L} · \n${tp3L}`, held.msgId)
-      const s = loadState(); s[tf] = held; saveState(s)
+      await sendAll(`${dirIcon(held.direction)} <b>GOLD ${tf.toUpperCase()} — KEEP HOLDING ${held.direction}</b>\nConfluence still active — original trade stays open.\nEntry $${held.entry} · SL $${held.sl}\n${tp1L}\n${tp2L}\n${tp3L}`, held.msgId)
+      const s = loadState(); s[tf]=held; saveState(s)
       console.log(`[${tf}] 📡 Sent KEEP HOLDING (reply to msgId=${held.msgId})`)
     } else {
       const msgText =
 `${dirIcon(sig.direction)} <b>GOLD ${tf.toUpperCase()} — ${sig.direction}</b> (score ${sig.score}/100 ${sig.tier})
- H1 ${sig.h1Trend} · ${sig.session}
+H1 ${sig.h1Trend} · ${sig.session}
 🔰 Entry $${sig.entry} · live $${sig.live}
-❌️ SL $${sig.sl}
-✅ TP1 $${sig.tp1} (+${toPips(sig.tp1 - sig.entry)} pips)
-✅ TP2 $${sig.tp2} (+${toPips(sig.tp2 - sig.entry)} pips)
-✅ TP3 $${sig.tp3} (+${toPips(sig.tp3 - sig.entry)} pips)
+❌ SL $${sig.sl}
+✅ TP1 $${sig.tp1} (+${toPips(sig.tp1-sig.entry)} pips)
+✅ TP2 $${sig.tp2} (+${toPips(sig.tp2-sig.entry)} pips)
+✅ TP3 $${sig.tp3} (+${toPips(sig.tp3-sig.entry)} pips)
 🛡️ SL triggers on candle CLOSE beyond $${sig.sl} — a wick touch keeps the trade valid.
 ⚠️ Manage risk. Not financial advice.`
       const newMsgId = await sendAll(msgText)
@@ -310,8 +323,8 @@ async function runSignalCycle(tf, isStartup = false) {
     const livePrice = await fetchLivePrice()
     if (sig && sig.entry && livePrice) {
       const dir = sig.direction
-      const pipDiff = dir==='BUY' ? (livePrice-sig.entry)*10 : (sig.entry-livePrice)*10
-      const profitable = pipDiff > 0, pipAbs = Math.round(Math.abs(pipDiff))
+      const pipDiff = dir==='BUY'?(livePrice-sig.entry)*10:(sig.entry-livePrice)*10
+      const profitable = pipDiff>0, pipAbs = Math.round(Math.abs(pipDiff))
       const profitStr = profitable ? `+${pipAbs} pips in profit` : `-${pipAbs} pips at a loss`
       await sendAll(`⚠️ <b>GOLD ${tf.toUpperCase()} — SIGNAL INVALIDATED</b>\nConfluence has disappeared. Consider closing manually.\n\nCurrent P&L: <b>${profitStr}</b>\nLive $${livePrice.toFixed(2)} vs entry $${sig.entry}`, sig.msgId)
       addToDaily({ tf, dir, result:'INVALIDATED', pips:pipAbs, sign:profitable?+1:-1 })
@@ -321,67 +334,71 @@ async function runSignalCycle(tf, isStartup = false) {
   }
 }
 
-// ── Daily summary ─────────────────────────────────────────────────────────────
+// ── DAILY SUMMARY ─────────────────────────────────────────────────────────
 function scheduleDailySummary() {
   function msUntilMidnight() {
     const now = new Date()
-    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()+1)) - now
+    return new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate()+1)) - now
   }
   async function sendDailySummary() {
-    const key = todayKey(), daily = loadDaily(), day = daily[key]
-    if (day?.trades?.length > 0) {
-      const trades = day.trades, totalPips = Math.round(day.totalPips)
-      const wins = trades.filter(t=>t.sign>0), losses = trades.filter(t=>t.sign<0)
-      const lines = trades.map(t => `${t.sign>0?'✅':t.sign<0?'❌':'➖'} ${t.tf.toUpperCase()} ${t.dir} → ${t.result}: ${t.sign>0?'+':t.sign<0?'-':''}${t.pips} pips`)
-      const summaryLine = totalPips>=0 ? `+${totalPips} pips profit` : `${totalPips} pips loss`
+    const key=todayKey(), daily=loadDaily(), day=daily[key]
+    if (day?.trades?.length>0) {
+      const trades=day.trades, totalPips=Math.round(day.totalPips)
+      const wins=trades.filter(t=>t.sign>0), losses=trades.filter(t=>t.sign<0)
+      const lines=trades.map(t=>`${t.sign>0?'✅':t.sign<0?'❌':'➖'} ${t.tf.toUpperCase()} ${t.dir} → ${t.result}: ${t.sign>0?'+':t.sign<0?'-':''}${t.pips} pips`)
+      const summaryLine=totalPips>=0?`+${totalPips} pips profit`:`${totalPips} pips loss`
       await sendAll(`${totalPips>=0?'📈':'📉'} <b>GOLD AI — Daily Summary (${key})</b>\n\n${lines.join('\n')}\n\n──────────────\nTrades: ${trades.length} | Wins: ${wins.length} | Losses: ${losses.length}\n<b>Total: ${summaryLine}</b>`)
       console.log(`[daily] Summary sent: ${summaryLine}`)
     }
-    setTimeout(sendDailySummary, msUntilMidnight() + 1000)
+    setTimeout(sendDailySummary, msUntilMidnight()+1000)
   }
-  setTimeout(sendDailySummary, msUntilMidnight() + 1000)
+  setTimeout(sendDailySummary, msUntilMidnight()+1000)
   console.log(`   📅 Daily summary: in ${Math.round(msUntilMidnight()/60000)} min`)
 }
 
-// ── START ─────────────────────────────────────────────────────────────────────
-console.log('🚀 Gold AI Launcher v7 — candle-sync (SL on close · KEEP HOLDING fixed)')
+// ── STARTUP ───────────────────────────────────────────────────────────────
+const LIVE_TFS       = getLiveTFs()
+const SOURCE         = getLiveSource()
+const PRICE_CHECK_MS = getPriceCheckSec() * 1000
+
+console.log('🚀 Gold AI Launcher v8 — Fully Dynamic Config')
 console.log(`   📈 Timeframes:    ${LIVE_TFS.join(', ')}`)
-console.log(`   ⚡ Price watcher: every ${PRICE_CHECK_MS / 1000}s (TP only)`)
+console.log(`   ⚡ Price watcher: every ${PRICE_CHECK_MS/1000}s (TP only)`)
 console.log(`   🛡️  SL:           confirmed on candle close`)
 console.log(`   🔌 Data source:   ${SOURCE}`)
-console.log(`   🔑 API keys:      ${TWELVEDATA_KEYS.length} keys loaded`)
+console.log(`   🔑 API keys:      ${getLiveApiKeys().length} active`)
+console.log(`   💰 Account:       $${getAccountSize()} · Risk ${getRiskPct()}%`)
 console.log(`   ⏱️  Candle delay:  ${CANDLE_DELAY_MS}ms after close`)
 
 scheduleDailySummary()
 
+// Sanitise state file on startup
 ;(()=>{
-  const state = loadState(); let changed = false
+  const state=loadState(); let changed=false
   for (const key of Object.keys(state)) {
-    if (key === 'at') continue
-    if (typeof state[key] === 'string' || (state[key] && typeof state[key] !== 'object')) {
-      console.log(`[startup] Clearing old state for ${key}: ${state[key]}`)
-      state[key] = null; changed = true
+    if (key==='at') continue
+    if (typeof state[key]==='string' || (state[key] && typeof state[key]!=='object')) {
+      console.log(`[startup] Clearing stale state for ${key}`)
+      state[key]=null; changed=true
     }
   }
   if (changed) saveState(state)
   console.log('[startup] State OK:', JSON.stringify(state))
 })()
 
+// Initial check for each TF
 ;(async () => {
   for (const tf of LIVE_TFS) {
     console.log(`[startup] Running initial check for ${tf}…`)
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    for (let attempt=1; attempt<=MAX_RETRIES; attempt++) {
       try { await runSignalCycle(tf, true); break }
-      catch (e) {
+      catch(e) {
         const is429 = e.message?.includes('429') || e.message?.includes('fetch failed')
-        if (is429 && attempt < MAX_RETRIES) {
-          switchToNextKey()
-          console.log(`[startup] ${tf} 429 on attempt ${attempt} — waiting 65s…`)
-          await new Promise(r => setTimeout(r, 65000))
-        } else { console.error(`[startup] ${tf} gave up: ${e.message}`); break }
+        if (is429 && attempt<MAX_RETRIES) { switchToNextKey(); console.log(`[startup] ${tf} 429 on attempt ${attempt} — waiting 65s…`); await new Promise(r=>setTimeout(r,65000)) }
+        else { console.error(`[startup] ${tf} gave up: ${e.message}`); break }
       }
     }
-    if (LIVE_TFS.indexOf(tf) < LIVE_TFS.length - 1) await new Promise(r => setTimeout(r, 5000))
+    if (LIVE_TFS.indexOf(tf)<LIVE_TFS.length-1) await new Promise(r=>setTimeout(r,5000))
   }
   for (const tf of LIVE_TFS) scheduleCandle(tf, runSignalCycle)
 })()
