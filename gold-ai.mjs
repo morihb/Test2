@@ -61,7 +61,12 @@ function cfgFor(tframe){
 
 const MIN_NET=envNum('MIN_NET',30), MIN_CONV=envNum('MIN_CONV',0.35), MAX_CONFLICT=envNum('MAX_CONFLICT',0.40)
 const USE_MTF=process.env.USE_MTF!=='0'
-const TP_PLAN=[{tp:'tp1',w:0.5},{tp:'tp2',w:0.3},{tp:'tp3',w:0.2}], MOVE_BE_AFTER_TP1=true
+const TP_PLAN=[{tp:'tp1',w:0.5},{tp:'tp2',w:0.3},{tp:'tp3',w:0.2}]
+// Smarter break-even (#5): instead of moving to exact entry on TP1 (which gets
+// stopped on the common pullback), lock in a small profit at +0.2R. Then, once
+// the trade has run far in our favour (MFE ≥ BE_FULL_AT_R), tighten to full BE.
+const BE_LOCK_R   = parseFloat(process.env.BE_LOCK_R)   || 0.2   // stop → entry + 0.2R after TP1
+const BE_FULL_AT_R= parseFloat(process.env.BE_FULL_AT_R)|| 1.5   // once MFE ≥ this, stop → entry
 const NEWS_BLACKOUT_MIN={before:30,after:30}
 const NEWS_EVENTS=[]
 const TF={scalp:{slb:3}}
@@ -127,8 +132,11 @@ const SESSION_LABEL={asian:'🌏 Asian',london:'🇬🇧 London',london_ny:'🌍
 function detectStructure(c,lb=3){ const H=[],L=[]
   for(let i=lb;i<c.length-lb;i++){ const v=c[i].close
     const lf=c.slice(i-lb,i).map(d=>d.close),rt=c.slice(i+1,i+1+lb).map(d=>d.close)
-    if(v>Math.max(...lf)&&v>Math.max(...rt)) H.push({...c[i],idx:i})
-    if(v<Math.min(...lf)&&v<Math.min(...rt)) L.push({...c[i],idx:i}) }
+    if(v>Math.max(...lf)&&v>Math.max(...rt)){
+      // reversal = how far price dropped away from this high over the confirming bars
+      const rev=v-Math.min(...rt); H.push({...c[i],idx:i,reversal:rev}) }
+    if(v<Math.min(...lf)&&v<Math.min(...rt)){
+      const rev=Math.max(...rt)-v; L.push({...c[i],idx:i,reversal:rev}) } }
   let bos='none',choch='none'
   if(H.length>=2&&L.length>=2){ const rH=H[H.length-1],pH=H[H.length-2],rL=L[L.length-1],pL=L[L.length-2]
     if(rH.close>pH.close&&rL.close>pL.close) bos='bullish'
@@ -136,6 +144,57 @@ function detectStructure(c,lb=3){ const H=[],L=[]
     if(bos==='bullish'&&last(c).close<rL.close) choch='bearish_choch'
     if(bos==='bearish'&&last(c).close>rH.close) choch='bullish_choch' }
   return {H,L,rH:H.length?H[H.length-1]:null,rL:L.length?L[L.length-1]:null,bos,choch} }
+
+// ── SWING QUALITY SCORING (no look-ahead: all data is ≤ current bar) ─────────
+// Each swing gets a strength score from:
+//   touches      — how many later swings revisited this level (±ATR*0.15)
+//   reversalSize — how far price moved away from the swing right after it formed
+//   ageFactor    — older confirmed swings that survived are more significant
+//   distFactor   — closeness to current price (slight preference, not dominant)
+// Returns the same swing objects with a `.strength` field added.
+function scoreSwings(swings, allSwings, atr, lastIdx, price){
+  if(!atr||atr<=0) return swings.map(s=>({...s,strength:0,touches:0}))
+  const tol = atr*0.15
+  return swings.map(s=>{
+    // touches: other swings of the SAME type within tolerance band
+    const touches = allSwings.filter(o => Math.abs((o.high??o.low) - (s.high??s.low)) <= tol).length
+    // reversalSize: max move away from the swing level over the lb bars after it (already in `c`)
+    const reversalSize = s.reversal != null ? s.reversal : 0
+    // ageFactor: bars since the swing formed, normalised (older = sturdier, capped)
+    const age = Math.max(0, lastIdx - s.idx)
+    const ageFactor = Math.min(age / 20, 5)           // capped at 5
+    // distFactor: prefer levels not absurdly far (in ATR units), mild weight
+    const distAtr = Math.abs((s.high??s.low) - price)/atr
+    const distFactor = distAtr<=8 ? 1 : Math.max(0, 1 - (distAtr-8)/8)
+    const strength = (touches*3) + (reversalSize*2) + ageFactor + distFactor
+    return {...s, strength:+strength.toFixed(2), touches}
+  })
+}
+
+// ── EQUAL HIGHS / EQUAL LOWS (liquidity magnets) ─────────────────────────────
+// Two swing highs (or lows) within ATR*0.15 of each other = equal level.
+// Returns clusters with the representative price = the extreme of the pair/group.
+function detectEqualLevels(swingHighs, swingLows, atr){
+  if(!atr||atr<=0) return {equalHighs:[],equalLows:[]}
+  const tol = atr*0.15
+  const cluster = (arr, key, pickExtreme) => {
+    const used=new Array(arr.length).fill(false), out=[]
+    for(let i=0;i<arr.length;i++){ if(used[i]) continue
+      const group=[arr[i]]; used[i]=true
+      for(let j=i+1;j<arr.length;j++){ if(used[j]) continue
+        if(Math.abs(arr[j][key]-arr[i][key])<=tol){ group.push(arr[j]); used[j]=true } }
+      if(group.length>=2){
+        const level = pickExtreme(group.map(g=>g[key]))
+        out.push({ level, count:group.length, idx:Math.max(...group.map(g=>g.idx)) })
+      }
+    }
+    return out
+  }
+  return {
+    equalHighs: cluster(swingHighs,'high',vals=>Math.max(...vals)),
+    equalLows:  cluster(swingLows, 'low', vals=>Math.min(...vals)),
+  }
+}
 
 function detectLiquiditySweep(c){ const last5=c.slice(-5),prev=c.slice(-20,-5)
   if(!prev.length) return {sweepBull:false,sweepBear:false}
@@ -201,23 +260,166 @@ function analyse(candles,nowMs,cfg){
     const oppM15=(dir0==='BUY'&&m15Bos==='bearish')||(dir0==='SELL'&&m15Bos==='bullish')
     if(oppM15&&conv<MIN_CONV+0.15) return wait('opposes M15 & weak',reg,cfg,{net,bull,bear}) }
   const dir=dir0,score=Math.round(conv*100),tier=score>=70?'A':score>=55?'B':'C'
-  const stopMult=reg.regime==='volatile_expansion'?2.2:1.5
-  let entry=price,sl,tp1,tp2,tp3
+
+  // ── SL PLACEMENT ──────────────────────────────────────────────────────────
+  // Anchor to candle WICKS (high/low), buffer scales with regime.
+  const buf = reg.regime==='volatile_expansion' ? atr*0.8 : atr*0.5
+  const stopMult = reg.regime==='volatile_expansion' ? 2.5 : 1.8  // fallback only
+
+  // Previous-day extreme — TIMEFRAME-AWARE (1440 / cfg.min bars = 24h)
+  const barsPerDay  = Math.max(1, Math.round(1440 / cfg.min))
+  const dayCandles  = candles.slice(-Math.min(candles.length, barsPerDay))
+  const prevDayLow  = Math.min(...dayCandles.map(c=>c.low))
+  const prevDayHigh = Math.max(...dayCandles.map(c=>c.high))
+
+  // Weekly extreme — 7× the daily window (completed-data only, no look-ahead)
+  const barsPerWeek = Math.max(1, barsPerDay*7)
+  const weekCandles = candles.slice(-Math.min(candles.length, barsPerWeek))
+  const weekLow     = Math.min(...weekCandles.map(c=>c.low))
+  const weekHigh    = Math.max(...weekCandles.map(c=>c.high))
+
+  // ── MULTI-TIMEFRAME LIQUIDITY TARGET COLLECTION ────────────────────────────
+  // Gather swing levels from current TF + resampled M15/H1/H4 (completed bars).
+  // resampleTF already drops the forming bar, so this is look-ahead safe.
+  // Each level carries a tfWeight: H4=4, H1=3, M15=2, current=1.
+  // structMin / trendMin come from cfg; we add fixed 60/240 for H1/H4.
+  const htfDefs = [
+    { mins: cfg.min,  weight: 1 },   // current TF
+    { mins: 15,       weight: 2 },   // M15
+    { mins: 60,       weight: 3 },   // H1
+    { mins: 240,      weight: 4 },   // H4
+  ]
+  // Build pooled swing highs/lows across timeframes, each scored + tf-weighted.
+  const pooledHighs = [], pooledLows = []
+  for(const def of htfDefs){
+    // Skip resampling to a timeframe finer than current (can't upsample)
+    if(def.mins < cfg.min) continue
+    const series = def.mins === cfg.min ? candles : resampleTF(candles, def.mins)
+    if(series.length < 30) continue
+    const s = detectStructure(series, 3)
+    const lastIdx = series.length - 1
+    const seriesPrice = last(series).close
+    const scoredH = scoreSwings(s.H, s.H, atr, lastIdx, seriesPrice).map(h=>({...h, tfWeight:def.weight}))
+    const scoredL = scoreSwings(s.L, s.L, atr, lastIdx, seriesPrice).map(l=>({...l, tfWeight:def.weight}))
+    pooledHighs.push(...scoredH)
+    pooledLows.push(...scoredL)
+  }
+
+  // Equal highs/lows from CURRENT TF swings (the precise execution-level magnets)
+  const { equalHighs, equalLows } = detectEqualLevels(str.H, str.L, atr)
+
+  // Dynamic TP buffer by regime (request #4)
+  const tpBuf = reg.regime==='volatile_expansion' ? atr*0.6
+              : reg.regime==='ranging'            ? atr*0.2
+              :                                      atr*0.3
+
+  // Combined target score: liquidity priority + swing strength + tf weight.
+  // priorityBoost ranks the *type* of level (equal > PDH/PDL > weekly > swing).
+  const buildTargets = (dir) => {
+    const targets = []
+    if(dir==='BUY'){
+      // 1. Equal highs (highest priority liquidity)
+      for(const e of equalHighs) targets.push({ level:e.level, kind:'EqualHigh',  base:100, strength:e.count*3, tfWeight:1 })
+      // 2. Previous Day High
+      targets.push({ level:prevDayHigh, kind:'PDH', base:80, strength:2, tfWeight:1 })
+      // 3. Weekly High
+      targets.push({ level:weekHigh,    kind:'WeekHigh', base:70, strength:2, tfWeight:1 })
+      // 4. Strong swing highs (pooled, MTF-weighted)
+      for(const h of pooledHighs) targets.push({ level:h.high, kind:'Swing', base:40, strength:h.strength, tfWeight:h.tfWeight })
+    } else {
+      for(const e of equalLows) targets.push({ level:e.level, kind:'EqualLow', base:100, strength:e.count*3, tfWeight:1 })
+      targets.push({ level:prevDayLow, kind:'PDL', base:80, strength:2, tfWeight:1 })
+      targets.push({ level:weekLow,    kind:'WeekLow', base:70, strength:2, tfWeight:1 })
+      for(const l of pooledLows) targets.push({ level:l.low, kind:'Swing', base:40, strength:l.strength, tfWeight:l.tfWeight })
+    }
+    return targets
+  }
+
+  let entry=price, sl, tp1, tp2, tp3, tpInfo=[]
+
   if(dir==='BUY'){
-    let base=liq.sweepBull&&liq.prevLow?liq.prevLow-atr*0.3:str.rL?str.rL.close-atr*0.3:price-atr*stopMult
-    if(base>=entry) base=price-atr*stopMult
-    sl=+Math.max(base,price-atr*5).toFixed(SYMBOL_DECIMALS); const r=entry-sl
-    tp1=+(entry+r*1.5).toFixed(SYMBOL_DECIMALS);tp2=+(entry+r*2.5).toFixed(SYMBOL_DECIMALS);tp3=+(entry+r*4).toFixed(SYMBOL_DECIMALS)
+    // SL anchor — wick lows
+    const sweepWickLow  = liq.sweepBull && liq.prevLow ? liq.prevLow : null
+    const structWickLow = str.rL ? str.rL.low : null
+    const dayLow        = prevDayLow < price ? prevDayLow : null
+    let anchor = null
+    if(sweepWickLow  && sweepWickLow  < entry) anchor = sweepWickLow
+    else if(structWickLow && structWickLow < entry) anchor = structWickLow
+    else if(dayLow        && dayLow        < entry) anchor = dayLow
+    let slRaw = anchor ? anchor - buf : entry - atr*stopMult
+    if(slRaw >= entry) slRaw = entry - atr*stopMult
+    sl = +Math.max(slRaw, entry - atr*5).toFixed(SYMBOL_DECIMALS)
+    const R = entry - sl
+
+    // Candidate targets above entry, at least 0.8R away (meaningful)
+    const cands = buildTargets('BUY')
+      .filter(t => t.level > entry + R*0.8 && t.level <= entry + atr*12)  // realism cap #6
+      .map(t => ({ ...t, dist:t.level-entry, score: t.base + t.strength*2 + t.tfWeight*5 }))
+    // Sort by combined score (best liquidity first), then nearest as tiebreak
+    cands.sort((a,b) => b.score - a.score || a.dist - b.dist)
+    // Pick 3 progressively-further targets (TP2 must be beyond TP1, etc.)
+    const picked = []
+    for(const c of cands){
+      if(picked.length===0 || c.level > picked[picked.length-1].level + R*0.4){ picked.push(c); if(picked.length===3) break }
+    }
+    const fb = [R*1.5, R*2.5, R*4.0]   // fallbacks
+    const capHi = entry + Math.max(atr*12, R*5)  // realism cap #6 (scales with R)
+    // Guarantee each TP is at least R*0.5 beyond the previous, and never exceeds cap.
+    const place = (i, prevTp) => {
+      const floor = (prevTp ?? entry) + R*0.5
+      let lvl = picked[i] ? picked[i].level - tpBuf : entry + fb[i]
+      lvl = Math.max(lvl, floor)        // must clear previous TP
+      lvl = Math.min(lvl, capHi)        // obey realism cap
+      // If the cap forced us at/below the floor, nudge just past floor (cap wins only if floor itself > cap)
+      if(lvl < floor) lvl = Math.min(floor, capHi)
+      return +lvl.toFixed(SYMBOL_DECIMALS)
+    }
+    tp1 = place(0, null)
+    tp2 = place(1, tp1)
+    tp3 = place(2, tp2)
+    tpInfo = picked.map(p=>p.kind)
+
   } else {
-    let base=liq.sweepBear&&liq.prevHigh?liq.prevHigh+atr*0.3:str.rH?str.rH.close+atr*0.3:price+atr*stopMult
-    if(base<=entry) base=price+atr*stopMult
-    sl=+Math.min(base,price+atr*5).toFixed(SYMBOL_DECIMALS); const r=sl-entry
-    tp1=+(entry-r*1.5).toFixed(SYMBOL_DECIMALS);tp2=+(entry-r*2.5).toFixed(SYMBOL_DECIMALS);tp3=+(entry-r*4).toFixed(SYMBOL_DECIMALS) }
+    const sweepWickHigh  = liq.sweepBear && liq.prevHigh ? liq.prevHigh : null
+    const structWickHigh = str.rH ? str.rH.high : null
+    const dayHigh        = prevDayHigh > price ? prevDayHigh : null
+    let anchor = null
+    if(sweepWickHigh  && sweepWickHigh  > entry) anchor = sweepWickHigh
+    else if(structWickHigh && structWickHigh > entry) anchor = structWickHigh
+    else if(dayHigh        && dayHigh        > entry) anchor = dayHigh
+    let slRaw = anchor ? anchor + buf : entry + atr*stopMult
+    if(slRaw <= entry) slRaw = entry + atr*stopMult
+    sl = +Math.min(slRaw, entry + atr*5).toFixed(SYMBOL_DECIMALS)
+    const R = sl - entry
+
+    const cands = buildTargets('SELL')
+      .filter(t => t.level < entry - R*0.8 && t.level >= entry - atr*12)
+      .map(t => ({ ...t, dist:entry-t.level, score: t.base + t.strength*2 + t.tfWeight*5 }))
+    cands.sort((a,b) => b.score - a.score || a.dist - b.dist)
+    const picked = []
+    for(const c of cands){
+      if(picked.length===0 || c.level < picked[picked.length-1].level - R*0.4){ picked.push(c); if(picked.length===3) break }
+    }
+    const fb = [R*1.5, R*2.5, R*4.0]
+    const capLo = entry - Math.max(atr*12, R*5)  // realism cap #6 (scales with R)
+    const place = (i, prevTp) => {
+      const ceil = (prevTp ?? entry) - R*0.5   // must be below previous TP
+      let lvl = picked[i] ? picked[i].level + tpBuf : entry - fb[i]
+      lvl = Math.min(lvl, ceil)         // must clear previous TP (downward)
+      lvl = Math.max(lvl, capLo)        // obey realism cap
+      if(lvl > ceil) lvl = Math.max(ceil, capLo)
+      return +lvl.toFixed(SYMBOL_DECIMALS)
+    }
+    tp1 = place(0, null)
+    tp2 = place(1, tp1)
+    tp3 = place(2, tp2)
+    tpInfo = picked.map(p=>p.kind)
+  }
   const riskUSD=ACCT*(RISK/100),units=riskUSD/Math.abs(entry-sl)
   return { symbol:SYMBOL_LABEL, tframe:cfg.tframe, direction:dir, score, tier, net, bull, bear,
     conflict:+conflict.toFixed(2), regime:reg.regime, adx:reg.adx, atrPct:+reg.atrPct.toFixed(3),
     session:sessionOf(nowMs), h1Trend, m15Bos,
-    entry:+entry.toFixed(SYMBOL_DECIMALS), sl, tp1, tp2, tp3,
+    entry:+entry.toFixed(SYMBOL_DECIMALS), sl, tp1, tp2, tp3, tpInfo,
     rr:`1:${Math.abs((tp2-entry)/(entry-sl)).toFixed(1)}`,
     units:+units.toFixed(2), posSize:`${units.toFixed(2)} units · $${riskUSD.toFixed(0)} risk`,
     inv:dir==='BUY'?`${cfg.tframe} close below ${fmt(sl)}`:`${cfg.tframe} close above ${fmt(sl)}`,
@@ -316,20 +518,24 @@ function simulateTrade(candles,i,sig,maxHold=24){
   const Rd=Math.abs(fill-SL); if(Rd<=1e-9) return {skip:true,reason:'zero_risk'}
   const riskUSD=ACCT*(RISK/100),commR=COMMISSION_USD/(riskUSD||1)
   const tps=TP_PLAN.map(t=>({px:sig[t.tp],w:t.w,taken:false}))
-  let stop=SL,realized=-commR,remaining=1,mae=0,mfe=0,exitIdx=i+1
+  let stop=SL,realized=-commR,remaining=1,mae=0,mfe=0,exitIdx=i+1,tp1Done=false
   for(let j=i+1;j<Math.min(i+1+maxHold,candles.length);j++){
     const bar=candles[j]; exitIdx=j
     const fav=dir==='BUY'?(bar.high-fill)/Rd:(fill-bar.low)/Rd
     const adv=dir==='BUY'?(fill-bar.low)/Rd:(bar.high-fill)/Rd
     mfe=Math.max(mfe,fav); mae=Math.max(mae,adv)
     const sx=spreadAt(bar.timestamp,sig.regime),ssl=stopSlipAt(bar.timestamp,sig.regime)
+    // Tighten to full BE once the trade has run far in profit (request #5)
+    if(tp1Done && mfe>=BE_FULL_AT_R){ stop = dir==='BUY' ? Math.max(stop,fill) : Math.min(stop,fill) }
     if(dir==='BUY'?bar.low<=stop:bar.high>=stop){
       const px=dir==='BUY'?stop-sx/2-ssl:stop+sx/2+ssl
       realized+=remaining*((dir==='BUY'?px-fill:fill-px)/Rd); remaining=0; break }
     for(const t of tps){ if(t.taken) continue
       if(dir==='BUY'?bar.high>=t.px:bar.low<=t.px){ const px=dir==='BUY'?t.px-sx/2:t.px+sx/2
         realized+=t.w*((dir==='BUY'?px-fill:fill-px)/Rd); t.taken=true; remaining-=t.w
-        if(MOVE_BE_AFTER_TP1) stop=fill } }
+        // On TP1: lock +0.2R instead of exact BE (request #5)
+        if(t.px===sig.tp1 && !tp1Done){ tp1Done=true
+          stop = dir==='BUY' ? fill + Rd*BE_LOCK_R : fill - Rd*BE_LOCK_R } } }
     if(remaining<=1e-9) break }
   if(remaining>1e-9){ const bar=candles[exitIdx],sx=spreadAt(bar.timestamp,sig.regime)
     const px=dir==='BUY'?bar.close-sx/2:bar.close+sx/2; realized+=remaining*((dir==='BUY'?px-fill:fill-px)/Rd) }
