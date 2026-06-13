@@ -76,7 +76,7 @@ function getSymbols()         { return getSetting('symbols') || [] }
 function getActiveSymbols()   { return getSymbols().filter(s => s.active !== false) }
 function getSymbol(id)        { return getSymbols().find(s => s.id === id) || null }
 function saveSymbols(arr)     { setSetting('symbols', arr) }
-function nextSymbolId(label)  { return label.toLowerCase().replace(/[^a-z0-9]/g,'_').slice(0,20) + '_' + Date.now().toString(36).slice(-4) }
+function nextSymbolId(label)  { return label.toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,16) + Date.now().toString(36).slice(-4) }
 
 function getSymbolPackages(symId) { return getSymbol(symId)?.packages || [] }
 function getSymbolPackage(symId, pkgId) { return getSymbolPackages(symId).find(p => p.id === pkgId) || null }
@@ -92,8 +92,8 @@ function deleteSymbolPackage(symId, pkgId) {
 }
 function nextPkgId(symId) {
   const ids = getSymbolPackages(symId).map(p => p.id)
-  let i = 1; while (ids.includes(`${symId}_p${i}`)) i++
-  return `${symId}_p${i}`
+  let i = 1; while (ids.includes(`p${i}`)) i++
+  return `p${i}`
 }
 
 // ── API KEY / TF / PAYMENT HELPERS ────────────────────────────────────────
