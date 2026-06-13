@@ -822,4 +822,50 @@ async function handleUpdate(upd) {
     // Broadcast
     const broadcastSym=data.match(/^adm_broadcast_sym_(\w+)$/)
     if(broadcastSym) { setSession(chatId,'broadcast_msg',{symId:broadcastSym[1]}); return editMsg(chatId,msgId,`📢 <b>Broadcast to ${getSymbol(broadcastSym[1])?.label} subscribers</b>\n\nType your message:`,[[{text:'❌ Cancel',callback_data:'adm_broadcast_pick'}]]) }
-    if(data==='adm_broadcast_all') { setSession(chatId,'broadcast_msg',{symId:null});
+    if(data==='adm_broadcast_all') { setSession(chatId,'broadcast_msg',{symId:null}); return editMsg(chatId,msgId,`📢 <b>Broadcast to ALL subscribers</b>\n\nType your message:`,[[{text:'❌ Cancel',callback_data:'adm_broadcast_pick'}]]) }
+  }
+}
+
+// ── LONG POLLING ──────────────────────────────────────────────────────────
+async function startPolling() {
+  const s=loadSettings()
+  console.log('🤖 Gold AI Subscription Bot v4 — Multi-Symbol')
+  console.log(`   Channel: ${s.channel} | Admin: ${ADMIN_ID}`)
+  console.log(`   Symbols: ${getActiveSymbols().map(x=>`${x.emoji||''}${x.label}`).join(', ')}`)
+  console.log(`   API Keys: ${(s.twelvedata_keys||[]).filter(k=>k.active).length} active`)
+  console.log(`   Payments: ${(s.payment_methods||[]).filter(m=>m.active!==false).map(m=>m.coin).join(', ')}`)
+  let offset=0
+  while(true){
+    try{
+      const res=await fetch(`${API}/getUpdates?offset=${offset}&timeout=1&allowed_updates=["message","callback_query"]`)
+      const j=await res.json()
+      if(!j.ok){await sleep(3000);continue}
+      const updates=j.result||[]
+      for(const upd of updates){offset=upd.update_id+1;handleUpdate(upd).catch(e=>console.error('[update error]',e.message))}
+      if(!updates.length) await sleep(300)
+    }catch(e){console.error('[poll error]',e.message);await sleep(3000)}
+  }
+}
+
+// ── EXPIRY CHECKER ────────────────────────────────────────────────────────
+async function runExpiryChecker(){
+  setInterval(async()=>{
+    const data=loadSubs(),now=new Date()
+    for(const sub of Object.values(data)){
+      if(sub.status!=='active') continue
+      const sym=getSymbol(sub.symbolId),exp=new Date(sub.expiresAt),days=Math.ceil((exp-now)/86400000)
+      if(days===3&&!sub.warned3d){
+        upsertSub(sub.chatId,sub.symbolId,{warned3d:true})
+        await send(sub.chatId,`\u26a0\ufe0f <b>Subscription Expiring Soon</b>\n\n${sym?.emoji||''} <b>${sym?.label||sub.symbolId}</b> expires in <b>3 days</b>.\n\nRenew: /start`).catch(()=>{})
+      }
+      if(exp<=now){
+        upsertSub(sub.chatId,sub.symbolId,{status:'expired'})
+        await send(sub.chatId,`\u274c <b>Subscription Expired</b>\n\n${sym?.emoji||''} ${sym?.label||sub.symbolId} access has ended.\n\n/start \u2014 renew`).catch(()=>{})
+      }
+    }
+  },60*60*1000)
+}
+
+const sleep=ms=>new Promise(r=>setTimeout(r,ms))
+runExpiryChecker()
+startPolling()
