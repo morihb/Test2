@@ -68,7 +68,14 @@ const TP_PLAN=[{tp:'tp1',w:0.5},{tp:'tp2',w:0.3},{tp:'tp3',w:0.2}]
 const BE_LOCK_R   = parseFloat(process.env.BE_LOCK_R)   || 0.2   // stop → entry + 0.2R after TP1
 const BE_FULL_AT_R= parseFloat(process.env.BE_FULL_AT_R)|| 1.5   // once MFE ≥ this, stop → entry
 const NEWS_BLACKOUT_MIN={before:30,after:30}
-const NEWS_EVENTS=[]
+function loadNewsEvents(){
+  try{
+    const raw=JSON.parse(fs.readFileSync('./news_events.json','utf8'))
+    const arr=Array.isArray(raw)?raw:(raw.events||[])
+    return arr.filter(e=>e&&e.time&&!isNaN(new Date(e.time).getTime()))
+  }catch{ return [] }
+}
+const NEWS_EVENTS=loadNewsEvents()
 const TF={scalp:{slb:3}}
 
 // ── MATH ────────────────────────────────────────────────────
