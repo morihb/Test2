@@ -344,14 +344,24 @@ async function runSignalCycle(symObj, tf, isStartup=false) {
     const isHold=heldBefore&&heldBefore.direction===sig.direction
 
     if(isHold){
-      const held=heldBefore
-      const adminReplyId=held.signalMsgId||held.msgId
-      const subMsgIds=held.subMsgIds||{}
-      const tp1L=`${held.tp1Hit?'✅ ':''}TP1 ${held.tp1?.toFixed(dp)}`
-      const tp2L=`${held.tp2Hit?'✅ ':''}TP2 ${held.tp2?.toFixed(dp)}`
-      const tp3L=`${held.tp3Hit?'✅ ':''}TP3 ${held.tp3?.toFixed(dp)}`
-      await sendReply(`${dirIcon(held.direction)} <b>${symObj.label} ${tf.toUpperCase()} — KEEP HOLDING ${held.direction}</b>\nConfluence still active — original trade stays open.\nEntry ${held.entry?.toFixed(dp)} · SL ${held.sl?.toFixed(dp)}\n${tp1L}\n${tp2L}\n${tp3L}`, symObj.id, adminReplyId, subMsgIds)
-      const s=loadState(); s[stateKey]={...held}; saveState(s)   // signalMsgId + subMsgIds preserved
+      // Re-read state AFTER engine exec — the watcher may have run during the await and
+      // updated tp1Hit/sl (or set trade=null on TP3/SL). Using stale heldBefore here
+      // would clobber those updates or resurrect a closed trade.
+      const current=openTrade(loadState(), symObj.id, tf)
+      if(!current){
+        // Watcher already closed this trade during exec (TP3 or SL) — do not send
+        // KEEP HOLDING and do NOT re-save the old snapshot (that would resurrect it).
+        console.log(`[${symObj.label} ${tf}] KEEP HOLDING skipped — trade already closed by watcher`)
+        return
+      }
+      const adminReplyId=current.signalMsgId||current.msgId||null
+      const subMsgIds=current.subMsgIds||{}
+      const tp1L=`${current.tp1Hit?'✅ ':''}TP1 ${current.tp1?.toFixed(dp)}`
+      const tp2L=`${current.tp2Hit?'✅ ':''}TP2 ${current.tp2?.toFixed(dp)}`
+      const tp3L=`${current.tp3Hit?'✅ ':''}TP3 ${current.tp3?.toFixed(dp)}`
+      await sendReply(`${dirIcon(current.direction)} <b>${symObj.label} ${tf.toUpperCase()} — KEEP HOLDING ${current.direction}</b>\nConfluence still active — original trade stays open.\nEntry ${current.entry?.toFixed(dp)} · SL ${current.sl?.toFixed(dp)}\n${tp1L}\n${tp2L}\n${tp3L}`, symObj.id, adminReplyId, subMsgIds)
+      // DO NOT saveState here — the watcher owns tp1Hit/sl/lastBarTs.
+      // Saving the old snapshot would clobber those updates.
       console.log(`[${symObj.label} ${tf}] 📡 KEEP HOLDING`)
     } else {
       // HTF DIRECTION GATE — drop a new signal that opposes an open higher-TF trade
@@ -373,8 +383,9 @@ H1 ${sig.h1Trend} · ${sig.session}
 ✅ TP3 ${tp3.toFixed(dp)} (+${toPips(tp3-entry,dp)} pips)
 🛡️ SL confirms only when a 5-min candle CLOSES beyond ${sl.toFixed(dp)} — a wick touch keeps the trade valid.
 ⚠️ Manage risk. Not financial advice.`
-      // lastBarTs = current 5m boundary so only candles that CLOSE after entry are evaluated
-      const nowBar5m=Math.floor(Date.now()/BAR_MS)*BAR_MS
+      // lastBarTs = signal bar's open. Filter is b.ts > lastBarTs so the NEXT bar is
+      // the first evaluated. Without -BAR_MS the first post-entry bar was always skipped.
+      const nowBar5m=Math.floor(Date.now()/BAR_MS)*BAR_MS - BAR_MS
       const r=await sendNewSignal(msgText, symObj.id)
       const sNow=loadState()
       sNow[stateKey]={direction:sig.direction,entry,sl,tp1,tp2,tp3,tp1Hit:false,tp2Hit:false,tp3Hit:false,signalMsgId:r.adminMsgId,subMsgIds:r.subMsgIds,lastBarTs:nowBar5m,ts:sig.ts}
