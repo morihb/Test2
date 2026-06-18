@@ -1,13 +1,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  GOLD.AI — Subscription Bot  v5 — Multi-Symbol + Bundles + Monthly Stats
+//  GOLD.AI — Subscription Bot  v5.1 — Multi-Symbol + Bundles + Monthly Stats
 //
-//  New in v5:
-//   • BUNDLES — a single product that grants several symbols at once
-//     (e.g. "All-Markets" = GOLD + BTC + EUR/USD). On approval the bundle
-//     fans out into per-symbol active subscriptions, so the existing per-symbol
-//     broadcast machinery delivers signals for every included market.
-//   • MONTHLY STATS — admin button showing every TP/SL with pips for the month,
-//     win rate, net pips, and a per-market breakdown (reads daily_report.json).
+//  New in v5.1 (messaging only — no UI/flow changes):
+//   • broadcastSignal() now RETURNS each subscriber's message_id in `msgIds`
+//     ({ chatId: message_id }) so the launcher can thread TP/SL replies under
+//     the ORIGINAL signal in every subscriber's chat (not just the admin's).
+//   • broadcastReply() — new export: sends a TP/SL/HOLD alert as a threaded
+//     reply under each subscriber's stored signal message.
+//
+//  v5 features:
+//   • BUNDLES — a single product that grants several symbols at once.
+//   • MONTHLY STATS — admin button showing every TP/SL with pips for the month.
 // ─────────────────────────────────────────────────────────────────────────────
 import fs from 'fs'
 
@@ -174,6 +177,8 @@ function allActiveSubscribers() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  BROADCAST — per symbol (bundle wrappers excluded; recipients deduped by chat)
+//  v5.1: now captures + RETURNS each recipient's message_id so the launcher can
+//  thread TP/SL replies under the original signal in every subscriber's chat.
 // ─────────────────────────────────────────────────────────────────────────────
 export async function broadcastSignal(sigText, symbolId) {
   let subs = symbolId ? activeSubscribersForSymbol(symbolId) : allActiveSubscribers()
@@ -181,6 +186,7 @@ export async function broadcastSignal(sigText, symbolId) {
   const seen = new Set(), uniq = []
   for (const s of subs) { if (seen.has(s.chatId)) continue; seen.add(s.chatId); uniq.push(s) }  // 1 msg per person
   let sent=0, failed=0
+  const msgIds = {}                                      // { chatId: message_id } — for threaded TP/SL replies
   for (const sub of uniq) {
     try {
       const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
@@ -188,12 +194,41 @@ export async function broadcastSignal(sigText, symbolId) {
         body: JSON.stringify({ chat_id:sub.chatId, text:sigText, parse_mode:'HTML' })
       })
       const j = await res.json()
-      if (j.ok) sent++
+      if (j.ok) { sent++; msgIds[sub.chatId] = j.result.message_id }
       else { failed++; if (['blocked','kicked','deactivated','not_found'].some(w=>j.description?.toLowerCase().includes(w))) upsertSub(sub.chatId,sub.symbolId,{status:'bot_blocked'}) }
     } catch { failed++ }
     await new Promise(r=>setTimeout(r,50))
   }
   console.log(`[broadcast][${symbolId||'ALL'}] sent=${sent} failed=${failed}`)
+  return { sent, failed, msgIds }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  BROADCAST REPLY — send a TP/SL/HOLD alert as a threaded reply UNDER each
+//  subscriber's original signal. msgIds = { chatId: message_id } captured by
+//  broadcastSignal at signal time. allow_sending_without_reply means it still
+//  delivers (unthreaded) if a user deleted the original message.
+// ─────────────────────────────────────────────────────────────────────────────
+export async function broadcastReply(alertText, symbolId, msgIds = {}) {
+  let subs = symbolId ? activeSubscribersForSymbol(symbolId) : allActiveSubscribers()
+  subs = subs.filter(s => !isBundleSub(s))
+  const seen = new Set(), uniq = []
+  for (const s of subs) { if (seen.has(s.chatId)) continue; seen.add(s.chatId); uniq.push(s) }
+  let sent=0, failed=0
+  for (const sub of uniq) {
+    const body = { chat_id:sub.chatId, text:alertText, parse_mode:'HTML' }
+    const rid = msgIds[sub.chatId]
+    if (rid) { body.reply_to_message_id = rid; body.allow_sending_without_reply = true }
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+      })
+      const j = await res.json()
+      if (j.ok) sent++; else failed++
+    } catch { failed++ }
+    await new Promise(r=>setTimeout(r,50))
+  }
+  console.log(`[reply][${symbolId||'ALL'}] sent=${sent} failed=${failed}`)
   return { sent, failed }
 }
 
@@ -1006,7 +1041,7 @@ async function handleUpdate(upd) {
 // ── LONG POLLING ──────────────────────────────────────────────────────────
 async function startPolling() {
   const s=loadSettings()
-  console.log('🤖 Gold AI Subscription Bot v5 — Multi-Symbol + Bundles + Stats')
+  console.log('🤖 Gold AI Subscription Bot v5.1 — Multi-Symbol + Bundles + Stats')
   console.log(`   Channel: ${s.channel} | Admin: ${ADMIN_ID}`)
   console.log(`   Symbols: ${getActiveSymbols().map(x=>`${x.emoji||''}${x.label}`).join(', ')}`)
   console.log(`   Bundles: ${getActiveBundles().map(x=>x.label).join(', ')||'none'}`)
