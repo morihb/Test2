@@ -1,24 +1,27 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  launcher.mjs  —  v10 (Multi-Symbol + Multi-Timeframe)
+//  launcher.mjs  —  v10.1 (Multi-Symbol + Multi-Timeframe)
 //
-//  Changes vs v9:
-//   1. HTF DIRECTION GATE — a lower TF signal that OPPOSES an open higher-TF
-//      trade (same symbol) is suppressed. e.g. 1h holds BUY → 15m SELL is dropped.
-//   2. SL PIPS shown in the signal message.
-//   3. NO MORE 30s PRICE POLLING. A single watcher fires on each 5-min candle
-//      close and reads that candle's HIGH/LOW/CLOSE to detect TP (wick touch)
-//      and SL (close beyond). One API call per symbol every 5 minutes.
-//   4. ALL TP/SL alerts now REPLY TO THE ORIGINAL SIGNAL MESSAGE (stable
-//      signalMsgId that is never overwritten by alert message ids).
-//   5. RELIABILITY: the signal engine runs in an isolated working dir (./engine)
-//      so it can never corrupt or clobber the launcher's bot_state.json. State
-//      writes are atomic (temp file + rename). This fixes "sometimes doesn't send".
-//   6. 1-MINUTE RETRY when the per-minute API capacity is exhausted (429).
+//  Changes vs v10:
+//   A. TP/SL RELIABILITY FIX — the old watcher fetched ONE last-closed 5m bar
+//      and required an EXACT timestamp match (bar.ts===expectedOpen). When the
+//      bar timestamp didn't line up, or a 5m sweep was skipped (429 / restart),
+//      that candle was never re-checked and the TP/SL was silently lost — for
+//      ADMIN too. The watcher now fetches the last ~12 closed 5m bars and
+//      evaluates EVERY bar newer than the trade's lastBarTs, in order. Missed
+//      sweeps self-heal on the next sweep. This is the real "not sending" fix.
+//   B. SUBSCRIBER THREADING — TP/SL/KEEP-HOLDING alerts now reply UNDER the
+//      original signal in every SUBSCRIBER chat, not just the admin chat. The
+//      signal's per-subscriber message_id map (subMsgIds) is stored on the trade
+//      and used as reply_to for each recipient.
+//
+//  Carried over from v10: HTF direction gate, SL pips in message, engine run in
+//  isolated ./engine dir, atomic state writes, 1-min retry on 429.
 //
 //  State keys are  symbol|tf  so Gold 15m and EURUSD 15m never collide.
 // ─────────────────────────────────────────────────────────────────────────────
 import {
   broadcastSignal,
+  broadcastReply,
   getActiveApiKeys,
   getDataSource,
   getAccountSize,
@@ -47,6 +50,7 @@ const CANDLE_DELAY_MS = 2000
 const RETRY_DELAY_MS  = 60000      // 1 minute — used for per-minute API capacity (429)
 const MAX_RETRIES     = 3
 const WATCH_PERIOD_MS = 5 * 60000  // 5-minute OHLC sweep
+const BAR_MS          = 5 * 60000  // 5-minute candle
 
 // Stagger per TF so candle-close checks don't all fire at once
 const TF_STAGGER_MS = { '15m':0, '1h':4*60000, '4h':45000, '1d':60000 }
@@ -105,54 +109,73 @@ function addToDaily(trade) {
   saveDaily(daily)
 }
 
-// ── SEND (admin + subscribers, optional threaded reply) ─────────────────────
-async function sendAll(text, symbolId, replyToMsgId=null) {
+// ── SEND A NEW SIGNAL ──────────────────────────────────────────────────────
+// Admin (direct) + all subscribers. Captures EVERY message id so TP/SL alerts
+// can thread under the original signal in each chat.
+// Returns { adminMsgId, subMsgIds:{chatId:message_id} }.
+async function sendNewSignal(text, symbolId) {
   let adminMsgId=null
   try {
-    const body={chat_id:TG_CHAT,text,parse_mode:'HTML'}
-    if(replyToMsgId) body.reply_to_message_id=replyToMsgId
-    const res=await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    const res=await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:TG_CHAT,text,parse_mode:'HTML'})})
     const j=await res.json(); if(j.ok) adminMsgId=j.result.message_id
-  }catch(e){console.error('[sendAll admin]',e.message)}
+  }catch(e){console.error('[sendNewSignal admin]',e.message)}
   const result=await broadcastSignal(text, symbolId)
-  console.log(`[sendAll][${symbolId}] adminMsgId=${adminMsgId} subs sent=${result.sent} failed=${result.failed}`)
-  return adminMsgId
+  console.log(`[newSignal][${symbolId}] adminMsgId=${adminMsgId} subs sent=${result.sent} failed=${result.failed}`)
+  return { adminMsgId, subMsgIds: result.msgIds || {} }
 }
 
-// ── LAST CLOSED 5-MIN BAR (one call per symbol; reports 429 exhaustion) ─────
-async function fetchClosed5mBar(symObj) {
-  const interval='5min', periodMs=5*60000
-  const boundary=Math.floor(Date.now()/periodMs)*periodMs
-  const expectedOpen=boundary-periodMs
+// ── SEND A THREADED REPLY ──────────────────────────────────────────────────
+// TP/SL/KEEP-HOLDING alert that replies UNDER the original signal in every chat:
+// admin replies to adminReplyId, each subscriber replies to their stored id.
+// (allow_sending_without_reply means it still delivers if the original is gone.)
+async function sendReply(text, symbolId, adminReplyId=null, subMsgIds={}) {
+  try {
+    const body={chat_id:TG_CHAT,text,parse_mode:'HTML'}
+    if(adminReplyId){ body.reply_to_message_id=adminReplyId; body.allow_sending_without_reply=true }
+    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+  }catch(e){console.error('[sendReply admin]',e.message)}
+  const result=await broadcastReply(text, symbolId, subMsgIds)
+  console.log(`[reply][${symbolId}] subs sent=${result.sent} failed=${result.failed}`)
+}
+
+// ── RECENT CLOSED 5-MIN BARS (catch-up; reports 429 exhaustion) ────────────
+// Returns { bars:[{ts,high,low,close}], rateLimited } with ONLY closed bars,
+// sorted oldest→newest. The forming (incomplete) bar is excluded.
+async function fetchRecent5mBars(symObj) {
+  const interval='5min'
+  const nowBoundary=Math.floor(Date.now()/BAR_MS)*BAR_MS   // start of the FORMING bar
   const keys=getLiveApiKeys(); let saw429=false
   for(let attempt=0; attempt<Math.max(keys.length,1); attempt++){
     const key=currentKey(); if(!key) break
     try{
-      const res=await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symObj.td_symbol)}&interval=${interval}&outputsize=3&apikey=${key}`,{signal:AbortSignal.timeout(8000)})
+      const res=await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symObj.td_symbol)}&interval=${interval}&outputsize=12&apikey=${key}`,{signal:AbortSignal.timeout(8000)})
       if(res.status===429){ saw429=true; switchToNextKey(); continue }
       const j=await res.json()
       if(j.code===429 || /run out|api credits|minute|limit/i.test(j.message||'')){ saw429=true; switchToNextKey(); continue }
-      if(j.status==='error' || !j.values?.length) return { bar:null }
-      const bars=j.values.map(v=>({ts:new Date(v.datetime.replace(' ','T')+'Z').getTime(),high:parseFloat(v.high),low:parseFloat(v.low),close:parseFloat(v.close)}))
-      const bar=bars.find(b=>b.ts===expectedOpen) || bars.filter(b=>b.ts+periodMs<=Date.now()).sort((a,b)=>b.ts-a.ts)[0] || null
-      return { bar }
+      if(j.status==='error' || !j.values?.length) return { bars:[] }
+      const bars=j.values
+        .map(v=>({ts:new Date(v.datetime.replace(' ','T')+'Z').getTime(),high:parseFloat(v.high),low:parseFloat(v.low),close:parseFloat(v.close)}))
+        .filter(b=>Number.isFinite(b.ts)&&b.ts<nowBoundary)   // CLOSED bars only
+        .sort((a,b)=>a.ts-b.ts)                                // oldest → newest
+      return { bars }
     }catch{ /* network error — try next key */ }
   }
-  return { rateLimited:saw429, bar:null }
+  return { rateLimited:saw429, bars:[] }
 }
 
-// Evaluate one open trade against a closed 5-min bar. Mutates `state`, sends
-// threaded alerts. Returns true if state changed.
+// Evaluate one open trade against a single closed 5-min bar. Mutates `state`,
+// sends threaded alerts. Returns true if state changed.
 async function evalTradeAgainstBar(state, symObj, tf, sig, bar) {
   const key=`${symObj.id}|${tf}`, dp=symObj.decimals||2
   const dir=sig.direction, entry=sig.entry
-  const sigMsgId = sig.signalMsgId || sig.msgId || null   // always reply to ORIGINAL signal
+  const adminReplyId = sig.signalMsgId || sig.msgId || null   // reply to ORIGINAL signal (admin)
+  const subMsgIds = sig.subMsgIds || {}                        // per-subscriber original message ids
   let changed=false
 
   // ── TP1 (wick touch) ──
   if(!sig.tp1Hit && (dir==='BUY' ? bar.high>=sig.tp1 : bar.low<=sig.tp1)){
     const pips=toPips(sig.tp1-entry,dp)
-    await sendAll(`${dirIcon(dir)} <b>${symObj.label} ${tf.toUpperCase()} — TP1 HIT ✅</b>\n+${pips} pips @ ${sig.tp1.toFixed(dp)}\nSL moved to break-even (${entry.toFixed(dp)}) — trade is now risk-free.\n→ Targeting TP2 ${sig.tp2.toFixed(dp)}`, symObj.id, sigMsgId)
+    await sendReply(`${dirIcon(dir)} <b>${symObj.label} ${tf.toUpperCase()} — TP1 HIT ✅</b>\n+${pips} pips @ ${sig.tp1.toFixed(dp)}\nSL moved to break-even (${entry.toFixed(dp)}) — trade is now risk-free.\n→ Targeting TP2 ${sig.tp2.toFixed(dp)}`, symObj.id, adminReplyId, subMsgIds)
     addToDaily({sym:symObj.id,tf,dir,result:'TP1',pips,sign:+1})
     sig.tp1Hit=true; sig.sl=entry; state[key]={...sig}; changed=true
     console.log(`[${symObj.label} ${tf}] ✅ TP1 +${pips} pips`)
@@ -160,7 +183,7 @@ async function evalTradeAgainstBar(state, symObj, tf, sig, bar) {
   // ── TP2 ──
   if(sig.tp1Hit && !sig.tp2Hit && (dir==='BUY' ? bar.high>=sig.tp2 : bar.low<=sig.tp2)){
     const pips=toPips(sig.tp2-entry,dp)
-    await sendAll(`${dirIcon(dir)} <b>${symObj.label} ${tf.toUpperCase()} — TP2 HIT ✅</b>\n+${pips} pips @ ${sig.tp2.toFixed(dp)}\n→ Targeting TP3 ${sig.tp3.toFixed(dp)}`, symObj.id, sigMsgId)
+    await sendReply(`${dirIcon(dir)} <b>${symObj.label} ${tf.toUpperCase()} — TP2 HIT ✅</b>\n+${pips} pips @ ${sig.tp2.toFixed(dp)}\n→ Targeting TP3 ${sig.tp3.toFixed(dp)}`, symObj.id, adminReplyId, subMsgIds)
     addToDaily({sym:symObj.id,tf,dir,result:'TP2',pips,sign:+1})
     sig.tp2Hit=true; state[key]={...sig}; changed=true
     console.log(`[${symObj.label} ${tf}] ✅ TP2 +${pips} pips`)
@@ -168,7 +191,7 @@ async function evalTradeAgainstBar(state, symObj, tf, sig, bar) {
   // ── TP3 (full target → close) ──
   if(sig.tp2Hit && !sig.tp3Hit && (dir==='BUY' ? bar.high>=sig.tp3 : bar.low<=sig.tp3)){
     const pips=toPips(sig.tp3-entry,dp)
-    await sendAll(`${dirIcon(dir)} <b>${symObj.label} ${tf.toUpperCase()} — TP3 HIT 🏆 FULL TARGET</b>\n+${pips} pips @ ${sig.tp3.toFixed(dp)}\nAll targets reached! 🎯`, symObj.id, sigMsgId)
+    await sendReply(`${dirIcon(dir)} <b>${symObj.label} ${tf.toUpperCase()} — TP3 HIT 🏆 FULL TARGET</b>\n+${pips} pips @ ${sig.tp3.toFixed(dp)}\nAll targets reached! 🎯`, symObj.id, adminReplyId, subMsgIds)
     addToDaily({sym:symObj.id,tf,dir,result:'TP3',pips,sign:+1})
     state[key]=null; changed=true
     console.log(`[${symObj.label} ${tf}] 🏆 TP3 +${pips} pips`)
@@ -182,7 +205,7 @@ async function evalTradeAgainstBar(state, symObj, tf, sig, bar) {
     const isBE = Math.abs(sl-entry) < Math.pow(10,-dp)/2
     const pips = toPips(sl-entry,dp)
     const label = isBE ? 'Break-even (0 pips)' : `-${pips} pips`
-    await sendAll(`${dirIcon(dir)} <b>${symObj.label} ${tf.toUpperCase()} — ${isBE?'CLOSED AT BREAK-EVEN 🟦':'STOP LOSS ❌'}</b>\n${label} @ ${sl.toFixed(dp)}\n5-min candle closed at ${bar.close.toFixed(dp)} beyond the stop — confirmed on close.`, symObj.id, sigMsgId)
+    await sendReply(`${dirIcon(dir)} <b>${symObj.label} ${tf.toUpperCase()} — ${isBE?'CLOSED AT BREAK-EVEN 🟦':'STOP LOSS ❌'}</b>\n${label} @ ${sl.toFixed(dp)}\n5-min candle closed at ${bar.close.toFixed(dp)} beyond the stop — confirmed on close.`, symObj.id, adminReplyId, subMsgIds)
     addToDaily({sym:symObj.id,tf,dir,result:isBE?'BE':'SL',pips,sign:isBE?0:-1})
     state[key]=null; changed=true
     console.log(`[${symObj.label} ${tf}] ${isBE?'🟦 BE':'🔴 SL'} (${label})`)
@@ -190,25 +213,33 @@ async function evalTradeAgainstBar(state, symObj, tf, sig, bar) {
   return changed
 }
 
-// Watch one symbol's open trades against the last closed 5m candle.
+// Watch one symbol's open trades against ALL closed 5m bars since last checked.
 async function watchSymbol(symObj, isRetry=false) {
   const probe=loadState()
   const hasOpen=symObj.timeframes.some(tf=>openTrade(probe,symObj.id,tf))
   if(!hasOpen) return   // nothing open → no API call needed
 
-  const res=await fetchClosed5mBar(symObj)
+  const res=await fetchRecent5mBars(symObj)
   if(res.rateLimited){
     if(!isRetry){ console.log(`[watch ${symObj.label}] per-minute API capacity full — retrying in 60s`); setTimeout(()=>watchSymbol(symObj,true).catch(()=>{}), RETRY_DELAY_MS) }
     else console.error(`[watch ${symObj.label}] still rate-limited after retry — next 5m sweep will catch it`)
     return
   }
-  const bar=res.bar; if(!bar) return
+  const bars=res.bars; if(!bars.length) return
 
   const state=loadState(); let changed=false
   for(const tf of symObj.timeframes){
-    const sig=openTrade(state,symObj.id,tf); if(!sig?.entry) continue
-    const c=await evalTradeAgainstBar(state, symObj, tf, sig, bar)
-    changed = changed || c
+    let sig=openTrade(state,symObj.id,tf); if(!sig?.entry) continue
+    const lastBarTs=sig.lastBarTs||0
+    // Only bars that CLOSED after the signal was sent, and never re-check a bar.
+    const newBars=bars.filter(b=>b.ts>lastBarTs)
+    for(const bar of newBars){
+      sig=openTrade(state,symObj.id,tf); if(!sig?.entry) break    // closed mid-loop (TP3/SL)
+      const c=await evalTradeAgainstBar(state, symObj, tf, sig, bar)
+      changed = changed || c
+      const cur=openTrade(state,symObj.id,tf)                     // advance progress marker
+      if(cur){ cur.lastBarTs=bar.ts; state[`${symObj.id}|${tf}`]=cur; changed=true }
+    }
   }
   if(changed) saveState(state)
 }
@@ -314,12 +345,13 @@ async function runSignalCycle(symObj, tf, isStartup=false) {
 
     if(isHold){
       const held=heldBefore
-      const sigMsgId=held.signalMsgId||held.msgId
+      const adminReplyId=held.signalMsgId||held.msgId
+      const subMsgIds=held.subMsgIds||{}
       const tp1L=`${held.tp1Hit?'✅ ':''}TP1 ${held.tp1?.toFixed(dp)}`
       const tp2L=`${held.tp2Hit?'✅ ':''}TP2 ${held.tp2?.toFixed(dp)}`
       const tp3L=`${held.tp3Hit?'✅ ':''}TP3 ${held.tp3?.toFixed(dp)}`
-      await sendAll(`${dirIcon(held.direction)} <b>${symObj.label} ${tf.toUpperCase()} — KEEP HOLDING ${held.direction}</b>\nConfluence still active — original trade stays open.\nEntry ${held.entry?.toFixed(dp)} · SL ${held.sl?.toFixed(dp)}\n${tp1L}\n${tp2L}\n${tp3L}`, symObj.id, sigMsgId)
-      const s=loadState(); s[stateKey]={...held}; saveState(s)   // signalMsgId preserved
+      await sendReply(`${dirIcon(held.direction)} <b>${symObj.label} ${tf.toUpperCase()} — KEEP HOLDING ${held.direction}</b>\nConfluence still active — original trade stays open.\nEntry ${held.entry?.toFixed(dp)} · SL ${held.sl?.toFixed(dp)}\n${tp1L}\n${tp2L}\n${tp3L}`, symObj.id, adminReplyId, subMsgIds)
+      const s=loadState(); s[stateKey]={...held}; saveState(s)   // signalMsgId + subMsgIds preserved
       console.log(`[${symObj.label} ${tf}] 📡 KEEP HOLDING`)
     } else {
       // HTF DIRECTION GATE — drop a new signal that opposes an open higher-TF trade
@@ -341,11 +373,13 @@ H1 ${sig.h1Trend} · ${sig.session}
 ✅ TP3 ${tp3.toFixed(dp)} (+${toPips(tp3-entry,dp)} pips)
 🛡️ SL confirms only when a 5-min candle CLOSES beyond ${sl.toFixed(dp)} — a wick touch keeps the trade valid.
 ⚠️ Manage risk. Not financial advice.`
-      const newMsgId=await sendAll(msgText, symObj.id)
+      // lastBarTs = current 5m boundary so only candles that CLOSE after entry are evaluated
+      const nowBar5m=Math.floor(Date.now()/BAR_MS)*BAR_MS
+      const r=await sendNewSignal(msgText, symObj.id)
       const sNow=loadState()
-      sNow[stateKey]={direction:sig.direction,entry,sl,tp1,tp2,tp3,tp1Hit:false,tp2Hit:false,tp3Hit:false,signalMsgId:newMsgId,ts:sig.ts}
+      sNow[stateKey]={direction:sig.direction,entry,sl,tp1,tp2,tp3,tp1Hit:false,tp2Hit:false,tp3Hit:false,signalMsgId:r.adminMsgId,subMsgIds:r.subMsgIds,lastBarTs:nowBar5m,ts:sig.ts}
       saveState(sNow)
-      console.log(`[${symObj.label} ${tf}] 📡 NEW signal msgId=${newMsgId}`)
+      console.log(`[${symObj.label} ${tf}] 📡 NEW signal adminMsgId=${r.adminMsgId} subs=${Object.keys(r.subMsgIds).length}`)
     }
   } else if(!hasSignal&&!fresh){
     console.log(`[${symObj.label} ${tf}] No signal this candle`)
@@ -376,9 +410,9 @@ function scheduleDailySummary(){
 // ── STARTUP ───────────────────────────────────────────────────────────────
 const symbols=getLiveSymbols()
 
-console.log('🚀 Gold AI Launcher v10 — Multi-Symbol + Multi-Timeframe')
+console.log('🚀 Gold AI Launcher v10.1 — Multi-Symbol + Multi-Timeframe')
 console.log(`   Symbols: ${symbols.map(s=>`${s.emoji}${s.label}[${s.timeframes.join(',')}]`).join('  ')}`)
-console.log(`   ⚡ TP/SL watcher: every 5 min on candle close (no more 30s polling)`)
+console.log(`   ⚡ TP/SL watcher: every 5 min, catch-up over all closed bars`)
 console.log(`   🔑 API keys: ${getLiveApiKeys().length} active`)
 console.log(`   💰 Account: $${getAccountSize()} · Risk ${getRiskPct()}%`)
 
