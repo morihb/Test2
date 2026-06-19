@@ -73,21 +73,22 @@ for (const sym of SYMBOLS) {
   const key = KEYS[0]
   let bars = []
   try {
-    const res = await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym.td_symbol)}&interval=1min&outputsize=20&apikey=${key}`, {signal:AbortSignal.timeout(10000)})
+    const res = await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym.td_symbol)}&interval=1min&outputsize=20&timezone=UTC&apikey=${key}`, {signal:AbortSignal.timeout(10000)})
     const j = await res.json()
     if (j.status === 'error' || !j.values?.length) {
       console.log('  ❌ API error:', j.message || JSON.stringify(j))
       continue
     }
     console.log(`  ✅ API returned ${j.values.length} raw bars`)
-    bars = j.values
-      .map(v => ({
+    const allBars = j.values.map(v => ({
         dt:   v.datetime,
         ts:   new Date(v.datetime.replace(' ','T')+'Z').getTime(),
         high: parseFloat(v.high),
         low:  parseFloat(v.low),
         close:parseFloat(v.close),
       }))
+    console.log(`  Raw newest bar: ${allBars[0]?.dt} → ts=${allBars[0]?.ts} (${new Date(allBars[0]?.ts).toISOString()})`)
+    bars = allBars
       .filter(b => b.ts < nowBoundary)
       .sort((a,b) => a.ts - b.ts)
     console.log(`  ✅ Closed bars after filter: ${bars.length}`)
