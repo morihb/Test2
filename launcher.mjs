@@ -148,7 +148,7 @@ async function fetchRecentBars(symObj) {
   for(let attempt=0; attempt<Math.max(keys.length,1); attempt++){
     const key=currentKey(); if(!key) break
     try{
-      const res=await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symObj.td_symbol)}&interval=${interval}&outputsize=15&apikey=${key}`,{signal:AbortSignal.timeout(8000)})
+      const res=await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symObj.td_symbol)}&interval=${interval}&outputsize=15&timezone=UTC&apikey=${key}`,{signal:AbortSignal.timeout(8000)})
       if(res.status===429){ saw429=true; switchToNextKey(); continue }
       const j=await res.json()
       if(j.code===429 || /run out|api credits|minute|limit/i.test(j.message||'')){ saw429=true; switchToNextKey(); continue }
