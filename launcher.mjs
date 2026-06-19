@@ -49,8 +49,8 @@ const ENGINE_SCRIPT    = path.resolve('gold-ai.mjs')
 const CANDLE_DELAY_MS = 2000
 const RETRY_DELAY_MS  = 60000      // 1 minute — used for per-minute API capacity (429)
 const MAX_RETRIES     = 3
-const WATCH_PERIOD_MS = 5 * 60000  // 5-minute OHLC sweep
-const BAR_MS          = 5 * 60000  // 5-minute candle
+const WATCH_PERIOD_MS = 60 * 1000  // 1-minute TP/SL sweep
+const WATCH_BAR_MS    = 60 * 1000  // 1-minute candle for TP/SL detection
 
 // Stagger per TF so candle-close checks don't all fire at once
 const TF_STAGGER_MS = { '15m':0, '1h':4*60000, '4h':45000, '1d':60000 }
@@ -138,17 +138,17 @@ async function sendReply(text, symbolId, adminReplyId=null, subMsgIds={}) {
   console.log(`[reply][${symbolId}] subs sent=${result.sent} failed=${result.failed}`)
 }
 
-// ── RECENT CLOSED 5-MIN BARS (catch-up; reports 429 exhaustion) ────────────
-// Returns { bars:[{ts,high,low,close}], rateLimited } with ONLY closed bars,
-// sorted oldest→newest. The forming (incomplete) bar is excluded.
-async function fetchRecent5mBars(symObj) {
-  const interval='5min'
-  const nowBoundary=Math.floor(Date.now()/BAR_MS)*BAR_MS   // start of the FORMING bar
+// ── RECENT CLOSED 1-MIN BARS (catch-up; reports 429 exhaustion) ─────────────
+// Checks every minute — returns { bars:[{ts,high,low,close}], rateLimited }
+// with ONLY closed bars, sorted oldest→newest. The forming bar is excluded.
+async function fetchRecentBars(symObj) {
+  const interval='1min'
+  const nowBoundary=Math.floor(Date.now()/WATCH_BAR_MS)*WATCH_BAR_MS   // start of the FORMING bar
   const keys=getLiveApiKeys(); let saw429=false
   for(let attempt=0; attempt<Math.max(keys.length,1); attempt++){
     const key=currentKey(); if(!key) break
     try{
-      const res=await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symObj.td_symbol)}&interval=${interval}&outputsize=12&apikey=${key}`,{signal:AbortSignal.timeout(8000)})
+      const res=await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symObj.td_symbol)}&interval=${interval}&outputsize=15&apikey=${key}`,{signal:AbortSignal.timeout(8000)})
       if(res.status===429){ saw429=true; switchToNextKey(); continue }
       const j=await res.json()
       if(j.code===429 || /run out|api credits|minute|limit/i.test(j.message||'')){ saw429=true; switchToNextKey(); continue }
@@ -198,14 +198,14 @@ async function evalTradeAgainstBar(state, symObj, tf, sig, bar) {
     return changed   // trade fully closed
   }
 
-  // ── SL (candle CLOSE beyond — wick alone keeps it valid) ──
+  // ── SL (wick touch — immediate, same as TP) ──────────────────────────────
   const sl=sig.sl
-  const closedBeyond = dir==='BUY' ? bar.close<=sl : bar.close>=sl
-  if(closedBeyond){
+  const wickedBeyond = dir==='BUY' ? bar.low<=sl : bar.high>=sl
+  if(wickedBeyond){
     const isBE = Math.abs(sl-entry) < Math.pow(10,-dp)/2
     const pips = toPips(sl-entry,dp)
     const label = isBE ? 'Break-even (0 pips)' : `-${pips} pips`
-    await sendReply(`${dirIcon(dir)} <b>${symObj.label} ${tf.toUpperCase()} — ${isBE?'CLOSED AT BREAK-EVEN 🟦':'STOP LOSS ❌'}</b>\n${label} @ ${sl.toFixed(dp)}\n5-min candle closed at ${bar.close.toFixed(dp)} beyond the stop — confirmed on close.`, symObj.id, adminReplyId, subMsgIds)
+    await sendReply(`${dirIcon(dir)} <b>${symObj.label} ${tf.toUpperCase()} — ${isBE?'CLOSED AT BREAK-EVEN 🟦':'STOP LOSS ❌'}</b>\n${label} @ ${sl.toFixed(dp)}\nPrice touched the stop — stopped out immediately.`, symObj.id, adminReplyId, subMsgIds)
     addToDaily({sym:symObj.id,tf,dir,result:isBE?'BE':'SL',pips,sign:isBE?0:-1})
     state[key]=null; changed=true
     console.log(`[${symObj.label} ${tf}] ${isBE?'🟦 BE':'🔴 SL'} (${label})`)
@@ -219,10 +219,10 @@ async function watchSymbol(symObj, isRetry=false) {
   const hasOpen=symObj.timeframes.some(tf=>openTrade(probe,symObj.id,tf))
   if(!hasOpen) return   // nothing open → no API call needed
 
-  const res=await fetchRecent5mBars(symObj)
+  const res=await fetchRecentBars(symObj)
   if(res.rateLimited){
     if(!isRetry){ console.log(`[watch ${symObj.label}] per-minute API capacity full — retrying in 60s`); setTimeout(()=>watchSymbol(symObj,true).catch(()=>{}), RETRY_DELAY_MS) }
-    else console.error(`[watch ${symObj.label}] still rate-limited after retry — next 5m sweep will catch it`)
+    else console.error(`[watch ${symObj.label}] still rate-limited after retry — next 1m sweep will catch it`)
     return
   }
   const bars=res.bars; if(!bars.length) return
@@ -381,11 +381,11 @@ H1 ${sig.h1Trend} · ${sig.session}
 ✅ TP1 ${tp1.toFixed(dp)} (+${toPips(tp1-entry,dp)} pips)
 ✅ TP2 ${tp2.toFixed(dp)} (+${toPips(tp2-entry,dp)} pips)
 ✅ TP3 ${tp3.toFixed(dp)} (+${toPips(tp3-entry,dp)} pips)
-🛡️ SL confirms only when a 5-min candle CLOSES beyond ${sl.toFixed(dp)} — a wick touch keeps the trade valid.
+🛡️ SL triggers immediately if price touches ${sl.toFixed(dp)}.
 ⚠️ Manage risk. Not financial advice.`
-      // lastBarTs = signal bar's open. Filter is b.ts > lastBarTs so the NEXT bar is
-      // the first evaluated. Without -BAR_MS the first post-entry bar was always skipped.
-      const nowBar5m=Math.floor(Date.now()/BAR_MS)*BAR_MS - BAR_MS
+      // lastBarTs = signal bar's open (1-min). Filter is b.ts > lastBarTs so the NEXT
+      // 1-min bar is the first one evaluated. Catches TP/SL within seconds of touch.
+      const nowBar5m=Math.floor(Date.now()/WATCH_BAR_MS)*WATCH_BAR_MS - WATCH_BAR_MS
       const r=await sendNewSignal(msgText, symObj.id)
       const sNow=loadState()
       sNow[stateKey]={direction:sig.direction,entry,sl,tp1,tp2,tp3,tp1Hit:false,tp2Hit:false,tp3Hit:false,signalMsgId:r.adminMsgId,subMsgIds:r.subMsgIds,lastBarTs:nowBar5m,ts:sig.ts}
@@ -423,7 +423,7 @@ const symbols=getLiveSymbols()
 
 console.log('🚀 Gold AI Launcher v10.1 — Multi-Symbol + Multi-Timeframe')
 console.log(`   Symbols: ${symbols.map(s=>`${s.emoji}${s.label}[${s.timeframes.join(',')}]`).join('  ')}`)
-console.log(`   ⚡ TP/SL watcher: every 5 min, catch-up over all closed bars`)
+console.log(`   ⚡ TP/SL watcher: every 1 min — TP & SL both trigger on wick touch`)
 console.log(`   🔑 API keys: ${getLiveApiKeys().length} active`)
 console.log(`   💰 Account: $${getAccountSize()} · Risk ${getRiskPct()}%`)
 
