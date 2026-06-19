@@ -1,0 +1,182 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  test-watcher.mjs  — TP/SL watcher diagnostic
+//  Run from the project folder: node test-watcher.mjs
+//  Shows every step: state → API bars → filter → TP/SL check → what fires
+// ─────────────────────────────────────────────────────────────────────────────
+import fs from 'fs'
+
+const WATCH_BAR_MS = 60 * 1000
+const SETTINGS_FILE = './settings.json'
+const STATE_FILE    = './bot_state.json'
+
+// ── Read settings ────────────────────────────────────────────────────────────
+function loadSettings() {
+  try { return JSON.parse(fs.readFileSync(SETTINGS_FILE,'utf8')) }
+  catch { return {} }
+}
+const settings = loadSettings()
+const KEYS     = (settings.twelvedata_keys||[]).filter(k=>k.active).map(k=>k.key)
+const SYMBOLS  = settings.symbols || []
+if (!KEYS.length) { console.error('❌  No active TwelveData keys in settings.json'); process.exit(1) }
+
+// ── Read state ───────────────────────────────────────────────────────────────
+console.log('\n══════════════════════════════════════════')
+console.log('  STEP 1 — bot_state.json')
+console.log('══════════════════════════════════════════')
+let state = {}
+try {
+  state = JSON.parse(fs.readFileSync(STATE_FILE,'utf8'))
+  const trades = Object.entries(state).filter(([k,v])=>k!=='at'&&v&&typeof v==='object'&&v.direction)
+  if (!trades.length) {
+    console.log('⚠️  No open trades found in bot_state.json')
+    console.log('Full state:', JSON.stringify(state, null, 2))
+    process.exit(0)
+  }
+  for (const [key, t] of trades) {
+    console.log(`\n✅ Open trade: ${key}`)
+    console.log(`   direction : ${t.direction}`)
+    console.log(`   entry     : ${t.entry}`)
+    console.log(`   sl        : ${t.sl}`)
+    console.log(`   tp1       : ${t.tp1}  hit=${t.tp1Hit}`)
+    console.log(`   tp2       : ${t.tp2}  hit=${t.tp2Hit}`)
+    console.log(`   tp3       : ${t.tp3}  hit=${t.tp3Hit}`)
+    console.log(`   lastBarTs : ${t.lastBarTs} (${t.lastBarTs ? new Date(t.lastBarTs).toISOString() : 'UNSET'})`)
+    console.log(`   signalMsg : ${t.signalMsgId}`)
+    console.log(`   subMsgIds : ${JSON.stringify(t.subMsgIds||{})}`)
+  }
+} catch(e) {
+  console.log('❌  Cannot read bot_state.json:', e.message)
+  process.exit(1)
+}
+
+// ── For each symbol, fetch 1-min bars ────────────────────────────────────────
+const nowBoundary = Math.floor(Date.now()/WATCH_BAR_MS)*WATCH_BAR_MS
+console.log('\n══════════════════════════════════════════')
+console.log('  STEP 2 — TwelveData 1-min bars')
+console.log(`  now        : ${new Date().toISOString()}`)
+console.log(`  boundary   : ${new Date(nowBoundary).toISOString()} (forming bar starts here)`)
+console.log('══════════════════════════════════════════')
+
+for (const sym of SYMBOLS) {
+  if (sym.active === false) continue
+  const tfs = sym.timeframes || ['15m','1h']
+  const openKeys = tfs.filter(tf => {
+    const t = state[`${sym.id}|${tf}`]
+    return t && typeof t === 'object' && t.direction
+  })
+  if (!openKeys.length) {
+    console.log(`\n${sym.emoji||'📊'} ${sym.label}: no open trade — watcher would skip`)
+    continue
+  }
+
+  console.log(`\n${sym.emoji||'📊'} ${sym.label} (${sym.td_symbol}) — fetching 1-min bars...`)
+  const key = KEYS[0]
+  let bars = []
+  try {
+    const res = await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym.td_symbol)}&interval=1min&outputsize=20&apikey=${key}`, {signal:AbortSignal.timeout(10000)})
+    const j = await res.json()
+    if (j.status === 'error' || !j.values?.length) {
+      console.log('  ❌ API error:', j.message || JSON.stringify(j))
+      continue
+    }
+    console.log(`  ✅ API returned ${j.values.length} raw bars`)
+    bars = j.values
+      .map(v => ({
+        dt:   v.datetime,
+        ts:   new Date(v.datetime.replace(' ','T')+'Z').getTime(),
+        high: parseFloat(v.high),
+        low:  parseFloat(v.low),
+        close:parseFloat(v.close),
+      }))
+      .filter(b => b.ts < nowBoundary)
+      .sort((a,b) => a.ts - b.ts)
+    console.log(`  ✅ Closed bars after filter: ${bars.length}`)
+    if (bars.length) {
+      console.log(`  Oldest: ${bars[0].dt}   Newest: ${bars[bars.length-1].dt}`)
+      console.log('  Last 5 bars:')
+      for (const b of bars.slice(-5))
+        console.log(`    ${b.dt}  H:${b.high}  L:${b.low}  C:${b.close}`)
+    }
+  } catch(e) {
+    console.log('  ❌ Fetch failed:', e.message)
+    continue
+  }
+
+  // ── For each open TF, run the TP/SL check ──────────────────────────────
+  console.log('\n══════════════════════════════════════════')
+  console.log('  STEP 3 — TP/SL evaluation per trade')
+  console.log('══════════════════════════════════════════')
+
+  for (const tf of openKeys) {
+    const sig = state[`${sym.id}|${tf}`]
+    const lastBarTs = sig.lastBarTs || 0
+    const newBars = bars.filter(b => b.ts > lastBarTs)
+    console.log(`\n  Trade: ${sym.id}|${tf}  direction=${sig.direction}`)
+    console.log(`  lastBarTs = ${lastBarTs} (${lastBarTs ? new Date(lastBarTs).toISOString() : 'UNSET — all bars will be checked'})`)
+    console.log(`  New bars to evaluate: ${newBars.length}`)
+
+    if (!newBars.length) {
+      console.log('  ⚠️  NO NEW BARS — watcher does nothing this sweep')
+      console.log('       → lastBarTs is too recent, or bars are too old')
+      console.log('       → Check if lastBarTs > newest bar ts:')
+      if (bars.length) {
+        console.log(`         lastBarTs=${lastBarTs}  newestBar=${bars[bars.length-1].ts}`)
+        if (lastBarTs > bars[bars.length-1].ts)
+          console.log('         ❌ lastBarTs is AHEAD of newest bar — bars will never pass until time catches up')
+      }
+      continue
+    }
+
+    const dir = sig.direction, entry = sig.entry, dp = sym.decimals || 2
+    let tp1Hit = sig.tp1Hit, tp2Hit = sig.tp2Hit, sl = sig.sl
+
+    for (const bar of newBars) {
+      console.log(`\n    Bar: ${bar.dt}  H:${bar.high}  L:${bar.low}  C:${bar.close}`)
+
+      // TP1
+      const tp1Cond = dir==='BUY' ? bar.high>=sig.tp1 : bar.low<=sig.tp1
+      if (!tp1Hit && tp1Cond) {
+        console.log(`    🎯 TP1 HIT!  (${dir==='BUY'?'bar.high':'bar.low'} ${dir==='BUY'?bar.high:bar.low} ${dir==='BUY'?'>=':'<='} ${sig.tp1})`)
+        tp1Hit = true; sl = entry
+      } else if (!tp1Hit) {
+        console.log(`    — TP1 not hit  (need ${dir==='BUY'?'bar.high':'bar.low'} ${dir==='BUY'?'>=':'<='} ${sig.tp1}, got ${dir==='BUY'?bar.high:bar.low})`)
+      }
+
+      // TP2
+      if (tp1Hit) {
+        const tp2Cond = dir==='BUY' ? bar.high>=sig.tp2 : bar.low<=sig.tp2
+        if (!tp2Hit && tp2Cond) {
+          console.log(`    🎯 TP2 HIT!  (${dir==='BUY'?'bar.high':'bar.low'} ${dir==='BUY'?bar.high:bar.low} ${dir==='BUY'?'>=':'<='} ${sig.tp2})`)
+          tp2Hit = true
+        } else if (!tp2Hit) {
+          console.log(`    — TP2 not hit  (need ${dir==='BUY'?'bar.high':'bar.low'} ${dir==='BUY'?'>=':'<='} ${sig.tp2}, got ${dir==='BUY'?bar.high:bar.low})`)
+        }
+      }
+
+      // TP3
+      if (tp2Hit) {
+        const tp3Cond = dir==='BUY' ? bar.high>=sig.tp3 : bar.low<=sig.tp3
+        if (tp3Cond) {
+          console.log(`    🏆 TP3 HIT!  trade would close`)
+          break
+        } else {
+          console.log(`    — TP3 not hit  (need ${dir==='BUY'?'bar.high':'bar.low'} ${dir==='BUY'?'>=':'<='} ${sig.tp3}, got ${dir==='BUY'?bar.high:bar.low})`)
+        }
+      }
+
+      // SL (wick)
+      const slCond = dir==='BUY' ? bar.low<=sl : bar.high>=sl
+      if (slCond) {
+        const isBE = Math.abs(sl-entry) < Math.pow(10,-dp)/2
+        console.log(`    🔴 SL HIT!  (${dir==='BUY'?'bar.low':'bar.high'} ${dir==='BUY'?bar.low:bar.high} ${dir==='BUY'?'<=':'<='} ${sl})  ${isBE?'(break-even)':''}`)
+        break
+      } else {
+        console.log(`    — SL not hit  (${dir==='BUY'?'bar.low':'bar.high'} ${dir==='BUY'?bar.low:bar.high}  SL=${sl})`)
+      }
+    }
+  }
+}
+
+console.log('\n══════════════════════════════════════════')
+console.log('  DONE — copy paste this output back')
+console.log('══════════════════════════════════════════\n')
