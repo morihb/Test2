@@ -1,12 +1,21 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  GOLD.AI — Subscription Bot  v5.1 — Multi-Symbol + Bundles + Monthly Stats
+//  GOLD.AI — Subscription Bot  v5.2 — Multi-Symbol + Bundles + Monthly Stats
 //
-//  New in v5.1 (messaging only — no UI/flow changes):
-//   • broadcastSignal() now RETURNS each subscriber's message_id in `msgIds`
-//     ({ chatId: message_id }) so the launcher can thread TP/SL replies under
-//     the ORIGINAL signal in every subscriber's chat (not just the admin's).
-//   • broadcastReply() — new export: sends a TP/SL/HOLD alert as a threaded
-//     reply under each subscriber's stored signal message.
+//  New in v5.2 (monthly stats correctness + formatting):
+//   • collapseDaily() — collapses all TP1/TP2/TP3/SL/BE rows of ONE signal
+//     (matched by signalId, stamped by launcher.mjs) into a SINGLE outcome:
+//     the FURTHEST level reached. Pips are from entry, never summed across TP
+//     levels. A trade that hits TP1+TP2 now counts as TP2 (e.g. 200p), and if
+//     it later hits TP3 the same row becomes TP3 — no extra trade added.
+//   • Monthly stats now render grouped BY DATE (Today / 19-6 / …) with the
+//     line format:  ✅ Gold - BUY Signal - TP2 - +200pips
+//   • Net / win-rate / by-market all computed from COLLAPSED rows.
+//
+//  v5.1 (messaging only):
+//   • broadcastSignal() RETURNS each subscriber's message_id in `msgIds`
+//     ({ chatId: message_id }) so the launcher can thread TP/SL replies.
+//   • broadcastReply() — sends a TP/SL/HOLD alert threaded under each
+//     subscriber's stored signal message.
 //
 //  v5 features:
 //   • BUNDLES — a single product that grants several symbols at once.
@@ -471,13 +480,35 @@ function ymNav(ym, delta)     { const [y,m]=ym.split('-').map(Number); return ne
 function ymLabel(ym)          { const [y,m]=ym.split('-').map(Number); return new Date(Date.UTC(y,m-1,1)).toLocaleString('en-US',{month:'long',year:'numeric',timeZone:'UTC'}) }
 function signedPips(t)        { return t.sign>0 ? t.pips : t.sign<0 ? -t.pips : 0 }
 
+// Collapse all rows of ONE signal into a SINGLE outcome: the furthest level
+// reached. TP3 > TP2 > TP1 > SL/BE. Pips are measured from entry (NOT summed
+// across TP levels), so TP1+TP2 → one TP2 row, and a later TP3 replaces it.
+// Rows are matched by signalId (stamped by launcher.mjs); legacy rows without
+// a signalId can't be grouped and are kept as separate trades.
+const OUTCOME_RANK = { SL:0, BE:0, TP1:1, TP2:2, TP3:3 }
+function collapseDaily(rows) {
+  const byId = new Map()
+  let auto = 0
+  for (const t of rows) {
+    const id = t.signalId || `__solo_${auto++}`            // legacy rows stay separate
+    const rank = OUTCOME_RANK[t.result] ?? -1
+    const cur = byId.get(id)
+    if (!cur || rank > (OUTCOME_RANK[cur.result] ?? -1)) byId.set(id, t)
+  }
+  return [...byId.values()]
+}
+
 async function screenMonthlyStats(chatId, msgId, ym) {
   ym = ym || ymNow()
   const daily = loadDaily()
-  const trades = []
+
+  // Collapse PER DAY so each signal counts once on the day it resolved, keeping
+  // each trade's date for the grouped display.
+  let trades = []
   for (const [date, day] of Object.entries(daily)) {
     if (!date.startsWith(ym)) continue
-    for (const t of (day.trades||[])) trades.push({ ...t, date })
+    const collapsed = collapseDaily(day.trades || [])      // ← furthest TP only
+    for (const t of collapsed) trades.push({ ...t, date })
   }
   trades.sort((a,b)=> new Date(a.ts||a.date) - new Date(b.ts||b.date))
 
@@ -488,7 +519,7 @@ async function screenMonthlyStats(chatId, msgId, ym) {
   const decided = wins.length + losses.length
   const wr = decided ? (wins.length/decided*100).toFixed(1) : '0.0'
 
-  // per-market breakdown
+  // per-market breakdown (from collapsed rows)
   const bySym = {}
   for (const t of trades) { const k=t.sym||'?'; (bySym[k] ??= {net:0,n:0,w:0,l:0}); bySym[k].n++; bySym[k].net+=signedPips(t); if(t.sign>0)bySym[k].w++; else if(t.sign<0)bySym[k].l++ }
   const symLines = Object.entries(bySym).map(([k,v])=>{
@@ -496,14 +527,25 @@ async function screenMonthlyStats(chatId, msgId, ym) {
     return `   ${getSymbol(k)?.emoji||'•'} ${nm}: ${v.net>=0?'+':''}${Math.round(v.net)}p  (${v.w}W/${v.l}L)`
   })
 
+  // ── Grouped-by-date display ──
+  //   Today:
+  //   ✅ Gold - BUY Signal - TP2 - +200pips
+  //   19-6:
+  //   ...
+  const todayStr = new Date().toISOString().slice(0,10)
+  const dateLabel = d => d===todayStr ? 'Today' : (()=>{ const [Y,M,D]=d.split('-'); return `${+D}-${+M}` })()
   const fmtLine = t => {
-    const nm = getSymbol(t.sym)?.label?.split(' ')[0] || (t.sym||'').toUpperCase()
+    const nm   = getSymbol(t.sym)?.label?.split(' ')[0] || (t.sym||'').toUpperCase()
     const icon = t.sign>0?'✅':t.sign<0?'❌':'🟦'
     const sign = t.sign>0?'+':t.sign<0?'-':''
-    const d = (t.ts||t.date||'').slice(5,10)
-    return `${icon} ${d} ${nm} ${String(t.tf||'').toUpperCase()} ${t.dir} ${t.result} ${sign}${t.pips}p`
+    const tpL  = t.result==='SL'?'SL':t.result==='BE'?'BE':t.result      // TP1/TP2/TP3
+    return `${icon} ${nm} - ${t.dir} Signal - ${tpL} - ${sign}${t.pips}pips`
   }
-  const recent = trades.slice().reverse().map(fmtLine)
+  const days = {}
+  for (const t of trades) (days[t.date] ??= []).push(t)
+  const dayBlocks = Object.keys(days).sort().reverse().map(d =>
+    `<b>${dateLabel(d)}:</b>\n` + days[d].slice().reverse().map(fmtLine).join('\n')
+  )
 
   const header =
 `📈 <b>Monthly Stats — ${ymLabel(ym)}</b>\n\n`+
@@ -512,12 +554,12 @@ async function screenMonthlyStats(chatId, msgId, ym) {
 `<b>By market:</b>\n${symLines.join('\n')||'   —'}\n\n`+
 `<b>Trades (newest first):</b>\n`
 
-  let body = recent.join('\n') || 'No trades recorded this month yet.'
+  let body = dayBlocks.join('\n\n') || 'No trades recorded this month yet.'
   let text = header + body
   if (text.length > 3800) {
     const keep=[]; let len=header.length
-    for (const l of recent) { if (len+l.length+1 > 3600) { keep.push('… (older trades trimmed)'); break } keep.push(l); len+=l.length+1 }
-    text = header + keep.join('\n')
+    for (const blk of dayBlocks) { if (len+blk.length+2 > 3600) { keep.push('… (older days trimmed)'); break } keep.push(blk); len+=blk.length+2 }
+    text = header + keep.join('\n\n')
   }
 
   const prev=ymNav(ym,-1), next=ymNav(ym,1)
@@ -1041,7 +1083,7 @@ async function handleUpdate(upd) {
 // ── LONG POLLING ──────────────────────────────────────────────────────────
 async function startPolling() {
   const s=loadSettings()
-  console.log('🤖 Gold AI Subscription Bot v5.1 — Multi-Symbol + Bundles + Stats')
+  console.log('🤖 Gold AI Subscription Bot v5.2 — Multi-Symbol + Bundles + Stats')
   console.log(`   Channel: ${s.channel} | Admin: ${ADMIN_ID}`)
   console.log(`   Symbols: ${getActiveSymbols().map(x=>`${x.emoji||''}${x.label}`).join(', ')}`)
   console.log(`   Bundles: ${getActiveBundles().map(x=>x.label).join(', ')||'none'}`)
