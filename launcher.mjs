@@ -73,7 +73,7 @@ function switchToNextKey() {
 
 // ── HELPERS ───────────────────────────────────────────────────────────────
 const dirIcon = dir => dir==='BUY'?'🟢':'🔴'
-const toPips  = (d, decimals) => decimals >= 4 ? Math.round(Math.abs(d)*10000) : Math.round(Math.abs(d)*10)
+const toPips  = (d, decimals) => Math.round(Math.abs(d) * Math.pow(10, decimals))
 function openTrade(state, sym, tf) { const s=state[`${sym}|${tf}`]; return (s&&typeof s==='object'&&s.direction)?s:null }
 const sleep = ms => new Promise(r=>setTimeout(r,ms))
 
