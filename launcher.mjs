@@ -176,7 +176,7 @@ async function fetchRecentBars(symObj) {
 // Evaluate one open trade against a single closed 1-min bar. Mutates `state`,
 // sends threaded alerts. Returns true if state changed.
 async function evalTradeAgainstBar(state, symObj, tf, sig, bar) {
-  const key=`${symObj.id}|${tf}`, dp=symObj.decimals||2
+  const key=`${symObj.id}|${tf}`,dp = symObj.decimals ?? 2
   const dir=sig.direction, entry=sig.entry
   const signalId = makeSignalId(symObj.id, tf, sig)             // shared across all outcome rows
   const adminReplyId = sig.signalMsgId || sig.msgId || null     // reply to ORIGINAL signal (admin)
