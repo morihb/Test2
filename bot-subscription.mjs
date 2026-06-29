@@ -1,7 +1,22 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  GOLD.AI — Subscription Bot  v5.3 — Subscriber Management
+//  GOLD.AI — Subscription Bot  v5.4 — Visitors (Leads) + Broadcast Targets
 //
-//  New in v5.3 (subscriber management):
+//  New in v5.4:
+//   • VISITORS file (visitors.json) — every unique chatId that presses /start
+//     is recorded with first_name, username, first-seen timestamp, and status
+//     (visitor | subscriber | expired). Automatically upgraded to "subscriber"
+//     when approved, back to "expired" when subscription lapses.
+//   • Admin panel shows visitor count. "👥 Subscribers" screen gains a
+//     "👁 All Visitors / Leads" button to browse everyone who ever started.
+//   • screenVisitors() — paginated list (25/page) with chatId, name, username,
+//     status badge, and first-seen date.
+//   • Broadcast now has THREE audience targets:
+//       ① By symbol (existing)
+//       ② 📣 Active subscribers only (existing "ALL")
+//       ③ 📣 Non-subscribers (visitors who never paid / expired) — new
+//       ④ 📣 Everyone (all visitors + all active subscribers) — new
+//
+//  v5.3 (subscriber management):
 //   • screenAdminSubs() now groups by USER (one row per person, not per market).
 //     Each row shows the user's chatId, what they hold, and days remaining.
 //   • Tapping a user opens screenSubUser() — a per-user profile showing all
@@ -30,6 +45,7 @@ if (!TG_TOKEN) { console.error('❌  TG_TOKEN not set'); process.exit(1) }
 const SUB_FILE      = './subscribers.json'
 const SETTINGS_FILE = './settings.json'
 const DAILY_FILE    = './daily_report.json'
+const VISITORS_FILE = './visitors.json'
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  SETTINGS STORE
@@ -153,6 +169,55 @@ function nextPayId()        { const ids=getAllPayMethods().map(m=>m.id); let i=1
 function loadDaily() { try { return JSON.parse(fs.readFileSync(DAILY_FILE,'utf8')) } catch { return {} } }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  VISITORS — everyone who has ever pressed /start
+//  { chatId: { chatId, firstName, username, firstSeen, lastSeen, status } }
+//  status: 'visitor' | 'subscriber' | 'expired'
+// ─────────────────────────────────────────────────────────────────────────────
+function loadVisitors() { try { return JSON.parse(fs.readFileSync(VISITORS_FILE,'utf8')) } catch { return {} } }
+function saveVisitors(v) { fs.writeFileSync(VISITORS_FILE, JSON.stringify(v, null, 2)) }
+
+function recordVisitor(chatId, from={}) {
+  const v = loadVisitors()
+  const now = new Date().toISOString()
+  const existing = v[chatId]
+  v[chatId] = {
+    chatId: String(chatId),
+    firstName: from.first_name || existing?.firstName || '',
+    username:  from.username   || existing?.username  || '',
+    firstSeen: existing?.firstSeen || now,
+    lastSeen:  now,
+    // Preserve subscriber/expired status if already set; default to visitor
+    status: existing?.status === 'subscriber' ? 'subscriber'
+          : existing?.status === 'expired'    ? 'expired'
+          : 'visitor',
+  }
+  saveVisitors(v)
+}
+
+// Upgrade a visitor to subscriber status (called on approval)
+function markVisitorSubscriber(chatId) {
+  const v = loadVisitors()
+  if (v[chatId]) { v[chatId].status = 'subscriber'; saveVisitors(v) }
+}
+// Downgrade to expired (called when subscription lapses)
+function markVisitorExpired(chatId) {
+  const v = loadVisitors()
+  if (v[chatId] && v[chatId].status === 'subscriber') { v[chatId].status = 'expired'; saveVisitors(v) }
+}
+
+// All visitors who have NO active subscription (leads + expired)
+function getNonSubscriberVisitors() {
+  const activeChatIds = new Set(allActiveSubscribers().map(s => s.chatId))
+  return Object.values(loadVisitors()).filter(v => !activeChatIds.has(v.chatId))
+}
+// All unique chatIds across visitors + active subscribers (deduped)
+function getAllKnownChatIds() {
+  const ids = new Set(Object.keys(loadVisitors()))
+  for (const s of allActiveSubscribers()) ids.add(s.chatId)
+  return [...ids]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  SUBSCRIBERS
 // ─────────────────────────────────────────────────────────────────────────────
 function loadSubs()   { try { return JSON.parse(fs.readFileSync(SUB_FILE,'utf8')) } catch { return {} } }
@@ -229,6 +294,24 @@ export async function broadcastReply(alertText, symbolId, msgIds = {}) {
   return { sent, failed }
 }
 
+// Send a message to an arbitrary list of chatIds (used for visitor broadcasts)
+async function broadcastToList(text, chatIds=[]) {
+  let sent=0, failed=0
+  for (const cid of chatIds) {
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ chat_id:cid, text, parse_mode:'HTML' })
+      })
+      const j = await res.json()
+      if (j.ok) sent++; else failed++
+    } catch { failed++ }
+    await new Promise(r=>setTimeout(r,50))
+  }
+  console.log(`[broadcastToList] sent=${sent} failed=${failed}`)
+  return { sent, failed }
+}
+
 // ── ADMIN SESSION ─────────────────────────────────────────────────────────
 const adminSession = {}
 function setSession(chatId, step, data={}) { adminSession[chatId]={step,data} }
@@ -263,7 +346,10 @@ function productLabel(productId) {
 // ─────────────────────────────────────────────────────────────────────────────
 //  USER FLOW
 // ─────────────────────────────────────────────────────────────────────────────
-async function screenStart(chatId, firstName) {
+async function screenStart(chatId, firstName, from={}) {
+  // Record every /start press — builds the leads/visitor list
+  recordVisitor(chatId, from)
+
   const subs = getAllSubsForUser(chatId).filter(s => isActive(s))
   const activeIds = subs.map(s => s.symbolId)
   const symbols = getActiveSymbols(), bundles = getActiveBundles()
@@ -440,13 +526,15 @@ async function screenAdminHome(chatId) {
   const total = allActiveSubscribers().filter(s=>!isBundleSub(s)).length
   const pending = Object.values(loadSubs()).filter(s=>s.status==='awaiting_admin').length
   const syms = getActiveSymbols(), bundles = getActiveBundles(), keys = (getSetting('twelvedata_keys')||[]).filter(k=>k.active).length
-  // Count unique users (not unique subs)
   const uniqueUsers = new Set(allActiveSubscribers().map(s=>s.chatId)).size
+  const totalVisitors = Object.keys(loadVisitors()).length
+  const nonSubVisitors = getNonSubscriberVisitors().length
   const rows = [
     [{ text:`📊 Symbols (${syms.length} active)`,     callback_data:'adm_symbols' }],
     [{ text:`🎁 Bundles (${bundles.length})`,          callback_data:'adm_bundles' }],
     [{ text:`📈 Monthly Statistics`,                   callback_data:'adm_stats'   }],
     [{ text:`👥 Subscribers (${uniqueUsers} users)`,   callback_data:'adm_subs'    }],
+    [{ text:`👁 Visitors / Leads (${totalVisitors})`,  callback_data:'adm_visitors'}],
     [{ text:`⏳ Pending Approvals (${pending})`,        callback_data:'adm_pending' }],
     [{ text:`🔑 API Keys (${keys} active)`,            callback_data:'adm_keys'    }],
     [{ text:'💳 Payment Methods',                       callback_data:'adm_payments'}],
@@ -454,7 +542,42 @@ async function screenAdminHome(chatId) {
     [{ text:'📢 Broadcast',                             callback_data:'adm_broadcast_pick'}],
   ]
   return sendInline(chatId,
-`🔧 <b>GOLD AI Admin Panel</b>\n\nActive users: <b>${uniqueUsers}</b> · Subscriptions: <b>${total}</b>\nPending approvals: <b>${pending}</b>\nActive symbols: <b>${syms.length}</b> · Bundles: <b>${bundles.length}</b>\nAPI keys: <b>${keys} active</b>`, rows)
+`🔧 <b>GOLD AI Admin Panel</b>\n\nActive users: <b>${uniqueUsers}</b> · Subscriptions: <b>${total}</b>\nPending approvals: <b>${pending}</b>\nVisitors (total): <b>${totalVisitors}</b> · Non-subscribers: <b>${nonSubVisitors}</b>\nActive symbols: <b>${syms.length}</b> · Bundles: <b>${bundles.length}</b>\nAPI keys: <b>${keys} active</b>`, rows)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ADMIN — VISITORS / LEADS
+// ─────────────────────────────────────────────────────────────────────────────
+async function screenVisitors(chatId, msgId, page=0) {
+  const all = Object.values(loadVisitors()).sort((a,b) => new Date(b.lastSeen) - new Date(a.lastSeen))
+  const PAGE = 25
+  const total = all.length
+  const slice = all.slice(page*PAGE, (page+1)*PAGE)
+
+  const statusIcon = s => s==='subscriber'?'✅':s==='expired'?'🔴':'👁'
+  const lines = slice.map(v => {
+    const name = [v.firstName, v.username ? `@${v.username}` : ''].filter(Boolean).join(' ')
+    const seen = new Date(v.firstSeen).toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'})
+    return `${statusIcon(v.status)} <code>${v.chatId}</code> ${name ? `— ${name}` : ''} <i>(${seen})</i>`
+  })
+
+  const nonSubs = all.filter(v => v.status !== 'subscriber').length
+  const subs    = all.filter(v => v.status === 'subscriber').length
+  const expired = all.filter(v => v.status === 'expired').length
+
+  const header = `👁 <b>All Visitors / Leads</b>\n\nTotal: <b>${total}</b>  ✅ ${subs} subscribers  🔴 ${expired} expired  👁 ${nonSubs} leads\n\n`
+
+  const rows = []
+  // Pagination
+  const navRow = []
+  if (page > 0) navRow.push({ text:'⬅️ Prev', callback_data:`adm_visitors_${page-1}` })
+  if ((page+1)*PAGE < total) navRow.push({ text:'Next ➡️', callback_data:`adm_visitors_${page+1}` })
+  if (navRow.length) rows.push(navRow)
+  rows.push([{ text:'📢 Message non-subscribers', callback_data:'adm_broadcast_pick' }])
+  rows.push([{ text:'⬅️ Back', callback_data:'adm_home' }])
+
+  const text = header + (lines.join('\n') || 'No visitors yet.')
+  return msgId ? editMsg(chatId,msgId,text,rows) : sendInline(chatId,text,rows)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -789,10 +912,21 @@ async function screenAdminPending(chatId, msgId) {
 // ── BROADCAST PICK ──
 async function screenBroadcastPick(chatId, msgId) {
   const syms = getActiveSymbols()
-  const rows = syms.map(s=>[{text:`${s.emoji||'📊'} ${s.label}`, callback_data:`adm_broadcast_sym_${s.id}`}])
-  rows.push([{ text:'📢 Broadcast to ALL subscribers', callback_data:'adm_broadcast_all' }])
+  const activeSubs   = new Set(allActiveSubscribers().map(s=>s.chatId)).size
+  const nonSubCount  = getNonSubscriberVisitors().length
+  const everyoneCount = getAllKnownChatIds().length
+
+  const rows = []
+  // Per-symbol targets
+  for (const s of syms) rows.push([{text:`${s.emoji||'📊'} ${s.label} subscribers`, callback_data:`adm_broadcast_sym_${s.id}`}])
+  // Audience-wide targets
+  rows.push([{ text:`📢 Active subscribers only (${activeSubs})`,              callback_data:'adm_broadcast_all'      }])
+  rows.push([{ text:`📣 Non-subscribers / leads (${nonSubCount})`,             callback_data:'adm_broadcast_nonsub'   }])
+  rows.push([{ text:`🌐 Everyone — visitors + subscribers (${everyoneCount})`, callback_data:'adm_broadcast_everyone' }])
   rows.push([{ text:'⬅️ Back', callback_data:'adm_home' }])
-  return msgId ? editMsg(chatId,msgId,'📢 <b>Choose broadcast target:</b>',rows) : sendInline(chatId,'📢 <b>Choose broadcast target:</b>',rows)
+
+  const text = `📢 <b>Choose broadcast target:</b>\n\n📢 = active paying subscribers\n📣 = visitors who never paid (or expired)\n🌐 = everyone who has ever pressed /start`
+  return msgId ? editMsg(chatId,msgId,text,rows) : sendInline(chatId,text,rows)
 }
 
 // ── API KEYS ──
@@ -846,6 +980,7 @@ async function adminApprove(adminChatId, targetChatId, symId) {
   if (!pkg) return send(adminChatId,`❌ Package ${sub.pendingPkg} not found`)
   const now=new Date(), exp=new Date(now.getTime()+pkg.days*86400000)
   upsertSub(targetChatId, symId, { status:'active', plan:pkg.id, planLabel:pkg.label, price:pkg.price, activatedAt:now.toISOString(), expiresAt:exp.toISOString(), pendingPkg:null, pendingMethod:null })
+  markVisitorSubscriber(targetChatId)
   const expStr=exp.toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'})
   await send(adminChatId,`✅ Approved ${targetChatId} for ${sym?.label} — ${pkg.label} until ${expStr}`)
   await send(targetChatId,`🎉 <b>Payment Confirmed!</b>\n\nMarket: <b>${sym?.emoji||''} ${sym?.label}</b>\nPlan: <b>${pkg.label}</b> — Active until <b>${expStr}</b>\n\nSignals will be sent here automatically. 🟡`)
@@ -864,6 +999,7 @@ async function adminApproveBundle(adminChatId, targetChatId, bid) {
   const pkg = getBundlePackage(bid, sub.pendingPkg); if (!pkg) return send(adminChatId,`❌ Bundle package ${sub.pendingPkg} not found`)
   const now=new Date(), exp=new Date(now.getTime()+pkg.days*86400000), expStr=exp.toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'})
   upsertSub(targetChatId, bid, { status:'active', plan:pkg.id, planLabel:`${bundle.label} — ${pkg.label}`, price:pkg.price, activatedAt:now.toISOString(), expiresAt:exp.toISOString(), isBundle:true, pendingPkg:null, pendingMethod:null })
+  markVisitorSubscriber(targetChatId)
   const granted=[]
   for (const symId of (bundle.symbols||[])) {
     const sym=getSymbol(symId); if(!sym) continue
@@ -982,17 +1118,32 @@ async function handleUpdate(upd) {
       if(step==='cfg_oanda_token')  { setSetting('oanda_token',text.trim()==='none'?'':text.trim()); clearSession(chatId); return send(chatId,`✅ OANDA token saved.\n\n/admin`) }
 
       if(step==='broadcast_msg') {
-        const symId=data.symId||null; clearSession(chatId)
-        const r=await broadcastSignal(text,symId)
-        const target=symId?getSymbol(symId)?.label:'ALL subscribers'
-        return send(chatId,`📢 Broadcast sent to <b>${target}</b>!\n\n✅ Delivered: ${r.sent}\n❌ Failed: ${r.failed}`)
+        const { symId, target } = data
+        clearSession(chatId)
+        let r, targetLabel
+        if (target === 'nonsub') {
+          const ids = getNonSubscriberVisitors().map(v => v.chatId)
+          r = await broadcastToList(text, ids)
+          targetLabel = 'non-subscribers / leads'
+        } else if (target === 'everyone') {
+          const ids = getAllKnownChatIds()
+          r = await broadcastToList(text, ids)
+          targetLabel = 'everyone (all visitors + subscribers)'
+        } else if (symId) {
+          r = await broadcastSignal(text, symId)
+          targetLabel = getSymbol(symId)?.label || symId
+        } else {
+          r = await broadcastSignal(text, null)
+          targetLabel = 'all active subscribers'
+        }
+        return send(chatId, `📢 Broadcast sent to <b>${targetLabel}</b>!\n\n✅ Delivered: ${r.sent}\n❌ Failed: ${r.failed}`)
       }
 
       if(text.startsWith('/')) clearSession(chatId)
     }
 
     // ── Regular commands ──
-    if(text==='/start')  return screenStart(chatId,firstName)
+    if(text==='/start')  return screenStart(chatId, firstName, msg.from||{})
     if(text==='/status') {
       const subs=getAllSubsForUser(chatId).filter(s=>isActive(s))
       if(!subs.length) return send(chatId,'No active subscriptions.\n\n/start — view markets')
@@ -1031,7 +1182,7 @@ async function handleUpdate(upd) {
     await answerCb(cb.id)
 
     // ── User flow ──
-    if(data==='back_home')  return screenStart(chatId,'')
+    if(data==='back_home')  return screenStart(chatId, '', cb.from||{})
     if(data==='my_subs')    return screenMySubs(chatId,msgId)
     const symM=data.match(/^sym_(\w+)$/);   if(symM) return screenSymbol(chatId,symM[1],msgId)
     const pkgM=data.match(/^pkg_(\w+)_(\w+)$/);  if(pkgM) return screenPickPayment(chatId,pkgM[1],pkgM[2],msgId)
@@ -1152,15 +1303,21 @@ async function handleUpdate(upd) {
 
     // ── Broadcast ──
     const bSym=data.match(/^adm_broadcast_sym_(\w+)$/)
-    if(bSym) { setSession(chatId,'broadcast_msg',{symId:bSym[1]}); return editMsg(chatId,msgId,`📢 <b>Broadcast to ${getSymbol(bSym[1])?.label} subscribers</b>\n\nType your message:`,[[{text:'❌ Cancel',callback_data:'adm_broadcast_pick'}]]) }
-    if(data==='adm_broadcast_all') { setSession(chatId,'broadcast_msg',{symId:null}); return editMsg(chatId,msgId,`📢 <b>Broadcast to ALL subscribers</b>\n\nType your message:`,[[{text:'❌ Cancel',callback_data:'adm_broadcast_pick'}]]) }
+    if(bSym) { setSession(chatId,'broadcast_msg',{symId:bSym[1],target:'sym'}); return editMsg(chatId,msgId,`📢 <b>Broadcast to ${getSymbol(bSym[1])?.label} subscribers</b>\n\nType your message:`,[[{text:'❌ Cancel',callback_data:'adm_broadcast_pick'}]]) }
+    if(data==='adm_broadcast_all')      { setSession(chatId,'broadcast_msg',{symId:null,target:'all'});      return editMsg(chatId,msgId,`📢 <b>Broadcast to all active subscribers</b>\n\nType your message:`,[[{text:'❌ Cancel',callback_data:'adm_broadcast_pick'}]]) }
+    if(data==='adm_broadcast_nonsub')   { setSession(chatId,'broadcast_msg',{symId:null,target:'nonsub'});   return editMsg(chatId,msgId,`📣 <b>Broadcast to non-subscribers / leads</b>\n\nThese are people who pressed /start but never paid (or whose subscription expired).\n\nType your message:`,[[{text:'❌ Cancel',callback_data:'adm_broadcast_pick'}]]) }
+    if(data==='adm_broadcast_everyone') { setSession(chatId,'broadcast_msg',{symId:null,target:'everyone'}); return editMsg(chatId,msgId,`🌐 <b>Broadcast to everyone</b>\n\nThis will message ALL visitors + subscribers.\n\nType your message:`,[[{text:'❌ Cancel',callback_data:'adm_broadcast_pick'}]]) }
+
+    // ── Visitors ──
+    const visitorsM = data.match(/^adm_visitors(?:_(\d+))?$/)
+    if(visitorsM || data==='adm_visitors') return screenVisitors(chatId, msgId, visitorsM?.[1] ? parseInt(visitorsM[1]) : 0)
   }
 }
 
 // ── LONG POLLING ──────────────────────────────────────────────────────────
 async function startPolling() {
   const s=loadSettings()
-  console.log('🤖 Gold AI Subscription Bot v5.3 — Subscriber Management')
+  console.log('🤖 Gold AI Subscription Bot v5.4 — Visitors + Broadcast Targets')
   console.log(`   Channel: ${s.channel} | Admin: ${ADMIN_ID}`)
   console.log(`   Symbols: ${getActiveSymbols().map(x=>`${x.emoji||''}${x.label}`).join(', ')}`)
   console.log(`   Bundles: ${getActiveBundles().map(x=>x.label).join(', ')||'none'}`)
@@ -1192,6 +1349,7 @@ async function runExpiryChecker(){
       }
       if(exp<=now){
         upsertSub(sub.chatId,sub.symbolId,{status:'expired'})
+        markVisitorExpired(sub.chatId)
         await send(sub.chatId,`\u274c <b>Subscription Expired</b>\n\n${name} access has ended.\n\n/start \u2014 renew`).catch(()=>{})
       }
     }
