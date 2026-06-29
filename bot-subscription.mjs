@@ -84,6 +84,9 @@ const DEFAULT_SETTINGS = {
     },
   ],
   bundles: [],
+  // 'live' = normal operation | 'coming_soon' = show teaser page to non-subscribers
+  bot_mode: 'live',
+  coming_soon_text: '🚀 <b>GOLD AI is launching soon!</b>\n\nWe\'re putting the finishing touches on the most precise gold trading signal service on Telegram.\n\n🔔 You\'ll be notified the moment we go live.\n\n<i>Stay tuned — something big is coming.</i>',
 }
 
 function loadSettings() {
@@ -349,6 +352,20 @@ function productLabel(productId) {
 async function screenStart(chatId, firstName, from={}) {
   // Record every /start press — builds the leads/visitor list
   recordVisitor(chatId, from)
+
+  // ── COMING SOON MODE ──────────────────────────────────────────────────────
+  // Show the teaser page to everyone EXCEPT users who already have an active
+  // subscription (they still get full access — their signals keep working).
+  const botMode = getSetting('bot_mode') || 'live'
+  if (botMode === 'coming_soon') {
+    const activeSubs = getAllSubsForUser(chatId).filter(s => isActive(s))
+    if (!activeSubs.length) {
+      // Non-subscriber → teaser screen
+      const csText = getSetting('coming_soon_text') || '🚀 <b>Coming Soon!</b>'
+      return send(chatId, csText)
+    }
+    // Active subscriber → fall through to normal flow
+  }
 
   const subs = getAllSubsForUser(chatId).filter(s => isActive(s))
   const activeIds = subs.map(s => s.symbolId)
@@ -964,8 +981,18 @@ async function screenPaymentView(chatId,msgId,payId) {
 // ── BOT SETTINGS ──
 async function screenBotSettings(chatId,msgId) {
   const s=loadSettings()
-  const rows=[[{text:'📡 Channel',callback_data:'adm_cfg_channel'},{text:'💰 Account Size',callback_data:'adm_cfg_account_size'}],[{text:'⚖️ Risk %',callback_data:'adm_cfg_risk_pct'},{text:'⏱️ Price Check',callback_data:'adm_cfg_price_check'}],[{text:'🔌 Data Source ('+s.data_source+')',callback_data:'adm_cfg_datasource'},{text:'🌐 OANDA Env ('+s.oanda_env+')',callback_data:'adm_cfg_oanda_env'}],[{text:'🔐 OANDA Token',callback_data:'adm_cfg_oanda_token'}],[{text:'⬅️ Back',callback_data:'adm_home'}]]
-  const text=`⚙️ <b>Bot Settings</b>\n\n📡 Channel: <b>${s.channel}</b>\n💰 Account: <b>$${s.account_size.toLocaleString()}</b>\n⚖️ Risk: <b>${s.risk_pct}%</b>\n⏱️ Price check: <b>${s.price_check_sec}s</b>\n🔌 Source: <b>${s.data_source}</b>\n🌐 OANDA: <b>${s.oanda_env}</b>`
+  const mode = s.bot_mode || 'live'
+  const modeLabel = mode === 'coming_soon' ? '🚧 Coming Soon (tap to go Live)' : '✅ Live (tap to set Coming Soon)'
+  const rows=[
+    [{text:'📡 Channel',callback_data:'adm_cfg_channel'},{text:'💰 Account Size',callback_data:'adm_cfg_account_size'}],
+    [{text:'⚖️ Risk %',callback_data:'adm_cfg_risk_pct'},{text:'⏱️ Price Check',callback_data:'adm_cfg_price_check'}],
+    [{text:'🔌 Data Source ('+s.data_source+')',callback_data:'adm_cfg_datasource'},{text:'🌐 OANDA Env ('+s.oanda_env+')',callback_data:'adm_cfg_oanda_env'}],
+    [{text:'🔐 OANDA Token',callback_data:'adm_cfg_oanda_token'}],
+    [{text:modeLabel, callback_data:'adm_cfg_toggle_mode'}],
+    [{text:'✏️ Edit Coming Soon message', callback_data:'adm_cfg_coming_soon_text'}],
+    [{text:'⬅️ Back',callback_data:'adm_home'}],
+  ]
+  const text=`⚙️ <b>Bot Settings</b>\n\n📡 Channel: <b>${s.channel}</b>\n💰 Account: <b>$${s.account_size.toLocaleString()}</b>\n⚖️ Risk: <b>${s.risk_pct}%</b>\n⏱️ Price check: <b>${s.price_check_sec}s</b>\n🔌 Source: <b>${s.data_source}</b>\n🌐 OANDA: <b>${s.oanda_env}</b>\n\n🤖 Bot mode: <b>${mode === 'coming_soon' ? '🚧 Coming Soon' : '✅ Live'}</b>`
   return msgId?editMsg(chatId,msgId,text,rows):sendInline(chatId,text,rows)
 }
 
@@ -1116,6 +1143,7 @@ async function handleUpdate(upd) {
       if(step==='cfg_risk_pct')     { const v=parseFloat(text); if(isNaN(v)||v<=0) return send(chatId,'❌ Invalid:'); setSetting('risk_pct',v); clearSession(chatId); return send(chatId,`✅ Risk → ${v}%\n\n/admin`) }
       if(step==='cfg_price_check')  { const v=parseInt(text); if(isNaN(v)||v<5) return send(chatId,'❌ Min 5s:'); setSetting('price_check_sec',v); clearSession(chatId); return send(chatId,`✅ Price check → ${v}s\n\n⚠️ Restart launcher to apply.\n\n/admin`) }
       if(step==='cfg_oanda_token')  { setSetting('oanda_token',text.trim()==='none'?'':text.trim()); clearSession(chatId); return send(chatId,`✅ OANDA token saved.\n\n/admin`) }
+      if(step==='cfg_coming_soon_text') { setSetting('coming_soon_text',text.trim()); clearSession(chatId); return send(chatId,`✅ Coming Soon message updated.\n\nPreview:\n\n${text.trim()}\n\n/admin`) }
 
       if(step==='broadcast_msg') {
         const { symId, target } = data
@@ -1300,6 +1328,21 @@ async function handleUpdate(upd) {
     if(data==='adm_cfg_oanda_token')  {setSession(chatId,'cfg_oanda_token',{});  return editMsg(chatId,msgId,`🔐 Send <b>OANDA API token</b> or <code>none</code>:`,[[{text:'❌ Cancel',callback_data:'adm_botsettings'}]])}
     if(data==='adm_cfg_datasource')   {setSetting('data_source',getSetting('data_source')==='twelvedata'?'oanda':'twelvedata');return screenBotSettings(chatId,msgId)}
     if(data==='adm_cfg_oanda_env')    {setSetting('oanda_env',getSetting('oanda_env')==='practice'?'live':'practice');return screenBotSettings(chatId,msgId)}
+    if(data==='adm_cfg_toggle_mode') {
+      const cur = getSetting('bot_mode') || 'live'
+      const next = cur === 'coming_soon' ? 'live' : 'coming_soon'
+      setSetting('bot_mode', next)
+      const label = next === 'coming_soon' ? '🚧 Coming Soon' : '✅ Live'
+      await answerCb(cb.id, `Bot mode → ${label}`)
+      return screenBotSettings(chatId, msgId)
+    }
+    if(data==='adm_cfg_coming_soon_text') {
+      const cur = getSetting('coming_soon_text') || ''
+      setSession(chatId,'cfg_coming_soon_text',{})
+      return editMsg(chatId, msgId,
+        `✏️ <b>Edit Coming Soon message</b>\n\nCurrent message:\n\n${cur}\n\nSend the new message text (HTML formatting supported — <b>bold</b>, <i>italic</i>, <code>code</code>):`,
+        [[{text:'❌ Cancel', callback_data:'adm_botsettings'}]])
+    }
 
     // ── Broadcast ──
     const bSym=data.match(/^adm_broadcast_sym_(\w+)$/)
