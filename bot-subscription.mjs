@@ -1,25 +1,23 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  GOLD.AI — Subscription Bot  v5.2 — Multi-Symbol + Bundles + Monthly Stats
+//  GOLD.AI — Subscription Bot  v5.3 — Subscriber Management
 //
-//  New in v5.2 (monthly stats correctness + formatting):
-//   • collapseDaily() — collapses all TP1/TP2/TP3/SL/BE rows of ONE signal
-//     (matched by signalId, stamped by launcher.mjs) into a SINGLE outcome:
-//     the FURTHEST level reached. Pips are from entry, never summed across TP
-//     levels. A trade that hits TP1+TP2 now counts as TP2 (e.g. 200p), and if
-//     it later hits TP3 the same row becomes TP3 — no extra trade added.
-//   • Monthly stats now render grouped BY DATE (Today / 19-6 / …) with the
-//     line format:  ✅ Gold - BUY Signal - TP2 - +200pips
-//   • Net / win-rate / by-market all computed from COLLAPSED rows.
+//  New in v5.3 (subscriber management):
+//   • screenAdminSubs() now groups by USER (one row per person, not per market).
+//     Each row shows the user's chatId, what they hold, and days remaining.
+//   • Tapping a user opens screenSubUser() — a per-user profile showing all
+//     their active and inactive subs, with individual 🚫 Revoke buttons.
+//   • adm_sub_user_<chatId>  callback → screenSubUser
+//   • adm_revoke_<chatId>_<productId>  callback → adminRevoke (already exists)
+//     then returns to the updated subscriber list.
+//   • Bundle member subs (via bundle wrapper) are hidden from the per-user
+//     display when the wrapper itself is visible — avoids duplicate rows.
 //
-//  v5.1 (messaging only):
-//   • broadcastSignal() RETURNS each subscriber's message_id in `msgIds`
-//     ({ chatId: message_id }) so the launcher can thread TP/SL replies.
-//   • broadcastReply() — sends a TP/SL/HOLD alert threaded under each
-//     subscriber's stored signal message.
+//  v5.2 (monthly stats correctness + formatting):
+//   • collapseDaily() — furthest TP per signal, no double-counting.
+//   • Monthly stats grouped by date with correct pip totals.
 //
-//  v5 features:
-//   • BUNDLES — a single product that grants several symbols at once.
-//   • MONTHLY STATS — admin button showing every TP/SL with pips for the month.
+//  v5.1: broadcastSignal() returns msgIds for threaded TP/SL replies.
+//  v5.0: BUNDLES + MONTHLY STATS.
 // ─────────────────────────────────────────────────────────────────────────────
 import fs from 'fs'
 
@@ -31,7 +29,7 @@ if (!TG_TOKEN) { console.error('❌  TG_TOKEN not set'); process.exit(1) }
 // ── FILE PATHS ────────────────────────────────────────────────────────────
 const SUB_FILE      = './subscribers.json'
 const SETTINGS_FILE = './settings.json'
-const DAILY_FILE    = './daily_report.json'   // written by launcher.mjs
+const DAILY_FILE    = './daily_report.json'
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  SETTINGS STORE
@@ -69,8 +67,6 @@ const DEFAULT_SETTINGS = {
       ]
     },
   ],
-  // Bundles: a product that grants several symbols at once.
-  // { id:'bnd_xxx', label, emoji, symbols:[symId,...], active, packages:[{id,label,price,days,active}] }
   bundles: [],
 }
 
@@ -157,7 +153,7 @@ function nextPayId()        { const ids=getAllPayMethods().map(m=>m.id); let i=1
 function loadDaily() { try { return JSON.parse(fs.readFileSync(DAILY_FILE,'utf8')) } catch { return {} } }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SUBSCRIBERS — Sub key: `${chatId}::${productId}` (productId = symbolId or bundleId)
+//  SUBSCRIBERS
 // ─────────────────────────────────────────────────────────────────────────────
 function loadSubs()   { try { return JSON.parse(fs.readFileSync(SUB_FILE,'utf8')) } catch { return {} } }
 function saveSubs(d)  { fs.writeFileSync(SUB_FILE, JSON.stringify(d, null, 2)) }
@@ -185,17 +181,15 @@ function allActiveSubscribers() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  BROADCAST — per symbol (bundle wrappers excluded; recipients deduped by chat)
-//  v5.1: now captures + RETURNS each recipient's message_id so the launcher can
-//  thread TP/SL replies under the original signal in every subscriber's chat.
+//  BROADCAST
 // ─────────────────────────────────────────────────────────────────────────────
 export async function broadcastSignal(sigText, symbolId) {
   let subs = symbolId ? activeSubscribersForSymbol(symbolId) : allActiveSubscribers()
-  subs = subs.filter(s => !isBundleSub(s))               // bundle wrappers aren't recipients
+  subs = subs.filter(s => !isBundleSub(s))
   const seen = new Set(), uniq = []
-  for (const s of subs) { if (seen.has(s.chatId)) continue; seen.add(s.chatId); uniq.push(s) }  // 1 msg per person
+  for (const s of subs) { if (seen.has(s.chatId)) continue; seen.add(s.chatId); uniq.push(s) }
   let sent=0, failed=0
-  const msgIds = {}                                      // { chatId: message_id } — for threaded TP/SL replies
+  const msgIds = {}
   for (const sub of uniq) {
     try {
       const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
@@ -212,12 +206,6 @@ export async function broadcastSignal(sigText, symbolId) {
   return { sent, failed, msgIds }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  BROADCAST REPLY — send a TP/SL/HOLD alert as a threaded reply UNDER each
-//  subscriber's original signal. msgIds = { chatId: message_id } captured by
-//  broadcastSignal at signal time. allow_sending_without_reply means it still
-//  delivers (unthreaded) if a user deleted the original message.
-// ─────────────────────────────────────────────────────────────────────────────
 export async function broadcastReply(alertText, symbolId, msgIds = {}) {
   let subs = symbolId ? activeSubscribersForSymbol(symbolId) : allActiveSubscribers()
   subs = subs.filter(s => !isBundleSub(s))
@@ -266,14 +254,14 @@ async function isMember(chatId) {
   catch { return false }
 }
 
-// ── DISPLAY HELPER for a sub (symbol or bundle) ─────────────────────────────
+// ── DISPLAY HELPER ────────────────────────────────────────────────────────
 function productLabel(productId) {
   if (isBundleId(productId)) { const b=getBundle(productId); return `🎁 ${b?.label||productId}` }
   const s=getSymbol(productId); return `${s?.emoji||''} ${s?.label||productId}`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  USER FLOW — symbols & bundles
+//  USER FLOW
 // ─────────────────────────────────────────────────────────────────────────────
 async function screenStart(chatId, firstName) {
   const subs = getAllSubsForUser(chatId).filter(s => isActive(s))
@@ -297,7 +285,6 @@ async function screenStart(chatId, firstName) {
   return sendInline(chatId, welcome, rows)
 }
 
-// ── Symbol detail ──
 async function screenSymbol(chatId, symId, msgId) {
   const sym = getSymbol(symId); if (!sym) return
   const sub = getSub(chatId, symId)
@@ -319,7 +306,6 @@ async function screenSymbol(chatId, symId, msgId) {
 `${sym.emoji||'📊'} <b>${sym.label}</b>\n\nTimeframes: <b>${(sym.timeframes||['15m','1h']).join(', ')}</b>\nData: <b>${sym.td_symbol}</b>\n\n<b>Choose your subscription plan:</b>`, rows)
 }
 
-// ── Bundle detail ──
 async function screenBundle(chatId, bid, msgId) {
   const b = getBundle(bid); if (!b) return
   const sub = getSub(chatId, bid)
@@ -343,7 +329,6 @@ async function screenBundle(chatId, bid, msgId) {
 `🎁 <b>${b.label}</b>\n\nOne subscription, all of these markets:\n${memberList}\n\n<b>Choose your plan:</b>`, rows)
 }
 
-// ── Payment flow (symbols) ──
 async function screenPickPayment(chatId, symId, pkgId, msgId) {
   const sym = getSymbol(symId), pkg = getSymbolPackage(symId, pkgId); if (!sym || !pkg) return
   upsertSub(chatId, symId, { status:'pending_payment', pendingPkg:pkgId, msgId })
@@ -387,7 +372,6 @@ async function screenCheckJoin(chatId, symId, pkgId, methodId, msgId) {
   return editMsg(chatId, msgId, `✅ <b>Channel joined!</b>\n\nPayment still under review. Usually 10–30 minutes.`)
 }
 
-// ── Payment flow (bundles) ──
 async function screenBundlePickPayment(chatId, bid, pkgId, msgId) {
   const b = getBundle(bid), pkg = getBundlePackage(bid, pkgId); if (!b || !pkg) return
   upsertSub(chatId, bid, { status:'pending_payment', pendingPkg:pkgId, isBundle:true, msgId })
@@ -431,7 +415,6 @@ async function screenBundleCheckJoin(chatId, bid, pkgId, methodId, msgId) {
   return editMsg(chatId, msgId, `✅ <b>Channel joined!</b>\n\nPayment still under review. Usually 10–30 minutes.`)
 }
 
-// ── My Subscriptions ──
 async function screenMySubs(chatId, msgId) {
   const subs = getAllSubsForUser(chatId)
   if (!subs.length) return editMsg(chatId, msgId, '📊 You have no subscriptions yet.\n\nUse the market list to subscribe.', [[{ text:'⬅️ Back', callback_data:'back_home' }]])
@@ -457,19 +440,21 @@ async function screenAdminHome(chatId) {
   const total = allActiveSubscribers().filter(s=>!isBundleSub(s)).length
   const pending = Object.values(loadSubs()).filter(s=>s.status==='awaiting_admin').length
   const syms = getActiveSymbols(), bundles = getActiveBundles(), keys = (getSetting('twelvedata_keys')||[]).filter(k=>k.active).length
+  // Count unique users (not unique subs)
+  const uniqueUsers = new Set(allActiveSubscribers().map(s=>s.chatId)).size
   const rows = [
-    [{ text:`📊 Symbols (${syms.length} active)`,  callback_data:'adm_symbols' }],
-    [{ text:`🎁 Bundles (${bundles.length})`,       callback_data:'adm_bundles' }],
-    [{ text:`📈 Monthly Statistics`,                callback_data:'adm_stats'   }],
-    [{ text:`👥 All Subscribers (${total})`,        callback_data:'adm_subs'    }],
-    [{ text:`⏳ Pending Approvals (${pending})`,     callback_data:'adm_pending' }],
-    [{ text:`🔑 API Keys (${keys} active)`,         callback_data:'adm_keys'    }],
-    [{ text:'💳 Payment Methods',                    callback_data:'adm_payments'}],
-    [{ text:'⚙️ Bot Settings',                      callback_data:'adm_botsettings'}],
-    [{ text:'📢 Broadcast',                          callback_data:'adm_broadcast_pick'}],
+    [{ text:`📊 Symbols (${syms.length} active)`,     callback_data:'adm_symbols' }],
+    [{ text:`🎁 Bundles (${bundles.length})`,          callback_data:'adm_bundles' }],
+    [{ text:`📈 Monthly Statistics`,                   callback_data:'adm_stats'   }],
+    [{ text:`👥 Subscribers (${uniqueUsers} users)`,   callback_data:'adm_subs'    }],
+    [{ text:`⏳ Pending Approvals (${pending})`,        callback_data:'adm_pending' }],
+    [{ text:`🔑 API Keys (${keys} active)`,            callback_data:'adm_keys'    }],
+    [{ text:'💳 Payment Methods',                       callback_data:'adm_payments'}],
+    [{ text:'⚙️ Bot Settings',                         callback_data:'adm_botsettings'}],
+    [{ text:'📢 Broadcast',                             callback_data:'adm_broadcast_pick'}],
   ]
   return sendInline(chatId,
-`🔧 <b>GOLD AI Admin Panel</b>\n\nActive subscriptions: <b>${total}</b>\nPending approvals: <b>${pending}</b>\nActive symbols: <b>${syms.length}</b> · Bundles: <b>${bundles.length}</b>\nAPI keys: <b>${keys} active</b>`, rows)
+`🔧 <b>GOLD AI Admin Panel</b>\n\nActive users: <b>${uniqueUsers}</b> · Subscriptions: <b>${total}</b>\nPending approvals: <b>${pending}</b>\nActive symbols: <b>${syms.length}</b> · Bundles: <b>${bundles.length}</b>\nAPI keys: <b>${keys} active</b>`, rows)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -480,17 +465,12 @@ function ymNav(ym, delta)     { const [y,m]=ym.split('-').map(Number); return ne
 function ymLabel(ym)          { const [y,m]=ym.split('-').map(Number); return new Date(Date.UTC(y,m-1,1)).toLocaleString('en-US',{month:'long',year:'numeric',timeZone:'UTC'}) }
 function signedPips(t)        { return t.sign>0 ? t.pips : t.sign<0 ? -t.pips : 0 }
 
-// Collapse all rows of ONE signal into a SINGLE outcome: the furthest level
-// reached. TP3 > TP2 > TP1 > SL/BE. Pips are measured from entry (NOT summed
-// across TP levels), so TP1+TP2 → one TP2 row, and a later TP3 replaces it.
-// Rows are matched by signalId (stamped by launcher.mjs); legacy rows without
-// a signalId can't be grouped and are kept as separate trades.
 const OUTCOME_RANK = { SL:0, BE:0, TP1:1, TP2:2, TP3:3 }
 function collapseDaily(rows) {
   const byId = new Map()
   let auto = 0
   for (const t of rows) {
-    const id = t.signalId || `__solo_${auto++}`            // legacy rows stay separate
+    const id = t.signalId || `__solo_${auto++}`
     const rank = OUTCOME_RANK[t.result] ?? -1
     const cur = byId.get(id)
     if (!cur || rank > (OUTCOME_RANK[cur.result] ?? -1)) byId.set(id, t)
@@ -502,12 +482,10 @@ async function screenMonthlyStats(chatId, msgId, ym) {
   ym = ym || ymNow()
   const daily = loadDaily()
 
-  // Collapse PER DAY so each signal counts once on the day it resolved, keeping
-  // each trade's date for the grouped display.
   let trades = []
   for (const [date, day] of Object.entries(daily)) {
     if (!date.startsWith(ym)) continue
-    const collapsed = collapseDaily(day.trades || [])      // ← furthest TP only
+    const collapsed = collapseDaily(day.trades || [])
     for (const t of collapsed) trades.push({ ...t, date })
   }
   trades.sort((a,b)=> new Date(a.ts||a.date) - new Date(b.ts||b.date))
@@ -519,7 +497,6 @@ async function screenMonthlyStats(chatId, msgId, ym) {
   const decided = wins.length + losses.length
   const wr = decided ? (wins.length/decided*100).toFixed(1) : '0.0'
 
-  // per-market breakdown (from collapsed rows)
   const bySym = {}
   for (const t of trades) { const k=t.sym||'?'; (bySym[k] ??= {net:0,n:0,w:0,l:0}); bySym[k].n++; bySym[k].net+=signedPips(t); if(t.sign>0)bySym[k].w++; else if(t.sign<0)bySym[k].l++ }
   const symLines = Object.entries(bySym).map(([k,v])=>{
@@ -527,18 +504,13 @@ async function screenMonthlyStats(chatId, msgId, ym) {
     return `   ${getSymbol(k)?.emoji||'•'} ${nm}: ${v.net>=0?'+':''}${Math.round(v.net)}p  (${v.w}W/${v.l}L)`
   })
 
-  // ── Grouped-by-date display ──
-  //   Today:
-  //   ✅ Gold - BUY Signal - TP2 - +200pips
-  //   19-6:
-  //   ...
   const todayStr = new Date().toISOString().slice(0,10)
   const dateLabel = d => d===todayStr ? 'Today' : (()=>{ const [Y,M,D]=d.split('-'); return `${+D}-${+M}` })()
   const fmtLine = t => {
     const nm   = getSymbol(t.sym)?.label?.split(' ')[0] || (t.sym||'').toUpperCase()
     const icon = t.sign>0?'✅':t.sign<0?'❌':'🟦'
     const sign = t.sign>0?'+':t.sign<0?'-':''
-    const tpL  = t.result==='SL'?'SL':t.result==='BE'?'BE':t.result      // TP1/TP2/TP3
+    const tpL  = t.result==='SL'?'SL':t.result==='BE'?'BE':t.result
     return `${icon} ${nm} - ${t.dir} Signal - ${tpL} - ${sign}${t.pips}pips`
   }
   const days = {}
@@ -572,14 +544,125 @@ async function screenMonthlyStats(chatId, msgId, ym) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ADMIN — SYMBOLS MANAGER  (unchanged from v4)
+//  ADMIN — SUBSCRIBERS (v5.3: grouped by user, tappable, with revoke)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Build a Map<chatId, sub[]> of all active subs grouped by user
+function groupSubsByUser() {
+  const all = Object.values(loadSubs()).filter(s => isActive(s))
+  const byUser = new Map()
+  for (const s of all) {
+    if (!byUser.has(s.chatId)) byUser.set(s.chatId, [])
+    byUser.get(s.chatId).push(s)
+  }
+  return byUser
+}
+
+// Main subscriber list — one button per unique user
+async function screenAdminSubs(chatId, msgId) {
+  const byUser = groupSubsByUser()
+
+  if (!byUser.size) {
+    const text = '👥 No active subscribers.'
+    return msgId
+      ? editMsg(chatId, msgId, text, [[{ text:'⬅️ Back', callback_data:'adm_home' }]])
+      : sendInline(chatId, text, [[{ text:'⬅️ Back', callback_data:'adm_home' }]])
+  }
+
+  const rows = []
+  for (const [uid, subs] of byUser) {
+    // Build a compact label of what they hold.
+    // If a bundle wrapper is present, skip its individual member subs to avoid clutter.
+    const bundleIds = new Set(subs.filter(s => isBundleSub(s)).map(s => s.symbolId))
+    const labels = []
+    for (const s of subs) {
+      if (!isBundleSub(s) && s.viaBundle && bundleIds.has(s.viaBundle)) continue
+      if (isBundleId(s.symbolId)) {
+        labels.push(`🎁 ${getBundle(s.symbolId)?.label || s.symbolId}`)
+      } else {
+        labels.push((getSymbol(s.symbolId)?.emoji || '') + ' ' + (getSymbol(s.symbolId)?.label || s.symbolId))
+      }
+    }
+    const daysLeft = Math.min(...subs.map(s => Math.ceil((new Date(s.expiresAt) - new Date()) / 86400000)))
+    rows.push([{ text: `👤 ${uid} — ${labels.join(', ')} · ${daysLeft}d`, callback_data: `adm_sub_user_${uid}` }])
+  }
+  rows.push([{ text: '⬅️ Back', callback_data: 'adm_home' }])
+
+  const uniqueUsers = byUser.size
+  const totalSubs   = [...byUser.values()].flat().filter(s => !isBundleSub(s)).length
+  const text = `👥 <b>Active Subscribers — ${uniqueUsers} users · ${totalSubs} subscriptions</b>\n\nTap a user to view details or revoke access.`
+
+  return msgId
+    ? editMsg(chatId, msgId, text, rows)
+    : sendInline(chatId, text, rows)
+}
+
+// Per-user detail screen — full sub list + individual Revoke buttons
+async function screenSubUser(adminChatId, msgId, targetChatId) {
+  const allSubs  = getAllSubsForUser(targetChatId)
+  const active   = allSubs.filter(s => isActive(s))
+  const inactive = allSubs.filter(s => !isActive(s))
+
+  if (!allSubs.length) {
+    return editMsg(adminChatId, msgId,
+      `❌ No subscriptions found for <code>${targetChatId}</code>.`,
+      [[{ text: '⬅️ Back', callback_data: 'adm_subs' }]]
+    )
+  }
+
+  const lines = [`👤 <b>Subscriber: <code>${targetChatId}</code></b>\n`]
+  const rows  = []
+
+  if (active.length) {
+    lines.push('<b>✅ Active subscriptions:</b>')
+
+    // Figure out which bundle wrappers are present so we can hide their member subs
+    const bundleIds = new Set(active.filter(s => isBundleSub(s)).map(s => s.symbolId))
+
+    for (const s of active) {
+      // Skip member-level subs covered by a visible bundle wrapper
+      if (!isBundleSub(s) && s.viaBundle && bundleIds.has(s.viaBundle)) continue
+
+      const name    = productLabel(s.symbolId)
+      const exp     = new Date(s.expiresAt).toLocaleDateString('en-GB', { day:'2-digit', month:'short', year:'numeric' })
+      const daysLeft = Math.ceil((new Date(s.expiresAt) - new Date()) / 86400000)
+      const plan    = s.planLabel || s.plan || '—'
+      lines.push(`${name}\nPlan: ${plan}\nExpires: ${exp} (${daysLeft}d left)\n`)
+
+      // Revoke button uses a safe callback — productId is the symbolId or bundleId
+      // We use ~ as a separator since bundle IDs contain underscores
+      rows.push([{ text: `🚫 Revoke — ${name}`, callback_data: `adm_revoke_${targetChatId}_${s.symbolId}` }])
+    }
+  }
+
+  if (inactive.length) {
+    lines.push('<b>🕓 Inactive / expired:</b>')
+    for (const s of inactive) {
+      const name        = productLabel(s.symbolId)
+      const statusLabel = s.status === 'expired' ? 'Expired'
+                        : s.status === 'revoked'  ? 'Revoked'
+                        : s.status === 'denied'   ? 'Denied'
+                        : s.status
+      lines.push(`${name} — ${statusLabel}`)
+    }
+  }
+
+  rows.push([{ text: '⬅️ Back to Subscribers', callback_data: 'adm_subs' }])
+
+  await (msgId
+    ? editMsg(adminChatId, msgId, lines.join('\n'), rows)
+    : sendInline(adminChatId, lines.join('\n'), rows))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ADMIN — SYMBOLS MANAGER
 // ─────────────────────────────────────────────────────────────────────────────
 async function screenSymbolsManager(chatId, msgId) {
   const syms = getSymbols()
   const rows = syms.map(s => [{ text:`${s.active!==false?'✅':'❌'} ${s.emoji||'📊'} ${s.label}`, callback_data:`adm_sym_view_${s.id}` }])
   rows.push([{ text:'➕ Add New Symbol', callback_data:'adm_sym_add' }])
   rows.push([{ text:'⬅️ Back',           callback_data:'adm_home'   }])
-  const text=`📊 <b>Symbols Manager</b>\n\nEach symbol is a separate product with its own packages and subscribers.\n\nActive: <b>${syms.filter(s=>s.active!==false).length}/${syms.length}</b>`
+  const text=`📊 <b>Symbols Manager</b>\n\nActive: <b>${syms.filter(s=>s.active!==false).length}/${syms.length}</b>`
   return msgId ? editMsg(chatId,msgId,text,rows) : sendInline(chatId,text,rows)
 }
 async function screenSymbolView(chatId, msgId, symId) {
@@ -639,7 +722,7 @@ async function screenBundlesManager(chatId, msgId) {
   const rows = bundles.map(b => [{ text:`${b.active!==false?'✅':'❌'} 🎁 ${b.label} (${(b.symbols||[]).length} markets)`, callback_data:`adm_bun_view_${b.id}` }])
   rows.push([{ text:'➕ Add New Bundle', callback_data:'adm_bun_add' }])
   rows.push([{ text:'⬅️ Back',          callback_data:'adm_home'   }])
-  const text=`🎁 <b>Bundles Manager</b>\n\nA bundle sells several markets as one subscription. On approval it grants access to every included market.\n\nBundles: <b>${bundles.length}</b>`
+  const text=`🎁 <b>Bundles Manager</b>\n\nBundles: <b>${bundles.length}</b>`
   return msgId ? editMsg(chatId,msgId,text,rows) : sendInline(chatId,text,rows)
 }
 async function screenBundleView(chatId, msgId, bid) {
@@ -662,7 +745,7 @@ async function screenBundleMembers(chatId, msgId, bid) {
   const inSet = new Set(b.symbols||[])
   const rows = getSymbols().map(s => [{ text:`${inSet.has(s.id)?'✅':'⬜'} ${s.emoji||'📊'} ${s.label}`, callback_data:`adm_bun_mem_toggle_${bid}_${s.id}` }])
   rows.push([{ text:'⬅️ Back', callback_data:`adm_bun_view_${bid}` }])
-  await editMsg(chatId,msgId,`🧩 <b>${b.label} — Included Markets</b>\n\nTap to add/remove. Currently: <b>${(b.symbols||[]).map(id=>getSymbol(id)?.label||id).join(', ')||'none'}</b>`, rows)
+  await editMsg(chatId,msgId,`🧩 <b>${b.label} — Included Markets</b>\n\nCurrently: <b>${(b.symbols||[]).map(id=>getSymbol(id)?.label||id).join(', ')||'none'}</b>`, rows)
 }
 async function screenBundlePackages(chatId, msgId, bid) {
   const b = getBundle(bid); if (!b) return
@@ -684,14 +767,8 @@ async function screenBundlePackageView(chatId, msgId, bid, pkgId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ADMIN — GLOBAL SUBSCRIBERS / PENDING  (bundle-aware)
+//  ADMIN — PENDING APPROVALS
 // ─────────────────────────────────────────────────────────────────────────────
-async function screenAdminSubs(chatId, msgId) {
-  const subs = allActiveSubscribers().filter(s=>!isBundleSub(s))
-  if (!subs.length) return editMsg(chatId,msgId,'No active subscribers.',[[{text:'⬅️ Back',callback_data:'adm_home'}]])
-  const lines = subs.map(s=>`• <code>${s.chatId}</code> — ${productLabel(s.symbolId)} — ${s.planLabel||s.plan} — ${new Date(s.expiresAt).toLocaleDateString()}${s.viaBundle?' (bundle)':''}`)
-  await editMsg(chatId,msgId,`👥 <b>All Active Subscriptions (${subs.length})</b>\n\n${lines.join('\n')}`,[[{text:'⬅️ Back',callback_data:'adm_home'}]])
-}
 async function screenAdminPending(chatId, msgId) {
   const pending = Object.values(loadSubs()).filter(s=>s.status==='awaiting_admin')
   if (!pending.length) return editMsg(chatId,msgId,'✅ No pending approvals.',[[{text:'⬅️ Back',callback_data:'adm_home'}]])
@@ -718,7 +795,7 @@ async function screenBroadcastPick(chatId, msgId) {
   return msgId ? editMsg(chatId,msgId,'📢 <b>Choose broadcast target:</b>',rows) : sendInline(chatId,'📢 <b>Choose broadcast target:</b>',rows)
 }
 
-// ── API KEYS (unchanged) ──
+// ── API KEYS ──
 async function screenApiKeys(chatId, msgId) {
   const keys=getSetting('twelvedata_keys')||[]
   const rows=keys.map((k,i)=>[{text:`${k.active?'✅':'❌'} ${k.label} — ${k.key.slice(0,8)}…`,callback_data:`adm_key_view_${i}`}])
@@ -736,7 +813,7 @@ async function testApiKey(key) {
   catch(e) { return {ok:false,reason:e.message} }
 }
 
-// ── PAYMENT METHODS (unchanged) ──
+// ── PAYMENT METHODS ──
 async function screenPayments(chatId,msgId) {
   const methods=getAllPayMethods()
   const rows=methods.map(m=>[{text:`${m.active!==false?'✅':'❌'} ${m.label} (${m.coin})`,callback_data:`adm_pay_view_${m.id}`}])
@@ -750,7 +827,7 @@ async function screenPaymentView(chatId,msgId,payId) {
   await editMsg(chatId,msgId,`💳 <b>${m.label}</b>\n\nCoin: <b>${m.coin}</b>\nNetwork: <b>${m.network||'—'}</b>\nAddress: <code>${m.address}</code>\nStatus: ${m.active!==false?'✅':'❌'}`,rows)
 }
 
-// ── BOT SETTINGS (unchanged) ──
+// ── BOT SETTINGS ──
 async function screenBotSettings(chatId,msgId) {
   const s=loadSettings()
   const rows=[[{text:'📡 Channel',callback_data:'adm_cfg_channel'},{text:'💰 Account Size',callback_data:'adm_cfg_account_size'}],[{text:'⚖️ Risk %',callback_data:'adm_cfg_risk_pct'},{text:'⏱️ Price Check',callback_data:'adm_cfg_price_check'}],[{text:'🔌 Data Source ('+s.data_source+')',callback_data:'adm_cfg_datasource'},{text:'🌐 OANDA Env ('+s.oanda_env+')',callback_data:'adm_cfg_oanda_env'}],[{text:'🔐 OANDA Token',callback_data:'adm_cfg_oanda_token'}],[{text:'⬅️ Back',callback_data:'adm_home'}]]
@@ -759,7 +836,7 @@ async function screenBotSettings(chatId,msgId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ADMIN ACTIONS — approvals (symbol + bundle)
+//  ADMIN ACTIONS — approvals + revoke
 // ─────────────────────────────────────────────────────────────────────────────
 async function adminApprove(adminChatId, targetChatId, symId) {
   const sub = getSub(targetChatId, symId)
@@ -786,9 +863,7 @@ async function adminApproveBundle(adminChatId, targetChatId, bid) {
   const bundle = getBundle(bid); if (!bundle) return send(adminChatId,`❌ Bundle ${bid} not found`)
   const pkg = getBundlePackage(bid, sub.pendingPkg); if (!pkg) return send(adminChatId,`❌ Bundle package ${sub.pendingPkg} not found`)
   const now=new Date(), exp=new Date(now.getTime()+pkg.days*86400000), expStr=exp.toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'})
-  // wrapper sub (for status / renewal display)
   upsertSub(targetChatId, bid, { status:'active', plan:pkg.id, planLabel:`${bundle.label} — ${pkg.label}`, price:pkg.price, activatedAt:now.toISOString(), expiresAt:exp.toISOString(), isBundle:true, pendingPkg:null, pendingMethod:null })
-  // fan out to each member symbol
   const granted=[]
   for (const symId of (bundle.symbols||[])) {
     const sym=getSymbol(symId); if(!sym) continue
@@ -819,7 +894,7 @@ async function adminRevoke(adminChatId, targetChatId, productId) {
   }
   upsertSub(targetChatId,productId,{status:'revoked',expiresAt:new Date().toISOString()})
   const sym=getSymbol(productId)
-  await send(adminChatId,`✅ Revoked ${targetChatId} from ${sym?.label}.`)
+  await send(adminChatId,`✅ Revoked ${targetChatId} from ${sym?.label||productId}.`)
   await send(targetChatId,`⚠️ Your ${sym?.label||productId} subscription has been revoked.`)
 }
 
@@ -836,20 +911,18 @@ async function handleUpdate(upd) {
     if (isAdmin && sess) {
       const {step,data}=sess
 
-      // Symbol add
-      if(step==='sym_add_label')   { setSession(chatId,'sym_add_td',{label:text});        return send(chatId,`📡 TwelveData symbol for "<b>${text}</b>":\n(e.g. EUR/USD, BTC/USD, AAPL, NAS100)`) }
-      if(step==='sym_add_td')      { setSession(chatId,'sym_add_oanda',{...data,td:text.trim()});   return send(chatId,`🔌 OANDA instrument:\n(e.g. EUR_USD, BTC_USD — or send <code>none</code>)`) }
-      if(step==='sym_add_oanda')   { setSession(chatId,'sym_add_yahoo',{...data,oanda:text==='none'?'':text.trim()}); return send(chatId,`📈 Yahoo Finance ticker:\n(e.g. EURUSD=X, BTC-USD — or <code>none</code>)`) }
-      if(step==='sym_add_yahoo')   { setSession(chatId,'sym_add_dec',{...data,yahoo:text==='none'?'':text.trim()});   return send(chatId,`🔢 Decimal places for price display:\n(2 for forex/gold, 5 for pairs like EURUSD, 0 for indices)`) }
-      if(step==='sym_add_dec')     { setSession(chatId,'sym_add_emoji',{...data,dec:parseInt(text)||2}); return send(chatId,`😀 Emoji for this market (e.g. 💶 🪙 📈 💹) or send <code>none</code>:`) }
+      if(step==='sym_add_label')   { setSession(chatId,'sym_add_td',{label:text});        return send(chatId,`📡 TwelveData symbol for "<b>${text}</b>":\n(e.g. EUR/USD, BTC/USD, AAPL)`) }
+      if(step==='sym_add_td')      { setSession(chatId,'sym_add_oanda',{...data,td:text.trim()});   return send(chatId,`🔌 OANDA instrument:\n(e.g. EUR_USD — or send <code>none</code>)`) }
+      if(step==='sym_add_oanda')   { setSession(chatId,'sym_add_yahoo',{...data,oanda:text==='none'?'':text.trim()}); return send(chatId,`📈 Yahoo Finance ticker:\n(e.g. EURUSD=X — or <code>none</code>)`) }
+      if(step==='sym_add_yahoo')   { setSession(chatId,'sym_add_dec',{...data,yahoo:text==='none'?'':text.trim()});   return send(chatId,`🔢 Decimal places:\n(2 for gold/forex, 5 for pairs, 0 for indices)`) }
+      if(step==='sym_add_dec')     { setSession(chatId,'sym_add_emoji',{...data,dec:parseInt(text)||2}); return send(chatId,`😀 Emoji (e.g. 💶 🪙 📈) or <code>none</code>:`) }
       if(step==='sym_add_emoji') {
         const syms=getSymbols(), id=nextSymbolId(data.label)
         syms.push({ id, label:data.label, emoji:text==='none'?'📊':text.trim(), td_symbol:data.td, oanda_symbol:data.oanda, yahoo_symbol:data.yahoo, decimals:data.dec, timeframes:['15m','1h'], active:true, packages:[] })
         saveSymbols(syms); clearSession(chatId)
-        return send(chatId,`✅ <b>Symbol Added!</b>\n\nLabel: ${data.label}\nTwelveData: <code>${data.td}</code>\nID: <code>${id}</code>\n\nAdd packages via /admin → Symbols → ${data.label} → Packages`)
+        return send(chatId,`✅ <b>Symbol Added!</b>\n\nID: <code>${id}</code>\n\nAdd packages via /admin → Symbols → ${data.label} → Packages`)
       }
 
-      // Symbol edit
       if(step==='sym_edit_label') { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.label=text.trim(); saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ Label updated.\n\n/admin`) }
       if(step==='sym_edit_td')    { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.td_symbol=text.trim(); saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ TwelveData symbol updated.\n\n/admin`) }
       if(step==='sym_edit_oanda') { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.oanda_symbol=text==='none'?'':text.trim(); saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ OANDA symbol updated.\n\n/admin`) }
@@ -857,7 +930,6 @@ async function handleUpdate(upd) {
       if(step==='sym_edit_dec')   { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.decimals=parseInt(text)||2; saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ Decimals updated.\n\n/admin`) }
       if(step==='sym_edit_emoji') { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.emoji=text==='none'?'📊':text.trim(); saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ Emoji updated.\n\n/admin`) }
 
-      // Symbol packages
       if(step==='sym_pkg_add_label') { setSession(chatId,'sym_pkg_add_price',{...data,label:text}); return send(chatId,`💰 Price in USD for "<b>${text}</b>":`) }
       if(step==='sym_pkg_add_price') { const p=parseFloat(text); if(isNaN(p)||p<=0) return send(chatId,'❌ Invalid price:'); setSession(chatId,'sym_pkg_add_days',{...data,price:p}); return send(chatId,`📅 Duration in days:`) }
       if(step==='sym_pkg_add_days') {
@@ -869,18 +941,15 @@ async function handleUpdate(upd) {
       if(step==='sym_pkg_price') { const p=parseFloat(text); if(isNaN(p)||p<=0) return send(chatId,'❌ Invalid:'); const pkg=getSymbolPackage(data.symId,data.pkgId); if(pkg){pkg.price=p;saveSymbolPackage(data.symId,pkg);} clearSession(chatId); return send(chatId,`✅ Price updated.\n\n/admin`) }
       if(step==='sym_pkg_days')  { const d=parseInt(text); if(isNaN(d)||d<=0) return send(chatId,'❌ Invalid:'); const pkg=getSymbolPackage(data.symId,data.pkgId); if(pkg){pkg.days=d;saveSymbolPackage(data.symId,pkg);} clearSession(chatId); return send(chatId,`✅ Duration updated.\n\n/admin`) }
 
-      // Bundle add
-      if(step==='bun_add_label') { setSession(chatId,'bun_add_emoji',{label:text.trim()}); return send(chatId,`😀 Emoji for the bundle (e.g. 🎁 💼 ⭐) or send <code>none</code>:`) }
+      if(step==='bun_add_label') { setSession(chatId,'bun_add_emoji',{label:text.trim()}); return send(chatId,`😀 Emoji for the bundle (e.g. 🎁 💼 ⭐) or <code>none</code>:`) }
       if(step==='bun_add_emoji') {
         const arr=getBundles(), id=nextBundleId(data.label)
         arr.push({ id, label:data.label, emoji:text==='none'?'🎁':text.trim(), symbols:[], packages:[], active:true })
         saveBundles(arr); clearSession(chatId)
-        return send(chatId,`✅ <b>Bundle Created!</b>\n\n${data.label}\nID: <code>${id}</code>\n\nNow pick its markets and add packages:\n/admin → 🎁 Bundles → ${data.label}`)
+        return send(chatId,`✅ <b>Bundle Created!</b>\n\n${data.label}\nID: <code>${id}</code>\n\n/admin → 🎁 Bundles → ${data.label}`)
       }
-      // Bundle edit
       if(step==='bun_edit_label') { const arr=getBundles(),b=arr.find(x=>x.id===data.bid); if(b)b.label=text.trim(); saveBundles(arr); clearSession(chatId); return send(chatId,`✅ Bundle label updated.\n\n/admin`) }
       if(step==='bun_edit_emoji') { const arr=getBundles(),b=arr.find(x=>x.id===data.bid); if(b)b.emoji=text==='none'?'🎁':text.trim(); saveBundles(arr); clearSession(chatId); return send(chatId,`✅ Bundle emoji updated.\n\n/admin`) }
-      // Bundle packages
       if(step==='bun_pkg_add_label') { setSession(chatId,'bun_pkg_add_price',{...data,label:text}); return send(chatId,`💰 Price in USD for "<b>${text}</b>":`) }
       if(step==='bun_pkg_add_price') { const p=parseFloat(text); if(isNaN(p)||p<=0) return send(chatId,'❌ Invalid price:'); setSession(chatId,'bun_pkg_add_days',{...data,price:p}); return send(chatId,`📅 Duration in days:`) }
       if(step==='bun_pkg_add_days') {
@@ -892,15 +961,13 @@ async function handleUpdate(upd) {
       if(step==='bun_pkg_price') { const p=parseFloat(text); if(isNaN(p)||p<=0) return send(chatId,'❌ Invalid:'); const pkg=getBundlePackage(data.bid,data.pkgId); if(pkg){pkg.price=p;saveBundlePackage(data.bid,pkg);} clearSession(chatId); return send(chatId,`✅ Price updated.\n\n/admin`) }
       if(step==='bun_pkg_days')  { const d=parseInt(text); if(isNaN(d)||d<=0) return send(chatId,'❌ Invalid:'); const pkg=getBundlePackage(data.bid,data.pkgId); if(pkg){pkg.days=d;saveBundlePackage(data.bid,pkg);} clearSession(chatId); return send(chatId,`✅ Duration updated.\n\n/admin`) }
 
-      // API keys
       if(step==='add_key_label') { setSession(chatId,'add_key_value',{label:text}); return send(chatId,`🔑 Send the <b>API key string</b> for "<b>${text}</b>":`) }
       if(step==='add_key_value') { const keys=getSetting('twelvedata_keys')||[]; keys.push({key:text.trim(),label:data.label,active:true}); setSetting('twelvedata_keys',keys); clearSession(chatId); return send(chatId,`✅ Key "<b>${data.label}</b>" added.\n\n/admin`) }
       if(step==='edit_key_label') { const keys=getSetting('twelvedata_keys')||[]; keys[data.idx].label=text.trim(); setSetting('twelvedata_keys',keys); clearSession(chatId); return send(chatId,`✅ Key label updated.\n\n/admin`) }
       if(step==='edit_key_value') { const keys=getSetting('twelvedata_keys')||[]; keys[data.idx].key=text.trim(); setSetting('twelvedata_keys',keys); clearSession(chatId); return send(chatId,`✅ API key replaced.\n\n/admin`) }
 
-      // Payment methods
       if(step==='pay_add_label')   { setSession(chatId,'pay_add_coin',{label:text}); return send(chatId,`🪙 Coin symbol (e.g. USDT, BTC, ETH):`) }
-      if(step==='pay_add_coin')    { setSession(chatId,'pay_add_network',{...data,coin:text.toUpperCase()}); return send(chatId,`🌐 Network (e.g. TRC-20, ERC-20) or <code>none</code>:`) }
+      if(step==='pay_add_coin')    { setSession(chatId,'pay_add_network',{...data,coin:text.toUpperCase()}); return send(chatId,`🌐 Network (e.g. TRC-20) or <code>none</code>:`) }
       if(step==='pay_add_network') { setSession(chatId,'pay_add_address',{...data,network:text==='none'?'':text}); return send(chatId,`📋 Wallet address:`) }
       if(step==='pay_add_address') { const m=getAllPayMethods(),id=nextPayId(); m.push({id,label:data.label,coin:data.coin,network:data.network,address:text.trim(),active:true}); savePayMethods(m); clearSession(chatId); return send(chatId,`✅ Payment method "<b>${data.label}</b>" added.\n\n/admin`) }
       if(step==='pay_edit_label')   { const m=getAllPayMethods(),i=m.findIndex(x=>x.id===data.payId); if(i>=0){m[i].label=text.trim();savePayMethods(m);} clearSession(chatId); return send(chatId,`✅ Updated.\n\n/admin`) }
@@ -908,14 +975,12 @@ async function handleUpdate(upd) {
       if(step==='pay_edit_network') { const m=getAllPayMethods(),i=m.findIndex(x=>x.id===data.payId); if(i>=0){m[i].network=text==='none'?'':text.trim();savePayMethods(m);} clearSession(chatId); return send(chatId,`✅ Updated.\n\n/admin`) }
       if(step==='pay_edit_address') { const m=getAllPayMethods(),i=m.findIndex(x=>x.id===data.payId); if(i>=0){m[i].address=text.trim();savePayMethods(m);} clearSession(chatId); return send(chatId,`✅ Address updated.\n\n/admin`) }
 
-      // Bot settings
       if(step==='cfg_channel')      { setSetting('channel',text.trim()); clearSession(chatId); return send(chatId,`✅ Channel → <b>${text.trim()}</b>\n\n/admin`) }
       if(step==='cfg_account_size') { const v=parseFloat(text); if(isNaN(v)||v<=0) return send(chatId,'❌ Invalid:'); setSetting('account_size',v); clearSession(chatId); return send(chatId,`✅ Account size → $${v.toLocaleString()}\n\n/admin`) }
       if(step==='cfg_risk_pct')     { const v=parseFloat(text); if(isNaN(v)||v<=0) return send(chatId,'❌ Invalid:'); setSetting('risk_pct',v); clearSession(chatId); return send(chatId,`✅ Risk → ${v}%\n\n/admin`) }
       if(step==='cfg_price_check')  { const v=parseInt(text); if(isNaN(v)||v<5) return send(chatId,'❌ Min 5s:'); setSetting('price_check_sec',v); clearSession(chatId); return send(chatId,`✅ Price check → ${v}s\n\n⚠️ Restart launcher to apply.\n\n/admin`) }
       if(step==='cfg_oanda_token')  { setSetting('oanda_token',text.trim()==='none'?'':text.trim()); clearSession(chatId); return send(chatId,`✅ OANDA token saved.\n\n/admin`) }
 
-      // Broadcast
       if(step==='broadcast_msg') {
         const symId=data.symId||null; clearSession(chatId)
         const r=await broadcastSignal(text,symId)
@@ -934,11 +999,10 @@ async function handleUpdate(upd) {
       const lines=subs.map(s=>{const exp=new Date(s.expiresAt).toLocaleDateString(),d=Math.ceil((new Date(s.expiresAt)-new Date())/86400000);return `${productLabel(s.symbolId)} — ${s.planLabel} — ${exp} (${d}d)`})
       return send(chatId,`📊 <b>Your Active Subscriptions</b>\n\n${lines.join('\n')}`)
     }
-    if(text==='/help') return send(chatId,`📖 <b>GOLD AI — How It Works</b>\n\nEach market (Gold, EUR/USD, BTC…) is a separate subscription, or grab a 🎁 Bundle for several at once.\nYou only receive signals for markets you've subscribed to.\n\n<b>Signal format:</b>\n<code>🟢 GOLD 15M — BUY\nEntry · SL (pips) · TP1/TP2/TP3</code>\n\nTP/SL updates reply under the original signal.\n\n/start — view & subscribe\n/status — your subscriptions`)
+    if(text==='/help') return send(chatId,`📖 <b>GOLD AI — How It Works</b>\n\n/start — view & subscribe\n/status — your subscriptions`)
 
     if(!isAdmin) return
 
-    // Admin commands
     const parts=text.split(' ')
     if(text==='/admin')    return screenAdminHome(chatId)
     if(text==='/symbols')  return screenSymbolsManager(chatId,null)
@@ -974,7 +1038,6 @@ async function handleUpdate(upd) {
     const payM=data.match(/^pay_(\w+)_(\w+)_(\w+)$/);  if(payM) return screenPayment(chatId,payM[1],payM[2],payM[3],msgId)
     const confM=data.match(/^confirm_(\w+)_(\w+)_(\w+)$/);  if(confM) return screenConfirmPending(chatId,confM[1],confM[2],confM[3],msgId)
     const joinM=data.match(/^checkjoin_(\w+)_(\w+)_(\w+)$/);  if(joinM) return screenCheckJoin(chatId,joinM[1],joinM[2],joinM[3],msgId)
-    // Bundle user flow
     const bunM=data.match(/^bun_(\w+)$/);    if(bunM) return screenBundle(chatId,bunM[1],msgId)
     const bpkgM=data.match(/^bpkg_(\w+)_(\w+)$/);  if(bpkgM) return screenBundlePickPayment(chatId,bpkgM[1],bpkgM[2],msgId)
     const bpayM=data.match(/^bpay_(\w+)_(\w+)_(\w+)$/);  if(bpayM) return screenBundlePayment(chatId,bpayM[1],bpayM[2],bpayM[3],msgId)
@@ -996,11 +1059,25 @@ async function handleUpdate(upd) {
     if(data==='adm_broadcast_pick')return screenBroadcastPick(chatId,msgId)
     const statsM=data.match(/^adm_stats_(\d{4}-\d{2})$/); if(statsM) return screenMonthlyStats(chatId,msgId,statsM[1])
 
+    // ── NEW v5.3: per-user subscriber view + revoke ──
+    // adm_sub_user_<chatId>  — chatId is all digits
+    const subUserM = data.match(/^adm_sub_user_(\d+)$/)
+    if (subUserM) return screenSubUser(chatId, msgId, subUserM[1])
+
+    // adm_revoke_<chatId>_<productId>
+    // productId may contain underscores (e.g. bnd_xxx) — use a greedy split:
+    // everything after the first _ following the chatId digits is the productId.
+    const revokeM = data.match(/^adm_revoke_(\d+)_(.+)$/)
+    if (revokeM) {
+      await adminRevoke(chatId, revokeM[1], revokeM[2])
+      return screenSubUser(chatId, msgId, revokeM[1])   // refresh the user's profile
+    }
+
     // ── Symbol management ──
     const symView=data.match(/^adm_sym_view_(\w+)$/);   if(symView) return screenSymbolView(chatId,msgId,symView[1])
     const symToggle=data.match(/^adm_sym_toggle_(\w+)$/);  if(symToggle){const syms=getSymbols(),s=syms.find(x=>x.id===symToggle[1]);if(s)s.active=!s.active;saveSymbols(syms);return screenSymbolView(chatId,msgId,symToggle[1])}
     const symDel=data.match(/^adm_sym_delete_(\w+)$/);  if(symDel){saveSymbols(getSymbols().filter(x=>x.id!==symDel[1]));return editMsg(chatId,msgId,`🗑️ Symbol deleted.`,[[{text:'⬅️ Back',callback_data:'adm_symbols'}]])}
-    if(data==='adm_sym_add'){setSession(chatId,'sym_add_label',{});return editMsg(chatId,msgId,`➕ <b>Add Symbol — Step 1/6</b>\n\nSend the <b>display name</b>:\n(e.g. "EUR/USD", "Bitcoin")`,[[{text:'❌ Cancel',callback_data:'adm_symbols'}]])}
+    if(data==='adm_sym_add'){setSession(chatId,'sym_add_label',{});return editMsg(chatId,msgId,`➕ <b>Add Symbol — Step 1/6</b>\n\nSend the <b>display name</b>:`,[[{text:'❌ Cancel',callback_data:'adm_symbols'}]])}
     const symEL=data.match(/^adm_sym_edit_label_(\w+)$/); if(symEL){setSession(chatId,'sym_edit_label',{symId:symEL[1]});return editMsg(chatId,msgId,`✏️ Send new <b>display label</b>:`,[[{text:'❌ Cancel',callback_data:`adm_sym_view_${symEL[1]}`}]])}
     const symET=data.match(/^adm_sym_edit_td_(\w+)$/);    if(symET){setSession(chatId,'sym_edit_td',{symId:symET[1]});return editMsg(chatId,msgId,`📡 Send new <b>TwelveData symbol</b>:`,[[{text:'❌ Cancel',callback_data:`adm_sym_view_${symET[1]}`}]])}
     const symEO=data.match(/^adm_sym_edit_oanda_(\w+)$/); if(symEO){setSession(chatId,'sym_edit_oanda',{symId:symEO[1]});return editMsg(chatId,msgId,`🔌 Send new <b>OANDA instrument</b> or <code>none</code>:`,[[{text:'❌ Cancel',callback_data:`adm_sym_view_${symEO[1]}`}]])}
@@ -1022,7 +1099,7 @@ async function handleUpdate(upd) {
 
     // ── Bundle management ──
     const bunView=data.match(/^adm_bun_view_(\w+)$/);   if(bunView) return screenBundleView(chatId,msgId,bunView[1])
-    if(data==='adm_bun_add'){setSession(chatId,'bun_add_label',{});return editMsg(chatId,msgId,`➕ <b>Add Bundle — Step 1/2</b>\n\nSend the <b>bundle name</b>:\n(e.g. "All-Markets", "Crypto + Gold")`,[[{text:'❌ Cancel',callback_data:'adm_bundles'}]])}
+    if(data==='adm_bun_add'){setSession(chatId,'bun_add_label',{});return editMsg(chatId,msgId,`➕ <b>Add Bundle</b>\n\nSend the <b>bundle name</b>:`,[[{text:'❌ Cancel',callback_data:'adm_bundles'}]])}
     const bunTog=data.match(/^adm_bun_toggle_(\w+)$/);  if(bunTog){const arr=getBundles(),b=arr.find(x=>x.id===bunTog[1]);if(b)b.active=b.active===false?true:false;saveBundles(arr);return screenBundleView(chatId,msgId,bunTog[1])}
     const bunDel=data.match(/^adm_bun_delete_(\w+)$/);  if(bunDel){saveBundles(getBundles().filter(x=>x.id!==bunDel[1]));return editMsg(chatId,msgId,`🗑️ Bundle deleted.`,[[{text:'⬅️ Back',callback_data:'adm_bundles'}]])}
     const bunEL=data.match(/^adm_bun_edit_label_(\w+)$/); if(bunEL){setSession(chatId,'bun_edit_label',{bid:bunEL[1]});return editMsg(chatId,msgId,`✏️ Send new <b>bundle label</b>:`,[[{text:'❌ Cancel',callback_data:`adm_bun_view_${bunEL[1]}`}]])}
@@ -1039,7 +1116,7 @@ async function handleUpdate(upd) {
     const bunPP=data.match(/^adm_bun_pkg_price_(\w+)_(\w+)$/); if(bunPP){setSession(chatId,'bun_pkg_price',{bid:bunPP[1],pkgId:bunPP[2]});return editMsg(chatId,msgId,`💰 Send new <b>price in USD</b>:`,[[{text:'❌ Cancel',callback_data:`adm_bun_pkg_view_${bunPP[1]}_${bunPP[2]}`}]])}
     const bunPDy=data.match(/^adm_bun_pkg_days_(\w+)_(\w+)$/); if(bunPDy){setSession(chatId,'bun_pkg_days',{bid:bunPDy[1],pkgId:bunPDy[2]});return editMsg(chatId,msgId,`📅 Send new <b>duration in days</b>:`,[[{text:'❌ Cancel',callback_data:`adm_bun_pkg_view_${bunPDy[1]}_${bunPDy[2]}`}]])}
 
-    // ── Approve / deny (symbol + bundle) ──
+    // ── Approve / deny ──
     const admAp=data.match(/^adm_approve_(\d+)_(\w+)$/);   if(admAp){await adminApprove(chatId,admAp[1],admAp[2]);return screenAdminPending(chatId,msgId)}
     const admDn=data.match(/^adm_deny_(\d+)_(\w+)$/);      if(admDn){await adminDeny(chatId,admDn[1],admDn[2]);return screenAdminPending(chatId,msgId)}
     const admApB=data.match(/^adm_approveb_(\d+)_(\w+)$/); if(admApB){await adminApproveBundle(chatId,admApB[1],admApB[2]);return screenAdminPending(chatId,msgId)}
@@ -1058,7 +1135,7 @@ async function handleUpdate(upd) {
     const payView=data.match(/^adm_pay_view_(\w+)$/); if(payView) return screenPaymentView(chatId,msgId,payView[1])
     const payTog=data.match(/^adm_pay_toggle_(\w+)$/); if(payTog){const m=getAllPayMethods(),x=m.find(p=>p.id===payTog[1]);if(x)x.active=x.active===false?true:false;savePayMethods(m);return screenPaymentView(chatId,msgId,payTog[1])}
     const payDel=data.match(/^adm_pay_delete_(\w+)$/); if(payDel){savePayMethods(getAllPayMethods().filter(x=>x.id!==payDel[1]));return editMsg(chatId,msgId,`🗑️ Deleted.`,[[{text:'⬅️ Back',callback_data:'adm_payments'}]])}
-    if(data==='adm_pay_add'){setSession(chatId,'pay_add_label',{});return editMsg(chatId,msgId,`➕ <b>Add Payment Method</b>\n\nSend a <b>display label</b>:\n(e.g. "💎 ETH (ERC-20)")`,[[{text:'❌ Cancel',callback_data:'adm_payments'}]])}
+    if(data==='adm_pay_add'){setSession(chatId,'pay_add_label',{});return editMsg(chatId,msgId,`➕ <b>Add Payment Method</b>\n\nSend a <b>display label</b>:`,[[{text:'❌ Cancel',callback_data:'adm_payments'}]])}
     const pEL=data.match(/^adm_pay_edit_label_(\w+)$/);   if(pEL){setSession(chatId,'pay_edit_label',{payId:pEL[1]});return editMsg(chatId,msgId,`✏️ Send new label:`,[[{text:'❌ Cancel',callback_data:`adm_pay_view_${pEL[1]}`}]])}
     const pEC=data.match(/^adm_pay_edit_coin_(\w+)$/);    if(pEC){setSession(chatId,'pay_edit_coin',{payId:pEC[1]});return editMsg(chatId,msgId,`🪙 Send new coin symbol:`,[[{text:'❌ Cancel',callback_data:`adm_pay_view_${pEC[1]}`}]])}
     const pEN=data.match(/^adm_pay_edit_network_(\w+)$/); if(pEN){setSession(chatId,'pay_edit_network',{payId:pEN[1]});return editMsg(chatId,msgId,`🌐 Send new network or <code>none</code>:`,[[{text:'❌ Cancel',callback_data:`adm_pay_view_${pEN[1]}`}]])}
@@ -1067,7 +1144,7 @@ async function handleUpdate(upd) {
     // ── Bot settings ──
     if(data==='adm_cfg_channel')      {setSession(chatId,'cfg_channel',{});      return editMsg(chatId,msgId,`📡 Send new <b>channel username</b>:`,[[{text:'❌ Cancel',callback_data:'adm_botsettings'}]])}
     if(data==='adm_cfg_account_size') {setSession(chatId,'cfg_account_size',{}); return editMsg(chatId,msgId,`💰 Send <b>account size in USD</b>:`,[[{text:'❌ Cancel',callback_data:'adm_botsettings'}]])}
-    if(data==='adm_cfg_risk_pct')     {setSession(chatId,'cfg_risk_pct',{});     return editMsg(chatId,msgId,`⚖️ Send <b>risk % per trade</b> (e.g. 1):`,[[{text:'❌ Cancel',callback_data:'adm_botsettings'}]])}
+    if(data==='adm_cfg_risk_pct')     {setSession(chatId,'cfg_risk_pct',{});     return editMsg(chatId,msgId,`⚖️ Send <b>risk % per trade</b>:`,[[{text:'❌ Cancel',callback_data:'adm_botsettings'}]])}
     if(data==='adm_cfg_price_check')  {setSession(chatId,'cfg_price_check',{});  return editMsg(chatId,msgId,`⏱️ Send <b>price check interval in seconds</b> (min 5):`,[[{text:'❌ Cancel',callback_data:'adm_botsettings'}]])}
     if(data==='adm_cfg_oanda_token')  {setSession(chatId,'cfg_oanda_token',{});  return editMsg(chatId,msgId,`🔐 Send <b>OANDA API token</b> or <code>none</code>:`,[[{text:'❌ Cancel',callback_data:'adm_botsettings'}]])}
     if(data==='adm_cfg_datasource')   {setSetting('data_source',getSetting('data_source')==='twelvedata'?'oanda':'twelvedata');return screenBotSettings(chatId,msgId)}
@@ -1083,7 +1160,7 @@ async function handleUpdate(upd) {
 // ── LONG POLLING ──────────────────────────────────────────────────────────
 async function startPolling() {
   const s=loadSettings()
-  console.log('🤖 Gold AI Subscription Bot v5.2 — Multi-Symbol + Bundles + Stats')
+  console.log('🤖 Gold AI Subscription Bot v5.3 — Subscriber Management')
   console.log(`   Channel: ${s.channel} | Admin: ${ADMIN_ID}`)
   console.log(`   Symbols: ${getActiveSymbols().map(x=>`${x.emoji||''}${x.label}`).join(', ')}`)
   console.log(`   Bundles: ${getActiveBundles().map(x=>x.label).join(', ')||'none'}`)
