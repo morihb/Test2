@@ -324,7 +324,7 @@ async function runSignalCycle(symObj, tf, isStartup=false) {
     SYMBOL_TD:       symObj.td_symbol,
     SYMBOL_OANDA:    symObj.oanda_symbol || '',
     SYMBOL_YAHOO:    symObj.yahoo_symbol || '',
-    SYMBOL_DECIMALS: String(symObj.decimals || 2),
+    SYMBOL_DECIMALS: String(symObj.decimals ?? 2),
   }
 
   // Run engine in ISOLATED dir so it can't touch the launcher's bot_state.json
@@ -348,7 +348,7 @@ async function runSignalCycle(symObj, tf, isStartup=false) {
   console.log(`[${symObj.label} ${tf}] signal=${hasSignal} wait=${isWait} fresh=${fresh} held=${heldBefore?.direction||'none'} → send=${shouldSend}`)
 
   const stateKey=`${symObj.id}|${tf}`
-  const dp=symObj.decimals||2
+  const dp=symObj.decimals ?? 2
 
   if(shouldSend){
     const sig=latest
