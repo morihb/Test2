@@ -158,7 +158,7 @@ export function getSymbolsForLauncher() {
   return getActiveSymbols().map(s => ({
     id: s.id, label: s.label, emoji: s.emoji||'📊',
     td_symbol: s.td_symbol, oanda_symbol: s.oanda_symbol,
-    yahoo_symbol: s.yahoo_symbol, decimals: s.decimals||2,
+    yahoo_symbol: s.yahoo_symbol, decimals: s.decimals ?? 2,
     timeframes: s.timeframes || getActiveTimeframes(),
   }))
 }
@@ -1078,7 +1078,7 @@ async function handleUpdate(upd) {
       if(step==='sym_add_td')      { setSession(chatId,'sym_add_oanda',{...data,td:text.trim()});   return send(chatId,`🔌 OANDA instrument:\n(e.g. EUR_USD — or send <code>none</code>)`) }
       if(step==='sym_add_oanda')   { setSession(chatId,'sym_add_yahoo',{...data,oanda:text==='none'?'':text.trim()}); return send(chatId,`📈 Yahoo Finance ticker:\n(e.g. EURUSD=X — or <code>none</code>)`) }
       if(step==='sym_add_yahoo')   { setSession(chatId,'sym_add_dec',{...data,yahoo:text==='none'?'':text.trim()});   return send(chatId,`🔢 Decimal places:\n(2 for gold/forex, 5 for pairs, 0 for indices)`) }
-      if(step==='sym_add_dec')     { setSession(chatId,'sym_add_emoji',{...data,dec:parseInt(text)||2}); return send(chatId,`😀 Emoji (e.g. 💶 🪙 📈) or <code>none</code>:`) }
+      if(step==='sym_add_dec')     { const n=parseInt(text); setSession(chatId,'sym_add_emoji',{...data,dec:isNaN(n)?2:n}); return send(chatId,`😀 Emoji (e.g. 💶 🪙 📈) or <code>none</code>:`) }
       if(step==='sym_add_emoji') {
         const syms=getSymbols(), id=nextSymbolId(data.label)
         syms.push({ id, label:data.label, emoji:text==='none'?'📊':text.trim(), td_symbol:data.td, oanda_symbol:data.oanda, yahoo_symbol:data.yahoo, decimals:data.dec, timeframes:['15m','1h'], active:true, packages:[] })
@@ -1090,7 +1090,7 @@ async function handleUpdate(upd) {
       if(step==='sym_edit_td')    { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.td_symbol=text.trim(); saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ TwelveData symbol updated.\n\n/admin`) }
       if(step==='sym_edit_oanda') { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.oanda_symbol=text==='none'?'':text.trim(); saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ OANDA symbol updated.\n\n/admin`) }
       if(step==='sym_edit_yahoo') { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.yahoo_symbol=text==='none'?'':text.trim(); saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ Yahoo symbol updated.\n\n/admin`) }
-      if(step==='sym_edit_dec')   { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.decimals=parseInt(text)||2; saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ Decimals updated.\n\n/admin`) }
+      if(step==='sym_edit_dec')   { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s){const n=parseInt(text); s.decimals=isNaN(n)?2:n;} saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ Decimals updated.\n\n/admin`) }
       if(step==='sym_edit_emoji') { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.emoji=text==='none'?'📊':text.trim(); saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ Emoji updated.\n\n/admin`) }
 
       if(step==='sym_pkg_add_label') { setSession(chatId,'sym_pkg_add_price',{...data,label:text}); return send(chatId,`💰 Price in USD for "<b>${text}</b>":`) }
