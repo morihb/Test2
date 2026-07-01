@@ -375,15 +375,24 @@ async function runSignalCycle(symObj, tf, isStartup=false) {
       // Saving the old snapshot would clobber those updates.
       console.log(`[${symObj.label} ${tf}] 📡 KEEP HOLDING`)
     } else {
-      // HTF DIRECTION GATE — drop a new signal that opposes an open higher-TF trade
+      // HTF DIRECTION GATE — blocks 15m/1h/4h/1d from opposing an open higher-TF trade.
+      // 5m is exempt: it's allowed to counter-trend as a fast scalp, just flagged in the message.
       const htf=higherTfDirection(loadState(), symObj.id, tf, symObj.timeframes)
-      if(htf && htf.dir!==sig.direction){
+      const counterTrend = htf && htf.dir!==sig.direction
+
+      if(counterTrend && tf!=='5m'){
         console.log(`[${symObj.label} ${tf}] ⛔ ${sig.direction} suppressed — higher TF ${htf.tf} holds ${htf.dir}`)
         return
+      }
+      if(counterTrend && tf==='5m'){
+        console.log(`[${symObj.label} ${tf}] ⚠️ ${sig.direction} allowed as counter-trend scalp — higher TF ${htf.tf} holds ${htf.dir}`)
       }
 
       const entry=parseFloat(sig.entry), sl=parseFloat(sig.sl)
       const tp1=parseFloat(sig.tp1), tp2=parseFloat(sig.tp2), tp3=parseFloat(sig.tp3)
+      const counterTrendNote = counterTrend
+        ? `\n⚠️ Counter-trend scalp: ${htf.tf.toUpperCase()} is currently ${htf.dir} — this is a fast 5m play against that trend. Manage risk tightly.`
+        : ''
       const msgText=
 `${dirIcon(sig.direction)} <b>${symObj.label} ${tf.toUpperCase()} — ${sig.direction}</b> (score ${sig.score}/100 ${sig.tier})
 H1 ${sig.h1Trend} · ${sig.session}
@@ -392,7 +401,7 @@ H1 ${sig.h1Trend} · ${sig.session}
 ✅ TP1 ${tp1.toFixed(dp)} (+${toPips(tp1-entry,dp)} pips)
 ✅ TP2 ${tp2.toFixed(dp)} (+${toPips(tp2-entry,dp)} pips)
 ✅ TP3 ${tp3.toFixed(dp)} (+${toPips(tp3-entry,dp)} pips)
-🛡️ SL triggers immediately if price touches ${sl.toFixed(dp)}.
+🛡️ SL triggers immediately if price touches ${sl.toFixed(dp)}.${counterTrendNote}
 ⚠️ Manage risk. Not financial advice.`
       // lastBarTs = signal bar's open (1-min). Filter is b.ts > lastBarTs so the NEXT
       // 1-min bar is the first one evaluated. Catches TP/SL within seconds of touch.
@@ -453,7 +462,7 @@ function scheduleDailySummary(){
 // ── STARTUP ───────────────────────────────────────────────────────────────
 const symbols=getLiveSymbols()
 
-console.log('🚀 Gold AI Launcher v10.2 — Multi-Symbol + Multi-Timeframe')
+console.log('🚀 Gold AI Launcher v10.3 — Multi-Symbol + Multi-Timeframe')
 console.log(`   Symbols: ${symbols.map(s=>`${s.emoji}${s.label}[${s.timeframes.join(',')}]`).join('  ')}`)
 console.log(`   ⚡ TP/SL watcher: every 1 min — TP & SL both trigger on wick touch`)
 console.log(`   🔑 API keys: ${getLiveApiKeys().length} active`)
