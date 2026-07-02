@@ -1,5 +1,21 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  GOLD.AI — Subscription Bot  v5.4 — Visitors (Leads) + Broadcast Targets
+//  GOLD.AI — Subscription Bot  v5.6 — Weekly Stats + Per-Market TP1-only Breakdown
+//
+//  New in v5.6:
+//   • Monthly & weekly stats no longer show a combined "Net" line (gold pips
+//     and crypto pips aren't comparable) — each market keeps its own totals.
+//   • Per-market stats now show TWO pip totals: "All TPs" (furthest level
+//     actually reached, same math as before) and "TP1-only" (what you'd
+//     have made if every trade was closed right at TP1). Computed via a
+//     signalId → TP1-pips lookup built from the raw daily rows.
+//   • collapseDaily() now runs GLOBALLY across the whole date range instead
+//     of per-day — fixes an edge case where a trade whose TP1 hit one day
+//     and TP2/TP3 hit the next showed up as two separate trades.
+//   • Trade line format simplified: "GOLD - BUY - TP2 --> +192pips" (no
+//     more "Signal" filler word).
+//   • NEW: 📅 Weekly Statistics — same breakdown, scoped to the current
+//     Monday–Sunday week only. No history/navigation — always "this week".
+//     Admin panel button, /weekstats command, adm_weekly callback.
 //
 //  New in v5.4:
 //   • VISITORS file (visitors.json) — every unique chatId that presses /start
@@ -550,6 +566,7 @@ async function screenAdminHome(chatId) {
     [{ text:`📊 Symbols (${syms.length} active)`,     callback_data:'adm_symbols' }],
     [{ text:`🎁 Bundles (${bundles.length})`,          callback_data:'adm_bundles' }],
     [{ text:`📈 Monthly Statistics`,                   callback_data:'adm_stats'   }],
+    [{ text:`📅 Weekly Statistics`,                    callback_data:'adm_weekly'  }],
     [{ text:`👥 Subscribers (${uniqueUsers} users)`,   callback_data:'adm_subs'    }],
     [{ text:`👁 Visitors / Leads (${totalVisitors})`,  callback_data:'adm_visitors'}],
     [{ text:`⏳ Pending Approvals (${pending})`,        callback_data:'adm_pending' }],
@@ -618,30 +635,53 @@ function collapseDaily(rows) {
   return [...byId.values()]
 }
 
-async function screenMonthlyStats(chatId, msgId, ym) {
-  ym = ym || ymNow()
-  const daily = loadDaily()
+// Build signalId → TP1 pips lookup from RAW (uncollapsed) rows in the range.
+// Used to compute the "if I only ever took TP1" scenario per market.
+function buildTp1Map(rawRows) {
+  const m = new Map()
+  for (const t of rawRows) if (t.result === 'TP1') m.set(t.signalId, t.pips)
+  return m
+}
 
-  let trades = []
-  for (const [date, day] of Object.entries(daily)) {
-    if (!date.startsWith(ym)) continue
-    const collapsed = collapseDaily(day.trades || [])
-    for (const t of collapsed) trades.push({ ...t, date })
-  }
+// Shared renderer for Monthly + Weekly stats. `entries` = [{date, trades:[...]}]
+// of RAW (uncollapsed) daily rows already filtered to the desired date range.
+// Collapses GLOBALLY across the whole range (not per-day) so a trade whose
+// TP1 hit one day and TP2/TP3 hit the next isn't double-counted.
+// No combined cross-currency "Net" — gold pips and crypto pips aren't
+// comparable, so each market keeps its own totals only.
+function renderStatsBlock(entries, titleLine, emptyNote) {
+  let allRaw = []
+  for (const { date, trades } of entries) for (const t of trades) allRaw.push({ ...t, date })
+
+  const tp1Map = buildTp1Map(allRaw)
+  const trades = collapseDaily(allRaw)
   trades.sort((a,b)=> new Date(a.ts||a.date) - new Date(b.ts||b.date))
 
   const wins   = trades.filter(t=>t.sign>0)
   const losses = trades.filter(t=>t.sign<0)
   const bes    = trades.filter(t=>!t.sign)
-  const net    = trades.reduce((a,t)=>a+signedPips(t), 0)
   const decided = wins.length + losses.length
   const wr = decided ? (wins.length/decided*100).toFixed(1) : '0.0'
 
+  // Per-market: "All TPs" = furthest outcome actually reached (as before).
+  // "TP1-only" = what every trade would have made if closed right at TP1
+  // (losses/BE unaffected — they never got there).
   const bySym = {}
-  for (const t of trades) { const k=t.sym||'?'; (bySym[k] ??= {net:0,n:0,w:0,l:0}); bySym[k].n++; bySym[k].net+=signedPips(t); if(t.sign>0)bySym[k].w++; else if(t.sign<0)bySym[k].l++ }
+  for (const t of trades) {
+    const k = t.sym || '?'
+    bySym[k] ??= { allTps:0, tp1Only:0, n:0, w:0, l:0 }
+    bySym[k].n++
+    bySym[k].allTps += signedPips(t)
+    if (t.sign>0) bySym[k].w++; else if (t.sign<0) bySym[k].l++
+    const tp1Val = (t.result==='SL'||t.result==='BE') ? signedPips(t) : (tp1Map.get(t.signalId) ?? t.pips)
+    bySym[k].tp1Only += tp1Val
+  }
   const symLines = Object.entries(bySym).map(([k,v])=>{
-    const nm = getSymbol(k)?.label?.split(' ')[0] || (k||'?').toUpperCase()
-    return `   ${getSymbol(k)?.emoji||'•'} ${nm}: ${v.net>=0?'+':''}${Math.round(v.net)}p  (${v.w}W/${v.l}L)`
+    const nm    = getSymbol(k)?.label?.split(' ')[0] || (k||'?').toUpperCase()
+    const emoji = getSymbol(k)?.emoji || '•'
+    const allStr = `${v.allTps>=0?'+':''}${Math.round(v.allTps)}p`
+    const tp1Str = `${v.tp1Only>=0?'+':''}${Math.round(v.tp1Only)}p`
+    return `   ${emoji} ${nm}: ${allStr}  (${v.w}W/${v.l}L)\n      TP1-only: ${tp1Str} · All TPs: ${allStr}`
   })
 
   const todayStr = new Date().toISOString().slice(0,10)
@@ -651,7 +691,7 @@ async function screenMonthlyStats(chatId, msgId, ym) {
     const icon = t.sign>0?'✅':t.sign<0?'❌':'🟦'
     const sign = t.sign>0?'+':t.sign<0?'-':''
     const tpL  = t.result==='SL'?'SL':t.result==='BE'?'BE':t.result
-    return `${icon} ${nm} - ${t.dir} Signal - ${tpL} - ${sign}${t.pips}pips`
+    return `${icon} ${nm} - ${t.dir} - ${tpL} --> ${sign}${t.pips}pips`
   }
   const days = {}
   for (const t of trades) (days[t.date] ??= []).push(t)
@@ -660,24 +700,65 @@ async function screenMonthlyStats(chatId, msgId, ym) {
   )
 
   const header =
-`📈 <b>Monthly Stats — ${ymLabel(ym)}</b>\n\n`+
-`Trades: <b>${trades.length}</b>  ✅ ${wins.length}  ❌ ${losses.length}${bes.length?`  🟦 ${bes.length}`:''}\n`+
-`Win rate: <b>${wr}%</b>\nNet: <b>${net>=0?'+':''}${Math.round(net)} pips</b>\n\n`+
+`${titleLine}\n\n`+
+`Trades taken: <b>${trades.length}</b>\n`+
+`✅ ${wins.length}  ❌ ${losses.length}${bes.length?`  🟦 ${bes.length}`:''}\n`+
+`Win rate: <b>${wr}%</b>\n\n`+
 `<b>By market:</b>\n${symLines.join('\n')||'   —'}\n\n`+
 `<b>Trades (newest first):</b>\n`
 
-  let body = dayBlocks.join('\n\n') || 'No trades recorded this month yet.'
+  let body = dayBlocks.join('\n\n') || (emptyNote || 'No trades recorded in this period yet.')
   let text = header + body
   if (text.length > 3800) {
     const keep=[]; let len=header.length
     for (const blk of dayBlocks) { if (len+blk.length+2 > 3600) { keep.push('… (older days trimmed)'); break } keep.push(blk); len+=blk.length+2 }
     text = header + keep.join('\n\n')
   }
+  return text
+}
+
+async function screenMonthlyStats(chatId, msgId, ym) {
+  ym = ym || ymNow()
+  const daily = loadDaily()
+  const entries = Object.entries(daily)
+    .filter(([date]) => date.startsWith(ym))
+    .map(([date, day]) => ({ date, trades: day.trades || [] }))
+
+  const text = renderStatsBlock(entries, `📈 <b>Monthly Stats — ${ymLabel(ym)}</b>`, 'No trades recorded this month yet.')
 
   const prev=ymNav(ym,-1), next=ymNav(ym,1)
   const rows = [
     [{ text:`⬅️ ${ymLabel(prev)}`, callback_data:`adm_stats_${prev}` }, { text:`${ymLabel(next)} ➡️`, callback_data:`adm_stats_${next}` }],
     [{ text:'🔄 Refresh', callback_data:`adm_stats_${ym}` }],
+    [{ text:'🏠 Admin Home', callback_data:'adm_home' }],
+  ]
+  return msgId ? editMsg(chatId,msgId,text,rows) : sendInline(chatId,text,rows)
+}
+
+// ── Current week (Mon–Sun, UTC) — no history, always "this week" ───────────
+function currentWeekRange() {
+  const now = new Date()
+  const utcDay = now.getUTCDay() // 0=Sun..6=Sat
+  const diffToMonday = utcDay === 0 ? 6 : utcDay - 1
+  const monday = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - diffToMonday))
+  const sunday = new Date(Date.UTC(monday.getUTCFullYear(), monday.getUTCMonth(), monday.getUTCDate() + 6))
+  const mondayStr = monday.toISOString().slice(0,10)
+  const sundayStr = sunday.toISOString().slice(0,10)
+  const label = `${monday.toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'UTC'})} – ${sunday.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric',timeZone:'UTC'})}`
+  return { mondayStr, sundayStr, label }
+}
+
+async function screenWeeklyStats(chatId, msgId) {
+  const { mondayStr, sundayStr, label } = currentWeekRange()
+  const daily = loadDaily()
+  const entries = Object.entries(daily)
+    .filter(([date]) => date >= mondayStr && date <= sundayStr)
+    .map(([date, day]) => ({ date, trades: day.trades || [] }))
+
+  const text = renderStatsBlock(entries, `📅 <b>Weekly Stats — ${label}</b>`, 'No trades recorded this week yet.')
+
+  const rows = [
+    [{ text:'🔄 Refresh', callback_data:'adm_weekly' }],
     [{ text:'🏠 Admin Home', callback_data:'adm_home' }],
   ]
   return msgId ? editMsg(chatId,msgId,text,rows) : sendInline(chatId,text,rows)
@@ -1187,6 +1268,7 @@ async function handleUpdate(upd) {
     if(text==='/symbols')  return screenSymbolsManager(chatId,null)
     if(text==='/bundles')  return screenBundlesManager(chatId,null)
     if(text==='/stats')    return screenMonthlyStats(chatId,null)
+    if(text==='/weekstats')return screenWeeklyStats(chatId,null)
     if(text==='/keys')     return screenApiKeys(chatId,null)
     if(text==='/payments') return screenPayments(chatId,null)
     if(text==='/settings') return screenBotSettings(chatId,null)
@@ -1230,6 +1312,7 @@ async function handleUpdate(upd) {
     if(data==='adm_symbols')       return screenSymbolsManager(chatId,msgId)
     if(data==='adm_bundles')       return screenBundlesManager(chatId,msgId)
     if(data==='adm_stats')         return screenMonthlyStats(chatId,msgId)
+    if(data==='adm_weekly')        return screenWeeklyStats(chatId,msgId)
     if(data==='adm_subs')          return screenAdminSubs(chatId,msgId)
     if(data==='adm_pending')       return screenAdminPending(chatId,msgId)
     if(data==='adm_keys')          return screenApiKeys(chatId,msgId)
@@ -1360,7 +1443,7 @@ async function handleUpdate(upd) {
 // ── LONG POLLING ──────────────────────────────────────────────────────────
 async function startPolling() {
   const s=loadSettings()
-  console.log('🤖 Gold AI Subscription Bot v5.4 — Visitors + Broadcast Targets')
+  console.log('🤖 Gold AI Subscription Bot v5.6 — Weekly Stats + TP1-only Breakdown')
   console.log(`   Channel: ${s.channel} | Admin: ${ADMIN_ID}`)
   console.log(`   Symbols: ${getActiveSymbols().map(x=>`${x.emoji||''}${x.label}`).join(', ')}`)
   console.log(`   Bundles: ${getActiveBundles().map(x=>x.label).join(', ')||'none'}`)
