@@ -1,22 +1,19 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  launcher.mjs  —  v10.2 (Multi-Symbol + Multi-Timeframe)
+//  launcher.mjs  —  v10.4 (Multi-Symbol + Multi-Timeframe + LEARNING LOG)
 //
-//  New in v10.2 (monthly stats correctness):
-//   • addToDaily() rows are now stamped with a signalId so the bot's monthly
-//     stats can collapse all TP1/TP2/TP3/SL/BE rows of ONE signal into a single
-//     outcome (furthest level reached). Without this, a trade hitting TP1+TP2
-//     was double-counted (e.g. 100+200=300) instead of the correct 200 pips.
-//     signalId = `${symbol}|${tf}|${dir}|${signalTs}` — stable across every
-//     outcome row of the same trade.
+//  New in v10.4 (feeds the adaptive brain):
+//   • logOutcome() — when a trade fully closes (TP3, SL, or BE), ONE row with
+//     the FINAL outcome (furthest level reached) is appended to
+//     learning_log.json, including the signal's score/tier/regime/session.
+//     signal-brain.mjs reads this file and gold-ai.mjs v4.3 skips signals
+//     matching patterns that historically lose (fail-open until data exists).
+//   • New-signal state now stores score/tier/regime/session so the outcome
+//     row carries the metadata the brain buckets on.
+//   • Engine env now includes LEARNING_LOG (absolute path) so the engine —
+//     which runs with cwd ./engine — reads the SAME learning file.
 //
-//  Changes vs v10:
-//   A. TP/SL RELIABILITY FIX — the old watcher fetched ONE last-closed bar and
-//      required an EXACT timestamp match. The watcher now fetches the last ~15
-//      closed bars and evaluates EVERY bar newer than the trade's lastBarTs, in
-//      order. Missed sweeps self-heal on the next sweep.
-//   B. SUBSCRIBER THREADING — TP/SL/KEEP-HOLDING alerts reply UNDER the original
-//      signal in every SUBSCRIBER chat, using the per-subscriber message_id map
-//      (subMsgIds) stored on the trade.
+//  v10.2/10.3: signalId stamping for stats collapse, 15-bar TP/SL watcher
+//  with self-healing catch-up, subscriber threading, HTF direction gate.
 //
 //  State keys are  symbol|tf  so Gold 15m and EURUSD 15m never collide.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -119,6 +116,17 @@ function addToDaily(trade) {
   saveDaily(daily)
 }
 
+// ── LEARNING LOG (feeds signal-brain.mjs) ─────────────────────────────────
+// One row per CLOSED trade — the FINAL outcome only (furthest level reached).
+const LEARN_FILE = './learning_log.json'
+function logOutcome(symObj, tf, sig, result, pips, sign) {
+  let a=[]; try{a=JSON.parse(fs.readFileSync(LEARN_FILE,'utf8'))}catch{}
+  a.push({ ts:new Date().toISOString(), signalId:makeSignalId(symObj.id,tf,sig),
+    sym:symObj.label, symId:symObj.id, tf, dir:sig.direction, result, pips, sign,
+    score:sig.score??null, tier:sig.tier??null, regime:sig.regime??null, session:sig.session??null })
+  const tmp=LEARN_FILE+'.tmp'; fs.writeFileSync(tmp,JSON.stringify(a,null,2)); fs.renameSync(tmp,LEARN_FILE)
+}
+
 // ── SEND A NEW SIGNAL ──────────────────────────────────────────────────────
 // Admin (direct) + all subscribers. Captures EVERY message id so TP/SL alerts
 // can thread under the original signal in each chat.
@@ -204,6 +212,7 @@ async function evalTradeAgainstBar(state, symObj, tf, sig, bar) {
     const pips=toPips(sig.tp3-entry,dp)
     await sendReply(`${dirIcon(dir)} <b>${symObj.label} ${tf.toUpperCase()} — TP3 HIT 🏆 FULL TARGET</b>\n+${pips} pips @ ${sig.tp3.toFixed(dp)}\nAll targets reached! 🎯`, symObj.id, adminReplyId, subMsgIds)
     addToDaily({sym:symObj.id,tf,dir,result:'TP3',pips,sign:+1,signalId})
+    logOutcome(symObj,tf,sig,'TP3',pips,+1)
     state[key]=null; changed=true
     console.log(`[${symObj.label} ${tf}] 🏆 TP3 +${pips} pips`)
     return changed   // trade fully closed
@@ -218,6 +227,14 @@ async function evalTradeAgainstBar(state, symObj, tf, sig, bar) {
     const label = isBE ? 'Break-even (0 pips)' : `-${pips} pips`
     await sendReply(`${dirIcon(dir)} <b>${symObj.label} ${tf.toUpperCase()} — ${isBE?'CLOSED AT BREAK-EVEN 🟦':'STOP LOSS ❌'}</b>\n${label} @ ${sl.toFixed(dp)}\nPrice touched the stop — stopped out immediately.`, symObj.id, adminReplyId, subMsgIds)
     addToDaily({sym:symObj.id,tf,dir,result:isBE?'BE':'SL',pips,sign:isBE?0:-1,signalId})
+    {
+      // Learning row = FINAL outcome (furthest level reached), not the raw stop.
+      // A trade that hit TP1 then stopped at break-even was a WIN for the brain.
+      const finalRes  = sig.tp2Hit ? 'TP2' : sig.tp1Hit ? 'TP1' : (isBE ? 'BE' : 'SL')
+      const finalSign = (sig.tp2Hit||sig.tp1Hit) ? +1 : (isBE ? 0 : -1)
+      const finalPips = sig.tp2Hit ? toPips(sig.tp2-entry,dp) : sig.tp1Hit ? toPips(sig.tp1-entry,dp) : pips
+      logOutcome(symObj,tf,sig,finalRes,finalPips,finalSign)
+    }
     state[key]=null; changed=true
     console.log(`[${symObj.label} ${tf}] ${isBE?'🟦 BE':'🔴 SL'} (${label})`)
   }
@@ -325,6 +342,7 @@ async function runSignalCycle(symObj, tf, isStartup=false) {
     SYMBOL_OANDA:    symObj.oanda_symbol || '',
     SYMBOL_YAHOO:    symObj.yahoo_symbol || '',
     SYMBOL_DECIMALS: String(symObj.decimals ?? 2),
+    LEARNING_LOG:    path.resolve('./learning_log.json'),
   }
 
   // Run engine in ISOLATED dir so it can't touch the launcher's bot_state.json
@@ -408,7 +426,7 @@ H1 ${sig.h1Trend} · ${sig.session}
       const nowBar1m=Math.floor(Date.now()/WATCH_BAR_MS)*WATCH_BAR_MS - WATCH_BAR_MS
       const r=await sendNewSignal(msgText, symObj.id)
       const sNow=loadState()
-      sNow[stateKey]={direction:sig.direction,entry,sl,tp1,tp2,tp3,tp1Hit:false,tp2Hit:false,tp3Hit:false,signalMsgId:r.adminMsgId,subMsgIds:r.subMsgIds,lastBarTs:nowBar1m,ts:sig.ts}
+      sNow[stateKey]={direction:sig.direction,entry,sl,tp1,tp2,tp3,tp1Hit:false,tp2Hit:false,tp3Hit:false,signalMsgId:r.adminMsgId,subMsgIds:r.subMsgIds,lastBarTs:nowBar1m,ts:sig.ts,score:sig.score,tier:sig.tier,regime:sig.regime,session:sig.session}
       saveState(sNow)
       console.log(`[${symObj.label} ${tf}] 📡 NEW signal adminMsgId=${r.adminMsgId} subs=${Object.keys(r.subMsgIds).length}`)
     }
@@ -462,9 +480,10 @@ function scheduleDailySummary(){
 // ── STARTUP ───────────────────────────────────────────────────────────────
 const symbols=getLiveSymbols()
 
-console.log('🚀 Gold AI Launcher v10.3 — Multi-Symbol + Multi-Timeframe')
+console.log('🚀 Gold AI Launcher v10.4 — Multi-Symbol + Multi-Timeframe + Learning Log')
 console.log(`   Symbols: ${symbols.map(s=>`${s.emoji}${s.label}[${s.timeframes.join(',')}]`).join('  ')}`)
 console.log(`   ⚡ TP/SL watcher: every 1 min — TP & SL both trigger on wick touch`)
+console.log(`   🧠 Brain: closed trades → learning_log.json (BRAIN=0 to disable gate)`)
 console.log(`   🔑 API keys: ${getLiveApiKeys().length} active`)
 console.log(`   💰 Account: $${getAccountSize()} · Risk ${getRiskPct()}%`)
 
