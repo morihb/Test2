@@ -1,23 +1,20 @@
 // ─────────────────────────────────────────────────────────────
-//  GOLD.AI — v4.2  (multi-symbol · multi-timeframe · SPEED-AWARE)
+//  GOLD.AI — v4.3  (multi-symbol · multi-timeframe · SPEED-AWARE · BRAIN)
 //
-//  What changed vs v4.1 (NO change to the core edge/scoring):
-//   • TRADE PROFILES per timeframe. Fast TFs (5m/15m/1h) now behave
-//     as SCALP / INTRADAY trades: tighter R-based TPs, a hard ATR
-//     distance cap, and a short max-hold so signals resolve FAST and
-//     actually hit TP/SL instead of drifting for hours.
-//   • Slow TFs (4h/1d) keep the full multi-timeframe liquidity-target
-//     search (SWING trades) from v4.1.
-//   • Sharper decision gates (toggleable via env):
-//       - candle confirmation on the signal bar (scalp/intraday)
-//       - TP1-vs-spread feasibility (skip trades the spread would eat)
-//       - minimum stop distance floor (noise/spread can't insta-kill)
-//       - off-hours scalp strictness
-//       - confluence count (displayed; optional gate)
-//   • Signal now reports tradeType + expected max hold so the launcher
-//     can time-stop fast trades. Everything else preserved.
+//  What changed vs v4.2 (NO change to the core edge/scoring):
+//   • ADAPTIVE BRAIN GATE — after all normal gates pass, the signal is
+//     checked against signal-brain.mjs, which learns from closed trades
+//     (learning_log.json, written by launcher v10.4). Patterns with ≥5
+//     closed trades, win rate <35% and negative net pips are skipped.
+//     3 consecutive SLs on a symbol|tf → 12h cooldown. FAIL-OPEN: with
+//     no history the bot behaves exactly like v4.2. Disable: BRAIN=0.
+//
+//  v4.2: TRADE PROFILES per timeframe (SCALP/INTRADAY/SWING), candle
+//  confirmation, TP1-vs-spread feasibility, min stop distance floor,
+//  off-hours scalp strictness, confluence count.
 // ─────────────────────────────────────────────────────────────
 import fs from 'fs'
+import { brainCheck } from './signal-brain.mjs'
 
 // ── CONFIG ────────────────────────────────────────────────────
 const TG_TOKEN=process.env.TG_TOKEN||'', TG_CHAT=process.env.TG_CHAT||''
@@ -53,6 +50,7 @@ const KILL_DD_R=envNum('KILL_DD_R',10)
 // SPREAD_TP1_MULT           -> TP1 distance must be >= N × current spread
 // SCALP_OFFHOURS_STRICT=0   -> allow weak off-hours scalps
 // CONFLUENCE_MIN            -> min confluence factors required (0 = display only)
+// BRAIN=0                   -> disable the adaptive brain gate
 const REQUIRE_CANDLE_CONFIRM = process.env.REQUIRE_CANDLE_CONFIRM!=='0'
 const SPREAD_TP1_MIN_MULT    = parseFloat(process.env.SPREAD_TP1_MULT)||6
 const SCALP_OFFHOURS_STRICT  = process.env.SCALP_OFFHOURS_STRICT!=='0'
@@ -75,7 +73,6 @@ const TF_PRESETS={
 //   minStopAtr floor on stop distance (in ATR) so noise/spread can't insta-kill
 //   liquidity  'off'/'light' = R-based targets (snapped nearer to liquidity in
 //              the path) · 'on' = full MTF liquidity-target search (swing)
-// Tighter tpR + tpCapAtr on fast TFs = trades that actually complete quickly.
 const TRADE_PROFILES={
   '5m' : {type:'SCALP',    maxHold:12, tpR:[1.0,1.5,2.0], tpCapAtr:3,  minStopAtr:0.6, liquidity:'off'},
   '15m': {type:'SCALP',    maxHold:12, tpR:[1.0,1.5,2.0], tpCapAtr:4,  minStopAtr:0.7, liquidity:'off'},
@@ -386,6 +383,12 @@ function analyse(candles,nowMs,cfg){
   if(SCALP_OFFHOURS_STRICT && profile.type!=='SWING' && sessionOf(nowMs)==='offhours' && conv<MIN_CONV+0.10)
     return wait('off-hours scalp & weak',reg,cfg,{net,bull,bear})
 
+  // ── ADAPTIVE BRAIN GATE (learns from closed trades; fail-open) ──
+  if(process.env.BRAIN!=='0'){
+    const b=brainCheck({sym:SYMBOL_LABEL,tf:cfg.tframe,regime:reg.regime,session:sessionOf(nowMs),score})
+    if(!b.allow) return wait(`brain: ${b.why}`,reg,cfg,{net,bull,bear})
+  }
+
   // ── SL placement (anchored to wicks, regime-scaled buffer) ──
   const buf = reg.regime==='volatile_expansion' ? atr*0.8 : atr*0.5
   const stopMult = reg.regime==='volatile_expansion' ? 2.5 : 1.8
@@ -517,7 +520,7 @@ async function fetchOanda(count,cfg){
   if(out.length<200) throw new Error('OANDA: too few candles'); return out }
 
 async function fetchTwelveData(count,cfg){
-  const res=await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(SYMBOL_TD)}&interval=${cfg.td}&outputsize=${Math.min(count,5000)}&apikey=${process.env.TWELVEDATA_KEY}`)
+  const res=await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(SYMBOL_TD)}&interval=${cfg.td}&outputsize=${Math.min(count,5000)}&timezone=UTC&apikey=${process.env.TWELVEDATA_KEY}`)
   if(!res.ok) throw new Error(`TwelveData ${res.status}`)
   const j=await res.json()
   if(j.status==='error'||!j.values) throw new Error(`TwelveData: ${j.message||'no data'}`)
@@ -528,7 +531,7 @@ async function fetchTwelveDataPaged(target=30000,cfg){
   const key=process.env.TWELVEDATA_KEY,all=new Map(); let endDate=null
   const maxPages=Math.ceil(target/5000)+3
   for(let page=0;page<maxPages;page++){
-    let url=`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(SYMBOL_TD)}&interval=${cfg.td}&outputsize=5000&apikey=${key}`
+    let url=`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(SYMBOL_TD)}&interval=${cfg.td}&outputsize=5000&timezone=UTC&apikey=${key}`
     if(endDate) url+=`&end_date=${encodeURIComponent(endDate)}`
     const res=await fetch(url); if(!res.ok){console.error(`  TwelveData page ${page+1}: HTTP ${res.status} — stopping`);break}
     const j=await res.json()
@@ -592,7 +595,7 @@ function simulateTrade(candles,i,sig,maxHold=24){
     session:sessionOf(eb.timestamp),regime:sig.regime,tier:sig.tier,score:sig.score,dir,
     day:new Date(eb.timestamp).toISOString().slice(0,10)} }
 
-// ── BACKTEST (now uses the profile's maxHold for the active TF) ──
+// ── BACKTEST (uses the profile's maxHold for the active TF) ──
 function backtest(candles,cfg,opts={}){
   const profile=profileFor(cfg.tframe)
   const maxHold=opts.maxHold ?? profile.maxHold ?? cfg.maxHold
