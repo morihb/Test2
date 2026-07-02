@@ -1,6 +1,21 @@
-
 // ─────────────────────────────────────────────────────────────────────────────
-//  GOLD.AI — Subscription Bot  v5.7 — Public Weekly Performance Teaser
+//  GOLD.AI — Subscription Bot  v5.9 — Weekly Stats for Active Subscribers Too
+//
+//  New in v5.9:
+//   • Fixed a gap: active subscribers tapping into a market/bundle they
+//     already pay for landed on the "✅ Subscription Active" status screen,
+//     which never had the weekly-performance button. Now both the
+//     single-market "Active" screen and the bundle "Active" screen show
+//     "📅 This Week's Performance" too — not just the pre-purchase package
+//     screens. Main /start menu already showed it for everyone.
+//
+//  New in v5.8:
+//   • The main /start screen (market + bundle picker) now has its own
+//     "📅 This Week's Performance — All Markets" tab, plus a teaser
+//     sentence ("Curious how we're doing? Check this week's live results
+//     below…") — visible BEFORE the user drills into any specific market
+//     or bundle. Reuses the same pwk_all_<backTarget> public callback,
+//     landing back on the main menu.
 //
 //  New in v5.7:
 //   • Subscribers now see "📈 Want proof before you commit? Tap below to
@@ -401,6 +416,7 @@ async function screenStart(chatId, firstName, from={}) {
   let welcome = `🟡 <b>GOLD AI — Premium Signals</b>\n\nMulti-asset trading signals powered by AI analysis.\n\n`
   const activeNames = activeIds.map(id => isBundleId(id) ? getBundle(id)?.label : getSymbol(id)?.label).filter(Boolean)
   if (activeNames.length) welcome += `✅ Active: <b>${activeNames.join(', ')}</b>\n\n`
+  welcome += `📈 Curious how we're doing? Check this week's live results below, then pick a market to subscribe.\n\n`
   welcome += `<b>Select a market or bundle:</b>`
 
   const rows = symbols.map(s => {
@@ -411,6 +427,7 @@ async function screenStart(chatId, firstName, from={}) {
     const active = activeIds.includes(b.id)
     rows.push([{ text:`${active?'✅ ':''}🎁 ${b.emoji||''} ${b.label}${active?' (Active)':''}`, callback_data:`bun_${b.id}` }])
   }
+  rows.push([{ text:"📅 This Week's Performance — All Markets", callback_data:'pwk_all_back_home' }])
   rows.push([{ text:'📊 My Subscriptions', callback_data:'my_subs' }])
   return sendInline(chatId, welcome, rows)
 }
@@ -424,7 +441,7 @@ async function screenSymbol(chatId, symId, msgId) {
     const via = sub.viaBundle ? `\n(via bundle: ${getBundle(sub.viaBundle)?.label||sub.viaBundle})` : ''
     return editMsg(chatId, msgId,
 `${sym.emoji||'📊'} <b>${sym.label}</b>\n\n✅ <b>Subscription Active</b>\nExpires: <b>${exp}</b> (${daysLeft} days left)${via}\n\nSignals for ${sym.label} are delivered to this chat.`,
-      [[{ text:'⬅️ Back to Markets', callback_data:'back_home' }]])
+      [[{ text:"📅 This Week's Performance", callback_data:`pwk_${symId}_sym_${symId}` }], [{ text:'⬅️ Back to Markets', callback_data:'back_home' }]])
   }
   if (sub?.status === 'pending_payment') return screenPayment(chatId, symId, sub.pendingPkg, sub.pendingMethod, msgId)
 
@@ -448,7 +465,7 @@ async function screenBundle(chatId, bid, msgId) {
     const daysLeft = Math.ceil((new Date(sub.expiresAt)-new Date())/86400000)
     return editMsg(chatId, msgId,
 `🎁 <b>${b.label}</b>\n\n✅ <b>Bundle Active</b>\nExpires: <b>${exp}</b> (${daysLeft} days left)\n\nIncluded markets:\n${memberList}`,
-      [[{ text:'⬅️ Back to Markets', callback_data:'back_home' }]])
+      [[{ text:"📅 This Week's Performance", callback_data:`pwk_all_bun_${bid}` }], [{ text:'⬅️ Back to Markets', callback_data:'back_home' }]])
   }
   if (sub?.status === 'pending_payment') return screenBundlePayment(chatId, bid, sub.pendingPkg, sub.pendingMethod, msgId)
 
