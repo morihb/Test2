@@ -1,5 +1,16 @@
+
 // ─────────────────────────────────────────────────────────────────────────────
-//  GOLD.AI — Subscription Bot  v5.6 — Weekly Stats + Per-Market TP1-only Breakdown
+//  GOLD.AI — Subscription Bot  v5.7 — Public Weekly Performance Teaser
+//
+//  New in v5.7:
+//   • Subscribers now see "📈 Want proof before you commit? Tap below to
+//     see this week's live results" on both the single-market AND bundle
+//     package-selection screens, with a "📅 See This Week's Performance"
+//     button. Public callback (no admin gate) — scoped to that one market
+//     for single-symbol screens, or "All Markets" for bundles.
+//   • screenPublicWeeklyStats() reuses the same renderStatsBlock() as the
+//     admin monthly/weekly views, just filtered by symbol and with a
+//     single "⬅️ Back" button that returns to wherever the user came from.
 //
 //  New in v5.6:
 //   • Monthly & weekly stats no longer show a combined "Net" line (gold pips
@@ -420,9 +431,10 @@ async function screenSymbol(chatId, symId, msgId) {
   const pkgs = sym.packages?.filter(p=>p.active!==false) || []
   if (!pkgs.length) return editMsg(chatId, msgId, `⚠️ No plans available for ${sym.label} right now.`, [[{text:'⬅️ Back',callback_data:'back_home'}]])
   const rows = pkgs.map(p => [{ text:`📦 ${p.label} — $${p.price}`, callback_data:`pkg_${symId}_${p.id}` }])
+  rows.push([{ text:"📅 See This Week's Performance", callback_data:`pwk_${symId}_sym_${symId}` }])
   rows.push([{ text:'⬅️ Back to Markets', callback_data:'back_home' }])
   return editMsg(chatId, msgId,
-`${sym.emoji||'📊'} <b>${sym.label}</b>\n\nTimeframes: <b>${(sym.timeframes||['15m','1h']).join(', ')}</b>\nData: <b>${sym.td_symbol}</b>\n\n<b>Choose your subscription plan:</b>`, rows)
+`${sym.emoji||'📊'} <b>${sym.label}</b>\n\nTimeframes: <b>${(sym.timeframes||['15m','1h']).join(', ')}</b>\nData: <b>${sym.td_symbol}</b>\n\n📈 Want proof before you commit? Tap below to see this week's live results.\n\n<b>Choose your subscription plan:</b>`, rows)
 }
 
 async function screenBundle(chatId, bid, msgId) {
@@ -443,9 +455,10 @@ async function screenBundle(chatId, bid, msgId) {
   const pkgs = (b.packages||[]).filter(p=>p.active!==false)
   if (!pkgs.length) return editMsg(chatId, msgId, `⚠️ No plans available for ${b.label} right now.`, [[{text:'⬅️ Back',callback_data:'back_home'}]])
   const rows = pkgs.map(p => [{ text:`📦 ${p.label} — $${p.price}`, callback_data:`bpkg_${bid}_${p.id}` }])
+  rows.push([{ text:"📅 See This Week's Performance", callback_data:`pwk_all_bun_${bid}` }])
   rows.push([{ text:'⬅️ Back to Markets', callback_data:'back_home' }])
   return editMsg(chatId, msgId,
-`🎁 <b>${b.label}</b>\n\nOne subscription, all of these markets:\n${memberList}\n\n<b>Choose your plan:</b>`, rows)
+`🎁 <b>${b.label}</b>\n\nOne subscription, all of these markets:\n${memberList}\n\n📈 Want proof before you commit? Tap below to see this week's live results across all markets.\n\n<b>Choose your plan:</b>`, rows)
 }
 
 async function screenPickPayment(chatId, symId, pkgId, msgId) {
@@ -761,6 +774,27 @@ async function screenWeeklyStats(chatId, msgId) {
     [{ text:'🔄 Refresh', callback_data:'adm_weekly' }],
     [{ text:'🏠 Admin Home', callback_data:'adm_home' }],
   ]
+  return msgId ? editMsg(chatId,msgId,text,rows) : sendInline(chatId,text,rows)
+}
+
+// ── PUBLIC weekly stats — shown to subscribers browsing packages, as social
+// proof before they buy. Optionally scoped to one market; falls back to a
+// combined "All Markets" view (used from bundle package screens). `backTarget`
+// is the callback_data to return to (e.g. `sym_gold` or `bun_bnd_xxx`).
+async function screenPublicWeeklyStats(chatId, msgId, symId, backTarget) {
+  const { mondayStr, sundayStr, label } = currentWeekRange()
+  const daily = loadDaily()
+  const entries = Object.entries(daily)
+    .filter(([date]) => date >= mondayStr && date <= sundayStr)
+    .map(([date, day]) => ({ date, trades: symId ? (day.trades||[]).filter(t=>t.sym===symId) : (day.trades||[]) }))
+
+  const scopeLabel = symId ? (getSymbol(symId)?.label || symId) : 'All Markets'
+  const emptyNote = symId
+    ? `No ${getSymbol(symId)?.label || symId} signals have closed yet this week — check back soon!`
+    : 'No signals have closed yet this week — check back soon!'
+  const text = renderStatsBlock(entries, `📅 <b>This Week's Performance — ${scopeLabel}</b>\n<i>${label}</i>`, emptyNote)
+
+  const rows = [[{ text:'⬅️ Back', callback_data: backTarget || 'back_home' }]]
   return msgId ? editMsg(chatId,msgId,text,rows) : sendInline(chatId,text,rows)
 }
 
@@ -1304,6 +1338,11 @@ async function handleUpdate(upd) {
     const bpayM=data.match(/^bpay_(\w+)_(\w+)_(\w+)$/);  if(bpayM) return screenBundlePayment(chatId,bpayM[1],bpayM[2],bpayM[3],msgId)
     const bconfM=data.match(/^bconfirm_(\w+)_(\w+)_(\w+)$/);  if(bconfM) return screenBundleConfirmPending(chatId,bconfM[1],bconfM[2],bconfM[3],msgId)
     const bjoinM=data.match(/^bcheckjoin_(\w+)_(\w+)_(\w+)$/);  if(bjoinM) return screenBundleCheckJoin(chatId,bjoinM[1],bjoinM[2],bjoinM[3],msgId)
+
+    // Public weekly-performance teaser (shown from package selection screens)
+    // pwk_<symId|all>_<backTarget>  — backTarget is itself a callback_data string
+    const pwkM=data.match(/^pwk_([a-z0-9]+)_(.+)$/)
+    if(pwkM) return screenPublicWeeklyStats(chatId, msgId, pwkM[1]==='all'?null:pwkM[1], pwkM[2])
 
     if(!isAdmin) return
 
