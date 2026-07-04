@@ -1,25 +1,32 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  launcher.mjs  —  v10.4 (Multi-Symbol + Multi-Timeframe + LEARNING LOG)
+//  launcher.mjs  —  v10.5 (Multi-Symbol + Multi-Timeframe + LEARNING LOG)
 //
-//  New in v10.4 (feeds the adaptive brain):
-//   • logOutcome() — when a trade fully closes (TP3, SL, or BE), ONE row with
-//     the FINAL outcome (furthest level reached) is appended to
-//     learning_log.json, including the signal's score/tier/regime/session.
-//     signal-brain.mjs reads this file and gold-ai.mjs v4.3 skips signals
-//     matching patterns that historically lose (fail-open until data exists).
-//   • New-signal state now stores score/tier/regime/session so the outcome
-//     row carries the metadata the brain buckets on.
-//   • Engine env now includes LEARNING_LOG (absolute path) so the engine —
-//     which runs with cwd ./engine — reads the SAME learning file.
+//  New in v10.5:
+//   • SAME-TF REVERSAL LOCK — while a timeframe holds an OPEN trade, an
+//     opposite-direction signal on that SAME timeframe is suppressed. The
+//     open trade must fully close (TP3, SL, or break-even) before the
+//     direction can flip. No more "SELL sent while the BUY is still live".
+//   • 5m ↔ 15m HARD GATE — 5m may NEVER oppose an open 15m trade. Opposing
+//     an open 1h/4h/1d trade is still allowed as a flagged counter-trend
+//     scalp (unchanged). 15m/1h/4h/1d keep full HTF blocking as before.
+//   • CALIBRATED ATR BANDS — if the symbol has per-timeframe atr_bands in
+//     settings.json (set via admin "🎯 Recalibrate ATR" or auto on symbol
+//     add), the launcher injects ATR_LOW/ATR_HIGH into the engine env so
+//     forex pairs stop being falsely blocked as "low liquidity" by gold's
+//     default bands.
+//   • KEEP-HOLDING OPT-OUT — "KEEP HOLDING" updates are now only sent to
+//     users who have them enabled (/keepholding toggle in the bot, default
+//     ON). TP/SL/BE alerts and new signals are always sent to everyone.
 //
-//  v10.2/10.3: signalId stamping for stats collapse, 15-bar TP/SL watcher
-//  with self-healing catch-up, subscriber threading, HTF direction gate.
+//  v10.4: logOutcome() learning log for signal-brain.mjs.
+//  v10.2/10.3: signalId stamping, 15-bar TP/SL watcher, threading, HTF gate.
 //
 //  State keys are  symbol|tf  so Gold 15m and EURUSD 15m never collide.
 // ─────────────────────────────────────────────────────────────────────────────
 import {
   broadcastSignal,
   broadcastReply,
+  keepHoldingEnabled,
   getActiveApiKeys,
   getDataSource,
   getAccountSize,
@@ -146,14 +153,19 @@ async function sendNewSignal(text, symbolId) {
 // TP/SL/KEEP-HOLDING alert that replies UNDER the original signal in every chat:
 // admin replies to adminReplyId, each subscriber replies to their stored id.
 // (allow_sending_without_reply means it still delivers if the original is gone.)
-async function sendReply(text, symbolId, adminReplyId=null, subMsgIds={}) {
-  try {
-    const body={chat_id:TG_CHAT,text,parse_mode:'HTML'}
-    if(adminReplyId){ body.reply_to_message_id=adminReplyId; body.allow_sending_without_reply=true }
-    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-  }catch(e){console.error('[sendReply admin]',e.message)}
-  const result=await broadcastReply(text, symbolId, subMsgIds)
-  console.log(`[reply][${symbolId}] subs sent=${result.sent} failed=${result.failed}`)
+// opts.keepHolding=true → only delivered to users with /keepholding enabled
+// (TP/SL/BE alerts never set this flag and always go to everyone).
+async function sendReply(text, symbolId, adminReplyId=null, subMsgIds={}, opts={}) {
+  const isKeep = !!opts.keepHolding
+  if (!isKeep || keepHoldingEnabled(TG_CHAT)) {
+    try {
+      const body={chat_id:TG_CHAT,text,parse_mode:'HTML'}
+      if(adminReplyId){ body.reply_to_message_id=adminReplyId; body.allow_sending_without_reply=true }
+      await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    }catch(e){console.error('[sendReply admin]',e.message)}
+  }
+  const result=await broadcastReply(text, symbolId, subMsgIds, { keepHolding: isKeep })
+  console.log(`[reply][${symbolId}]${isKeep?' (keep-holding)':''} subs sent=${result.sent} failed=${result.failed} skipped=${result.skipped||0}`)
 }
 
 // ── RECENT CLOSED 1-MIN BARS (catch-up; reports 429 exhaustion) ─────────────
@@ -345,6 +357,15 @@ async function runSignalCycle(symObj, tf, isStartup=false) {
     LEARNING_LOG:    path.resolve('./learning_log.json'),
   }
 
+  // Per-symbol CALIBRATED ATR bands (v10.5) — set via admin "🎯 Recalibrate
+  // ATR" (or auto-calibrated when the symbol is added). Without this, forex
+  // pairs are judged against GOLD's ATR% bands and blocked as low_liquidity.
+  const band = symObj.atr_bands?.[tf]
+  if (band && band.atrLow != null && band.atrHigh != null) {
+    env.ATR_LOW  = String(band.atrLow)
+    env.ATR_HIGH = String(band.atrHigh)
+  }
+
   // Run engine in ISOLATED dir so it can't touch the launcher's bot_state.json
   const {stdout,stderr}=await exec('node',[ENGINE_SCRIPT,'check'],{env,timeout:60000,cwd:path.resolve(ENGINE_DIR)})
   if(stdout) console.log(`[${symObj.label} ${tf}]`,stdout.trim())
@@ -388,19 +409,41 @@ async function runSignalCycle(symObj, tf, isStartup=false) {
       const tp1L=`${current.tp1Hit?'✅ ':''}TP1 ${current.tp1?.toFixed(dp)}`
       const tp2L=`${current.tp2Hit?'✅ ':''}TP2 ${current.tp2?.toFixed(dp)}`
       const tp3L=`${current.tp3Hit?'✅ ':''}TP3 ${current.tp3?.toFixed(dp)}`
-      await sendReply(`${dirIcon(current.direction)} <b>${symObj.label} ${tf.toUpperCase()} — KEEP HOLDING ${current.direction}</b>\nConfluence still active — original trade stays open.\nEntry ${current.entry?.toFixed(dp)} · SL ${current.sl?.toFixed(dp)}\n${tp1L}\n${tp2L}\n${tp3L}`, symObj.id, adminReplyId, subMsgIds)
+      await sendReply(`${dirIcon(current.direction)} <b>${symObj.label} ${tf.toUpperCase()} — KEEP HOLDING ${current.direction}</b>\nConfluence still active — original trade stays open.\nEntry ${current.entry?.toFixed(dp)} · SL ${current.sl?.toFixed(dp)}\n${tp1L}\n${tp2L}\n${tp3L}`, symObj.id, adminReplyId, subMsgIds, { keepHolding:true })
       // DO NOT saveState here — the watcher owns tp1Hit/sl/lastBarTs.
       // Saving the old snapshot would clobber those updates.
       console.log(`[${symObj.label} ${tf}] 📡 KEEP HOLDING`)
     } else {
-      // HTF DIRECTION GATE — blocks 15m/1h/4h/1d from opposing an open higher-TF trade.
-      // 5m is exempt: it's allowed to counter-trend as a fast scalp, just flagged in the message.
+      // ── SAME-TF REVERSAL LOCK (v10.5) ────────────────────────────────────
+      // A timeframe that still holds an OPEN trade must never flip direction.
+      // The open trade has to fully close (TP3, SL, or break-even) before an
+      // opposite-direction signal on the SAME timeframe is allowed out.
+      // (Re-read fresh state — the trade may have closed during engine exec,
+      // in which case the reversal IS allowed.)
+      const stillOpen = openTrade(loadState(), symObj.id, tf)
+      if (stillOpen && stillOpen.direction && stillOpen.direction !== sig.direction) {
+        console.log(`[${symObj.label} ${tf}] ⛔ ${sig.direction} suppressed — ${tf} still holds an open ${stillOpen.direction} (waiting for TP3/SL/BE)`)
+        return
+      }
+
+      // HTF DIRECTION GATE (v10.5):
+      //  • 15m/1h/4h/1d: blocked from opposing ANY open higher-TF trade.
+      //  • 5m: HARD-blocked if it opposes an open 15m trade — no exceptions.
+      //        Opposing only 1h/4h/1d is allowed as a counter-trend scalp
+      //        (flagged in the message), same as before.
       const htf=higherTfDirection(loadState(), symObj.id, tf, symObj.timeframes)
       const counterTrend = htf && htf.dir!==sig.direction
 
       if(counterTrend && tf!=='5m'){
         console.log(`[${symObj.label} ${tf}] ⛔ ${sig.direction} suppressed — higher TF ${htf.tf} holds ${htf.dir}`)
         return
+      }
+      if(tf==='5m'){
+        const m15=openTrade(loadState(), symObj.id, '15m')
+        if(m15 && m15.direction && m15.direction!==sig.direction){
+          console.log(`[${symObj.label} ${tf}] ⛔ ${sig.direction} suppressed — 15m holds ${m15.direction} (5m may not oppose 15m)`)
+          return
+        }
       }
       if(counterTrend && tf==='5m'){
         console.log(`[${symObj.label} ${tf}] ⚠️ ${sig.direction} allowed as counter-trend scalp — higher TF ${htf.tf} holds ${htf.dir}`)
@@ -480,10 +523,13 @@ function scheduleDailySummary(){
 // ── STARTUP ───────────────────────────────────────────────────────────────
 const symbols=getLiveSymbols()
 
-console.log('🚀 Gold AI Launcher v10.4 — Multi-Symbol + Multi-Timeframe + Learning Log')
+console.log('🚀 Gold AI Launcher v10.5 — Reversal Lock + 5m/15m Gate + Calibrated ATR')
 console.log(`   Symbols: ${symbols.map(s=>`${s.emoji}${s.label}[${s.timeframes.join(',')}]`).join('  ')}`)
 console.log(`   ⚡ TP/SL watcher: every 1 min — TP & SL both trigger on wick touch`)
+console.log(`   🔒 Same-TF reversal lock: opposite signal suppressed until TP3/SL/BE`)
+console.log(`   🔒 5m ↔ 15m gate: 5m never opposes an open 15m trade`)
 console.log(`   🧠 Brain: closed trades → learning_log.json (BRAIN=0 to disable gate)`)
+console.log(`   🔁 KEEP HOLDING updates respect the /keepholding user toggle`)
 console.log(`   🔑 API keys: ${getLiveApiKeys().length} active`)
 console.log(`   💰 Account: $${getAccountSize()} · Risk ${getRiskPct()}%`)
 
