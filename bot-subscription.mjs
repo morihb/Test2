@@ -1,80 +1,35 @@
+
 // ─────────────────────────────────────────────────────────────────────────────
-//  GOLD.AI — Subscription Bot  v5.9 — Weekly Stats for Active Subscribers Too
+//  GOLD.AI — Subscription Bot  v6.0 — ATR Calibration + /keepholding + /statistics
 //
-//  New in v5.9:
-//   • Fixed a gap: active subscribers tapping into a market/bundle they
-//     already pay for landed on the "✅ Subscription Active" status screen,
-//     which never had the weekly-performance button. Now both the
-//     single-market "Active" screen and the bundle "Active" screen show
-//     "📅 This Week's Performance" too — not just the pre-purchase package
-//     screens. Main /start menu already showed it for everyone.
+//  New in v6.0:
+//   • 🎯 PER-SYMBOL ATR CALIBRATION — fixes the "low liquidity" false block
+//     on forex pairs (EUR/USD, USD/JPY, EUR/JPY…). calibrateSymbol() fetches
+//     ~500 bars per timeframe from TwelveData, computes the rolling 14-period
+//     ATR% distribution, and stores p5/p95 as atr_bands[tf]={atrLow,atrHigh}
+//     on the symbol in settings.json. The launcher (v10.5) injects these as
+//     ATR_LOW/ATR_HIGH into the engine env per run, so each instrument is
+//     judged against ITS OWN volatility profile instead of gold's.
+//     - Auto-calibrates when a new symbol is added via admin.
+//     - "🎯 Recalibrate ATR" button on each symbol's admin screen.
+//     - Restart the launcher after (re)calibration to apply.
+//   • 🔁 /keepholding (all users) — per-user toggle for "KEEP HOLDING"
+//     updates. Default ON. When OFF, the user still receives everything
+//     else (new signals with Entry/SL/TPs, TP hits, break-even, stop-loss)
+//     but no longer gets the periodic KEEP HOLDING confirmations.
+//     Stored in user_prefs.json. broadcastReply() filters by this pref
+//     when the launcher marks a reply as keepHolding.
+//   • 📅 /statistics (all users — subscribers or not) — opens a picker of
+//     every active market + "All Markets", each leading to this week's live
+//     performance (same public weekly stats view as the package screens).
 //
-//  New in v5.8:
-//   • The main /start screen (market + bundle picker) now has its own
-//     "📅 This Week's Performance — All Markets" tab, plus a teaser
-//     sentence ("Curious how we're doing? Check this week's live results
-//     below…") — visible BEFORE the user drills into any specific market
-//     or bundle. Reuses the same pwk_all_<backTarget> public callback,
-//     landing back on the main menu.
-//
-//  New in v5.7:
-//   • Subscribers now see "📈 Want proof before you commit? Tap below to
-//     see this week's live results" on both the single-market AND bundle
-//     package-selection screens, with a "📅 See This Week's Performance"
-//     button. Public callback (no admin gate) — scoped to that one market
-//     for single-symbol screens, or "All Markets" for bundles.
-//   • screenPublicWeeklyStats() reuses the same renderStatsBlock() as the
-//     admin monthly/weekly views, just filtered by symbol and with a
-//     single "⬅️ Back" button that returns to wherever the user came from.
-//
-//  New in v5.6:
-//   • Monthly & weekly stats no longer show a combined "Net" line (gold pips
-//     and crypto pips aren't comparable) — each market keeps its own totals.
-//   • Per-market stats now show TWO pip totals: "All TPs" (furthest level
-//     actually reached, same math as before) and "TP1-only" (what you'd
-//     have made if every trade was closed right at TP1). Computed via a
-//     signalId → TP1-pips lookup built from the raw daily rows.
-//   • collapseDaily() now runs GLOBALLY across the whole date range instead
-//     of per-day — fixes an edge case where a trade whose TP1 hit one day
-//     and TP2/TP3 hit the next showed up as two separate trades.
-//   • Trade line format simplified: "GOLD - BUY - TP2 --> +192pips" (no
-//     more "Signal" filler word).
-//   • NEW: 📅 Weekly Statistics — same breakdown, scoped to the current
-//     Monday–Sunday week only. No history/navigation — always "this week".
-//     Admin panel button, /weekstats command, adm_weekly callback.
-//
-//  New in v5.4:
-//   • VISITORS file (visitors.json) — every unique chatId that presses /start
-//     is recorded with first_name, username, first-seen timestamp, and status
-//     (visitor | subscriber | expired). Automatically upgraded to "subscriber"
-//     when approved, back to "expired" when subscription lapses.
-//   • Admin panel shows visitor count. "👥 Subscribers" screen gains a
-//     "👁 All Visitors / Leads" button to browse everyone who ever started.
-//   • screenVisitors() — paginated list (25/page) with chatId, name, username,
-//     status badge, and first-seen date.
-//   • Broadcast now has THREE audience targets:
-//       ① By symbol (existing)
-//       ② 📣 Active subscribers only (existing "ALL")
-//       ③ 📣 Non-subscribers (visitors who never paid / expired) — new
-//       ④ 📣 Everyone (all visitors + all active subscribers) — new
-//
-//  v5.3 (subscriber management):
-//   • screenAdminSubs() now groups by USER (one row per person, not per market).
-//     Each row shows the user's chatId, what they hold, and days remaining.
-//   • Tapping a user opens screenSubUser() — a per-user profile showing all
-//     their active and inactive subs, with individual 🚫 Revoke buttons.
-//   • adm_sub_user_<chatId>  callback → screenSubUser
-//   • adm_revoke_<chatId>_<productId>  callback → adminRevoke (already exists)
-//     then returns to the updated subscriber list.
-//   • Bundle member subs (via bundle wrapper) are hidden from the per-user
-//     display when the wrapper itself is visible — avoids duplicate rows.
-//
-//  v5.2 (monthly stats correctness + formatting):
-//   • collapseDaily() — furthest TP per signal, no double-counting.
-//   • Monthly stats grouped by date with correct pip totals.
-//
-//  v5.1: broadcastSignal() returns msgIds for threaded TP/SL replies.
-//  v5.0: BUNDLES + MONTHLY STATS.
+//  v5.9: weekly-performance button on active single-market + bundle screens.
+//  v5.8: main /start screen weekly-performance tab.
+//  v5.7: public weekly stats from package-selection screens.
+//  v5.6: no cross-market combined Net; TP1-only totals; global collapse.
+//  v5.4: visitors.json lead tracking + broadcast targets.
+//  v5.3: per-user subscriber management with revoke.
+//  v5.1/5.0: threaded replies, bundles, monthly stats.
 // ─────────────────────────────────────────────────────────────────────────────
 import fs from 'fs'
 
@@ -88,6 +43,7 @@ const SUB_FILE      = './subscribers.json'
 const SETTINGS_FILE = './settings.json'
 const DAILY_FILE    = './daily_report.json'
 const VISITORS_FILE = './visitors.json'
+const PREFS_FILE    = './user_prefs.json'
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  SETTINGS STORE
@@ -202,6 +158,7 @@ export function getSymbolsForLauncher() {
     td_symbol: s.td_symbol, oanda_symbol: s.oanda_symbol,
     yahoo_symbol: s.yahoo_symbol, decimals: s.decimals ?? 2,
     timeframes: s.timeframes || getActiveTimeframes(),
+    atr_bands: s.atr_bands || {},
   }))
 }
 
@@ -212,6 +169,96 @@ function nextPayId()        { const ids=getAllPayMethods().map(m=>m.id); let i=1
 
 // ── DAILY REPORT (read-only here) ─────────────────────────────────────────
 function loadDaily() { try { return JSON.parse(fs.readFileSync(DAILY_FILE,'utf8')) } catch { return {} } }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  USER PREFS — per-user notification preferences (v6.0)
+//  { chatId: { keepHolding: true|false } }   keepHolding default = true (ON)
+// ─────────────────────────────────────────────────────────────────────────────
+function loadPrefs()  { try { return JSON.parse(fs.readFileSync(PREFS_FILE,'utf8')) } catch { return {} } }
+function savePrefs(p) { fs.writeFileSync(PREFS_FILE, JSON.stringify(p, null, 2)) }
+
+// Exported — the launcher checks this before sending KEEP HOLDING updates
+// (to the admin directly, and per subscriber via broadcastReply's filter).
+export function keepHoldingEnabled(chatId) {
+  const p = loadPrefs()[String(chatId)]
+  return p?.keepHolding !== false          // default ON
+}
+function setKeepHolding(chatId, on) {
+  const p = loadPrefs(), k = String(chatId)
+  p[k] = { ...(p[k]||{}), keepHolding: !!on }
+  savePrefs(p)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ATR CALIBRATION (v6.0) — per-symbol, per-timeframe regime bands
+//  Fetches ~500 bars per timeframe from TwelveData, computes the rolling
+//  14-period ATR% distribution, and stores p5/p95 as the low-liquidity /
+//  volatile-expansion thresholds. This is what makes forex pairs work —
+//  gold's default bands (e.g. 0.08–0.80% on 15m) sit far above typical
+//  forex ATR%, so every pair was blocked as "low_liquidity".
+// ─────────────────────────────────────────────────────────────────────────────
+const TF_TO_TD = { '1m':'1min','3m':'3min','5m':'5min','15m':'15min','30m':'30min','1h':'1h','2h':'2h','4h':'4h','1d':'1day' }
+
+async function fetchBarsForCalibration(tdSymbol, tf) {
+  const interval = TF_TO_TD[tf] || '15min'
+  const keys = getActiveApiKeys()
+  for (let i = 0; i < Math.max(keys.length, 1); i++) {
+    const key = keys[i % keys.length]; if (!key) break
+    try {
+      const res = await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(tdSymbol)}&interval=${interval}&outputsize=500&timezone=UTC&apikey=${key}`, { signal: AbortSignal.timeout(15000) })
+      const j = await res.json()
+      if (j.code === 429 || /run out|api credits|minute|limit/i.test(j.message||'')) { await new Promise(r=>setTimeout(r,1500)); continue }   // rotate to next key
+      if (j.status === 'error' || !j.values?.length) return null
+      return j.values.map(v => ({ high:+v.high, low:+v.low, close:+v.close })).reverse()   // oldest → newest
+    } catch { /* network error — try next key */ }
+  }
+  return null
+}
+
+// Rolling Wilder ATR% distribution → { p5, p95 } or null if not enough data
+function atrPctDistribution(bars, n = 14) {
+  if (!bars || bars.length < n + 20) return null
+  const tr = []
+  for (let i = 1; i < bars.length; i++) {
+    const pc = bars[i-1].close
+    tr.push(Math.max(bars[i].high - bars[i].low, Math.abs(bars[i].high - pc), Math.abs(bars[i].low - pc)))
+  }
+  let atr = tr.slice(0, n).reduce((a,b)=>a+b,0) / n
+  const pcts = []
+  for (let i = n; i < tr.length; i++) {
+    atr = (atr * (n-1) + tr[i]) / n
+    const close = bars[i+1]?.close
+    if (close > 0) pcts.push(atr / close * 100)
+  }
+  if (pcts.length < 30) return null
+  pcts.sort((a,b)=>a-b)
+  const q = p => pcts[Math.min(pcts.length-1, Math.floor(p * pcts.length))]
+  return { p5:+q(0.05).toFixed(5), p95:+q(0.95).toFixed(5) }
+}
+
+// Calibrate every active timeframe of one symbol; persists atr_bands into
+// settings.json. Returns { ok, msg, bands }. Restart the launcher to apply.
+export async function calibrateSymbol(symId) {
+  const sym = getSymbol(symId); if (!sym) return { ok:false, msg:'Symbol not found.', bands:{} }
+  const tfs = sym.timeframes?.length ? sym.timeframes : ['15m','1h']
+  const bands = {}, details = []
+  for (const tf of tfs) {
+    const bars = await fetchBarsForCalibration(sym.td_symbol, tf)
+    const dist = bars ? atrPctDistribution(bars) : null
+    if (dist) {
+      const atrLow  = Math.max(dist.p5, 0.0005)                 // sanity floor
+      const atrHigh = Math.max(dist.p95, atrLow * 3)            // band must have width
+      bands[tf] = { atrLow:+atrLow.toFixed(5), atrHigh:+atrHigh.toFixed(5), calibratedAt:new Date().toISOString(), bars:bars.length }
+      details.push(`• ${tf}: ${bands[tf].atrLow}% – ${bands[tf].atrHigh}%  (${bars.length} bars)`)
+    } else {
+      details.push(`• ${tf}: ❌ not enough data — keeping current band`)
+    }
+    await new Promise(r=>setTimeout(r,1200))   // stay friendly with per-minute limits
+  }
+  const syms = getSymbols(), s = syms.find(x => x.id === symId)
+  if (s && Object.keys(bands).length) { s.atr_bands = { ...(s.atr_bands||{}), ...bands }; saveSymbols(syms) }
+  return { ok:Object.keys(bands).length > 0, msg:details.join('\n'), bands }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  VISITORS — everyone who has ever pressed /start
@@ -316,9 +363,17 @@ export async function broadcastSignal(sigText, symbolId) {
   return { sent, failed, msgIds }
 }
 
-export async function broadcastReply(alertText, symbolId, msgIds = {}) {
+// opts.keepHolding=true → skip subscribers who turned KEEP HOLDING updates
+// off via /keepholding. TP/SL/BE alerts never set this flag → always sent.
+export async function broadcastReply(alertText, symbolId, msgIds = {}, opts = {}) {
   let subs = symbolId ? activeSubscribersForSymbol(symbolId) : allActiveSubscribers()
   subs = subs.filter(s => !isBundleSub(s))
+  let skipped = 0
+  if (opts.keepHolding) {
+    const before = subs.length
+    subs = subs.filter(s => keepHoldingEnabled(s.chatId))
+    skipped = before - subs.length
+  }
   const seen = new Set(), uniq = []
   for (const s of subs) { if (seen.has(s.chatId)) continue; seen.add(s.chatId); uniq.push(s) }
   let sent=0, failed=0
@@ -335,8 +390,8 @@ export async function broadcastReply(alertText, symbolId, msgIds = {}) {
     } catch { failed++ }
     await new Promise(r=>setTimeout(r,50))
   }
-  console.log(`[reply][${symbolId||'ALL'}] sent=${sent} failed=${failed}`)
-  return { sent, failed }
+  console.log(`[reply][${symbolId||'ALL'}]${opts.keepHolding?' (keep-holding)':''} sent=${sent} failed=${failed} skipped=${skipped}`)
+  return { sent, failed, skipped }
 }
 
 // Send a message to an arbitrary list of chatIds (used for visitor broadcasts)
@@ -580,6 +635,17 @@ async function screenMySubs(chatId, msgId) {
     return `${name} — ${s.status}`
   })
   await editMsg(chatId, msgId, `📊 <b>My Subscriptions</b>\n\n${lines.join('\n')}`, [[{ text:'⬅️ Back', callback_data:'back_home' }]])
+}
+
+// ── PUBLIC STATISTICS PICKER (v6.0 — /statistics, all users) ─────────────
+// Pick any active market (or all markets) → this week's live performance.
+async function screenStatsPicker(chatId, msgId) {
+  const syms = getActiveSymbols()
+  const rows = syms.map(s => [{ text:`${s.emoji||'📊'} ${s.label}`, callback_data:`pwk_${s.id}_stats_menu` }])
+  rows.push([{ text:'🌐 All Markets', callback_data:'pwk_all_stats_menu' }])
+  rows.push([{ text:'⬅️ Back to Menu', callback_data:'back_home' }])
+  const text = `📅 <b>This Week's Performance</b>\n\nPick a market to see this week's live results, or view all markets combined.`
+  return msgId ? editMsg(chatId, msgId, text, rows) : sendInline(chatId, text, rows)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -902,7 +968,6 @@ async function screenSubUser(adminChatId, msgId, targetChatId) {
       lines.push(`${name}\nPlan: ${plan}\nExpires: ${exp} (${daysLeft}d left)\n`)
 
       // Revoke button uses a safe callback — productId is the symbolId or bundleId
-      // We use ~ as a separator since bundle IDs contain underscores
       rows.push([{ text: `🚫 Revoke — ${name}`, callback_data: `adm_revoke_${targetChatId}_${s.symbolId}` }])
     }
   }
@@ -940,11 +1005,17 @@ async function screenSymbolsManager(chatId, msgId) {
 async function screenSymbolView(chatId, msgId, symId) {
   const sym = getSymbol(symId); if (!sym) return
   const subsCount = activeSubscribersForSymbol(symId).length
+  // ATR calibration summary (v6.0)
+  const bands = sym.atr_bands || {}
+  const bandLines = Object.keys(bands).length
+    ? Object.entries(bands).map(([tf,b]) => `   ${tf}: ${b.atrLow}%–${b.atrHigh}%`).join('\n')
+    : '   (not calibrated — using default gold bands)'
   const rows = [
     [{ text:'✏️ Edit Label', callback_data:`adm_sym_edit_label_${symId}` }, { text:'🪙 Edit TD Symbol', callback_data:`adm_sym_edit_td_${symId}` }],
     [{ text:'🔌 Edit OANDA Sym', callback_data:`adm_sym_edit_oanda_${symId}` }, { text:'📈 Edit Yahoo Sym', callback_data:`adm_sym_edit_yahoo_${symId}` }],
     [{ text:'🔢 Edit Decimals', callback_data:`adm_sym_edit_dec_${symId}` }, { text:'😀 Edit Emoji', callback_data:`adm_sym_edit_emoji_${symId}` }],
     [{ text:'📊 Timeframes', callback_data:`adm_sym_tfs_${symId}` }],
+    [{ text:'🎯 Recalibrate ATR', callback_data:`adm_sym_cal_${symId}` }],
     [{ text:'📦 Packages', callback_data:`adm_sym_pkgs_${symId}` }],
     [{ text:'👥 Subscribers', callback_data:`adm_sym_subs_${symId}` }],
     [{ text: sym.active!==false ? '🚫 Disable Symbol' : '✅ Enable Symbol', callback_data:`adm_sym_toggle_${symId}` }],
@@ -952,14 +1023,14 @@ async function screenSymbolView(chatId, msgId, symId) {
     [{ text:'⬅️ Back', callback_data:'adm_symbols' }],
   ]
   await editMsg(chatId,msgId,
-`📊 <b>${sym.emoji||''} ${sym.label}</b>\n\nTwelveData: <code>${sym.td_symbol}</code>\nOANDA: <code>${sym.oanda_symbol}</code>\nYahoo: <code>${sym.yahoo_symbol}</code>\nDecimals: <b>${sym.decimals}</b>\nTimeframes: <b>${(sym.timeframes||[]).join(', ')}</b>\nActive subscribers: <b>${subsCount}</b>\nStatus: ${sym.active!==false?'✅ Active':'❌ Disabled'}`, rows)
+`📊 <b>${sym.emoji||''} ${sym.label}</b>\n\nTwelveData: <code>${sym.td_symbol}</code>\nOANDA: <code>${sym.oanda_symbol}</code>\nYahoo: <code>${sym.yahoo_symbol}</code>\nDecimals: <b>${sym.decimals}</b>\nTimeframes: <b>${(sym.timeframes||[]).join(', ')}</b>\n🎯 ATR bands:\n${bandLines}\nActive subscribers: <b>${subsCount}</b>\nStatus: ${sym.active!==false?'✅ Active':'❌ Disabled'}`, rows)
 }
 async function screenSymbolTFs(chatId, msgId, symId) {
   const sym = getSymbol(symId); if (!sym) return
   const active = sym.timeframes || [], ALL_TF = ['1m','3m','5m','15m','30m','1h','2h','4h','1d']
   const rows = ALL_TF.map(tf => [{ text:`${active.includes(tf)?'✅':'⬜'} ${tf}`, callback_data:`adm_sym_tf_toggle_${symId}_${tf}` }])
   rows.push([{ text:'⬅️ Back', callback_data:`adm_sym_view_${symId}` }])
-  await editMsg(chatId,msgId,`📊 <b>${sym.label} — Timeframes</b>\n\nActive: <b>${active.join(', ')||'none'}</b>`, rows)
+  await editMsg(chatId,msgId,`📊 <b>${sym.label} — Timeframes</b>\n\nActive: <b>${active.join(', ')||'none'}</b>\n\n💡 After changing timeframes, run 🎯 Recalibrate ATR so the new TF gets its own band.`, rows)
 }
 async function screenSymbolPackages(chatId, msgId, symId) {
   const sym = getSymbol(symId); if (!sym) return
@@ -1142,7 +1213,7 @@ async function adminApprove(adminChatId, targetChatId, symId) {
   markVisitorSubscriber(targetChatId)
   const expStr=exp.toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'})
   await send(adminChatId,`✅ Approved ${targetChatId} for ${sym?.label} — ${pkg.label} until ${expStr}`)
-  await send(targetChatId,`🎉 <b>Payment Confirmed!</b>\n\nMarket: <b>${sym?.emoji||''} ${sym?.label}</b>\nPlan: <b>${pkg.label}</b> — Active until <b>${expStr}</b>\n\nSignals will be sent here automatically. 🟡`)
+  await send(targetChatId,`🎉 <b>Payment Confirmed!</b>\n\nMarket: <b>${sym?.emoji||''} ${sym?.label}</b>\nPlan: <b>${pkg.label}</b> — Active until <b>${expStr}</b>\n\nSignals will be sent here automatically. 🟡\n\n💡 Tip: use /keepholding to turn "KEEP HOLDING" updates on/off, and /statistics to see this week's live results.`)
 }
 async function adminDeny(adminChatId, targetChatId, symId) {
   const sub = getSub(targetChatId, symId); if (!sub) return send(adminChatId,`❌ Not found`)
@@ -1166,7 +1237,7 @@ async function adminApproveBundle(adminChatId, targetChatId, bid) {
     granted.push(`${sym.emoji||''} ${sym.label}`)
   }
   await send(adminChatId,`✅ Approved bundle "${bundle.label}" for ${targetChatId} until ${expStr}\nGranted: ${granted.join(', ')||'(no markets!)'}`)
-  await send(targetChatId,`🎉 <b>Bundle Activated!</b>\n\n🎁 <b>${bundle.label}</b> — ${pkg.label}\nActive until <b>${expStr}</b>\n\nIncluded markets:\n${granted.map(g=>'• '+g).join('\n')}\n\nSignals for all included markets will arrive here. 🟡`)
+  await send(targetChatId,`🎉 <b>Bundle Activated!</b>\n\n🎁 <b>${bundle.label}</b> — ${pkg.label}\nActive until <b>${expStr}</b>\n\nIncluded markets:\n${granted.map(g=>'• '+g).join('\n')}\n\nSignals for all included markets will arrive here. 🟡\n\n💡 Tip: use /keepholding to turn "KEEP HOLDING" updates on/off, and /statistics to see this week's live results.`)
 }
 async function adminDenyBundle(adminChatId, targetChatId, bid) {
   const sub = getSub(targetChatId, bid); if (!sub) return send(adminChatId,`❌ Not found`)
@@ -1215,11 +1286,16 @@ async function handleUpdate(upd) {
         const syms=getSymbols(), id=nextSymbolId(data.label)
         syms.push({ id, label:data.label, emoji:text==='none'?'📊':text.trim(), td_symbol:data.td, oanda_symbol:data.oanda, yahoo_symbol:data.yahoo, decimals:data.dec, timeframes:['15m','1h'], active:true, packages:[] })
         saveSymbols(syms); clearSession(chatId)
-        return send(chatId,`✅ <b>Symbol Added!</b>\n\nID: <code>${id}</code>\n\nAdd packages via /admin → Symbols → ${data.label} → Packages`)
+        // Auto-calibrate ATR bands in the background (v6.0) — this is what
+        // makes forex pairs work instead of being blocked as low_liquidity.
+        calibrateSymbol(id)
+          .then(r => send(chatId, `${r.ok?'🎯':'⚠️'} <b>ATR calibration for ${data.label}</b>\n\n${r.msg}\n\n⚠️ Restart the launcher to apply.`))
+          .catch(e => send(chatId, `⚠️ ATR calibration failed for ${data.label}: ${e.message}\nYou can retry via /admin → Symbols → ${data.label} → 🎯 Recalibrate ATR`))
+        return send(chatId,`✅ <b>Symbol Added!</b>\n\nID: <code>${id}</code>\n\n🎯 Auto-calibrating ATR bands now (takes ~10–30s, result will arrive here)…\n\nAdd packages via /admin → Symbols → ${data.label} → Packages`)
       }
 
       if(step==='sym_edit_label') { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.label=text.trim(); saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ Label updated.\n\n/admin`) }
-      if(step==='sym_edit_td')    { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.td_symbol=text.trim(); saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ TwelveData symbol updated.\n\n/admin`) }
+      if(step==='sym_edit_td')    { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.td_symbol=text.trim(); saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ TwelveData symbol updated.\n\n💡 Run 🎯 Recalibrate ATR for this symbol — the data feed changed.\n\n/admin`) }
       if(step==='sym_edit_oanda') { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.oanda_symbol=text==='none'?'':text.trim(); saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ OANDA symbol updated.\n\n/admin`) }
       if(step==='sym_edit_yahoo') { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.yahoo_symbol=text==='none'?'':text.trim(); saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ Yahoo symbol updated.\n\n/admin`) }
       if(step==='sym_edit_dec')   { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s){const n=parseInt(text); s.decimals=isNaN(n)?2:n;} saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ Decimals updated.\n\n/admin`) }
@@ -1310,7 +1386,21 @@ async function handleUpdate(upd) {
       const lines=subs.map(s=>{const exp=new Date(s.expiresAt).toLocaleDateString(),d=Math.ceil((new Date(s.expiresAt)-new Date())/86400000);return `${productLabel(s.symbolId)} — ${s.planLabel} — ${exp} (${d}d)`})
       return send(chatId,`📊 <b>Your Active Subscriptions</b>\n\n${lines.join('\n')}`)
     }
-    if(text==='/help') return send(chatId,`📖 <b>GOLD AI — How It Works</b>\n\n/start — view & subscribe\n/status — your subscriptions`)
+    // ── /keepholding — per-user toggle for KEEP HOLDING updates (v6.0) ──
+    if(text==='/keepholding' || text==='/keep_holding') {
+      const next = !keepHoldingEnabled(chatId)
+      setKeepHolding(chatId, next)
+      return send(chatId,
+`🔁 <b>Keep-Holding Updates: ${next ? 'ON ✅' : 'OFF 🚫'}</b>\n\n`+
+`<b>What is this?</b>\nWhen a new candle closes and your open trade is still valid, the bot sends a "KEEP HOLDING" message confirming the trade stays open (with its current SL and TP progress).\n\n`+
+(next
+  ? `You will now <b>receive</b> these updates.`
+  : `You will <b>no longer receive</b> these updates.\n\nYou still get everything else as normal:\n• New signals (Entry / SL / TP1 / TP2 / TP3)\n• ✅ TP hit alerts\n• 🟦 Break-even alerts\n• ❌ Stop-loss alerts\n• 📈 Daily summaries`)+
+`\n\nSend /keepholding again anytime to switch it back.`)
+    }
+    // ── /statistics — weekly performance picker, open to EVERYONE (v6.0) ──
+    if(text==='/statistics') return screenStatsPicker(chatId, null)
+    if(text==='/help') return send(chatId,`📖 <b>GOLD AI — How It Works</b>\n\n/start — view & subscribe\n/status — your subscriptions\n/statistics — this week's live performance (any market)\n/keepholding — turn "KEEP HOLDING" updates on/off`)
 
     if(!isAdmin) return
 
@@ -1329,6 +1419,11 @@ async function handleUpdate(upd) {
       const lines=subs.map(s=>`• <code>${s.chatId}</code> — ${productLabel(s.symbolId)} — ${s.planLabel} — ${new Date(s.expiresAt).toLocaleDateString()}`)
       return send(chatId,`<b>All Active Subscriptions (${subs.length})</b>\n\n${lines.join('\n')}`)
     }
+    if(parts[0]==='/calibrate' && parts[1]) {
+      await send(chatId, `🎯 Calibrating ATR bands for <code>${parts[1]}</code>… (takes ~10–30s)`)
+      const r = await calibrateSymbol(parts[1])
+      return send(chatId, `${r.ok?'✅':'⚠️'} <b>ATR Calibration ${r.ok?'Complete':'Failed'}</b>\n\n${r.msg}\n\n⚠️ Restart the launcher to apply.`)
+    }
     if(parts[0]==='/approve' && parts[1] && parts[2]) return isBundleId(parts[2]) ? adminApproveBundle(chatId,parts[1],parts[2]) : adminApprove(chatId,parts[1],parts[2])
     if(parts[0]==='/deny'    && parts[1] && parts[2]) return isBundleId(parts[2]) ? adminDenyBundle(chatId,parts[1],parts[2])    : adminDeny(chatId,parts[1],parts[2])
     if(parts[0]==='/revoke'  && parts[1] && parts[2]) return adminRevoke(chatId,parts[1],parts[2])
@@ -1345,6 +1440,7 @@ async function handleUpdate(upd) {
     // ── User flow ──
     if(data==='back_home')  return screenStart(chatId, '', cb.from||{})
     if(data==='my_subs')    return screenMySubs(chatId,msgId)
+    if(data==='stats_menu') return screenStatsPicker(chatId,msgId)
     const symM=data.match(/^sym_(\w+)$/);   if(symM) return screenSymbol(chatId,symM[1],msgId)
     const pkgM=data.match(/^pkg_(\w+)_(\w+)$/);  if(pkgM) return screenPickPayment(chatId,pkgM[1],pkgM[2],msgId)
     const payM=data.match(/^pay_(\w+)_(\w+)_(\w+)$/);  if(payM) return screenPayment(chatId,payM[1],payM[2],payM[3],msgId)
@@ -1356,7 +1452,8 @@ async function handleUpdate(upd) {
     const bconfM=data.match(/^bconfirm_(\w+)_(\w+)_(\w+)$/);  if(bconfM) return screenBundleConfirmPending(chatId,bconfM[1],bconfM[2],bconfM[3],msgId)
     const bjoinM=data.match(/^bcheckjoin_(\w+)_(\w+)_(\w+)$/);  if(bjoinM) return screenBundleCheckJoin(chatId,bjoinM[1],bjoinM[2],bjoinM[3],msgId)
 
-    // Public weekly-performance teaser (shown from package selection screens)
+    // Public weekly-performance teaser (shown from package selection screens,
+    // the main menu, and the /statistics picker)
     // pwk_<symId|all>_<backTarget>  — backTarget is itself a callback_data string
     const pwkM=data.match(/^pwk_([a-z0-9]+)_(.+)$/)
     if(pwkM) return screenPublicWeeklyStats(chatId, msgId, pwkM[1]==='all'?null:pwkM[1], pwkM[2])
@@ -1377,7 +1474,7 @@ async function handleUpdate(upd) {
     if(data==='adm_broadcast_pick')return screenBroadcastPick(chatId,msgId)
     const statsM=data.match(/^adm_stats_(\d{4}-\d{2})$/); if(statsM) return screenMonthlyStats(chatId,msgId,statsM[1])
 
-    // ── NEW v5.3: per-user subscriber view + revoke ──
+    // ── v5.3: per-user subscriber view + revoke ──
     // adm_sub_user_<chatId>  — chatId is all digits
     const subUserM = data.match(/^adm_sub_user_(\d+)$/)
     if (subUserM) return screenSubUser(chatId, msgId, subUserM[1])
@@ -1396,6 +1493,20 @@ async function handleUpdate(upd) {
     const symToggle=data.match(/^adm_sym_toggle_(\w+)$/);  if(symToggle){const syms=getSymbols(),s=syms.find(x=>x.id===symToggle[1]);if(s)s.active=!s.active;saveSymbols(syms);return screenSymbolView(chatId,msgId,symToggle[1])}
     const symDel=data.match(/^adm_sym_delete_(\w+)$/);  if(symDel){saveSymbols(getSymbols().filter(x=>x.id!==symDel[1]));return editMsg(chatId,msgId,`🗑️ Symbol deleted.`,[[{text:'⬅️ Back',callback_data:'adm_symbols'}]])}
     if(data==='adm_sym_add'){setSession(chatId,'sym_add_label',{});return editMsg(chatId,msgId,`➕ <b>Add Symbol — Step 1/6</b>\n\nSend the <b>display name</b>:`,[[{text:'❌ Cancel',callback_data:'adm_symbols'}]])}
+    // 🎯 Recalibrate ATR (v6.0) — refits the low-liquidity/volatile bands to
+    // THIS symbol's real volatility, per timeframe. Restart launcher to apply.
+    const symCal=data.match(/^adm_sym_cal_(\w+)$/)
+    if(symCal){
+      const sym=getSymbol(symCal[1]); if(!sym) return
+      await editMsg(chatId,msgId,`🎯 <b>Calibrating ATR bands for ${sym.label}…</b>\n\nFetching ~500 candles per timeframe from TwelveData — this takes about 10–30 seconds. Result will arrive as a new message.`)
+      try {
+        const r=await calibrateSymbol(symCal[1])
+        await send(chatId, `${r.ok?'✅':'⚠️'} <b>ATR Calibration ${r.ok?'Complete':'Failed'} — ${sym.label}</b>\n\n${r.msg}\n\n⚠️ <b>Restart the launcher</b> to apply the new bands.`)
+      } catch(e) {
+        await send(chatId, `⚠️ Calibration error for ${sym.label}: ${e.message}`)
+      }
+      return screenSymbolView(chatId,msgId,symCal[1])
+    }
     const symEL=data.match(/^adm_sym_edit_label_(\w+)$/); if(symEL){setSession(chatId,'sym_edit_label',{symId:symEL[1]});return editMsg(chatId,msgId,`✏️ Send new <b>display label</b>:`,[[{text:'❌ Cancel',callback_data:`adm_sym_view_${symEL[1]}`}]])}
     const symET=data.match(/^adm_sym_edit_td_(\w+)$/);    if(symET){setSession(chatId,'sym_edit_td',{symId:symET[1]});return editMsg(chatId,msgId,`📡 Send new <b>TwelveData symbol</b>:`,[[{text:'❌ Cancel',callback_data:`adm_sym_view_${symET[1]}`}]])}
     const symEO=data.match(/^adm_sym_edit_oanda_(\w+)$/); if(symEO){setSession(chatId,'sym_edit_oanda',{symId:symEO[1]});return editMsg(chatId,msgId,`🔌 Send new <b>OANDA instrument</b> or <code>none</code>:`,[[{text:'❌ Cancel',callback_data:`adm_sym_view_${symEO[1]}`}]])}
@@ -1499,7 +1610,7 @@ async function handleUpdate(upd) {
 // ── LONG POLLING ──────────────────────────────────────────────────────────
 async function startPolling() {
   const s=loadSettings()
-  console.log('🤖 Gold AI Subscription Bot v5.6 — Weekly Stats + TP1-only Breakdown')
+  console.log('🤖 Gold AI Subscription Bot v6.0 — ATR Calibration + /keepholding + /statistics')
   console.log(`   Channel: ${s.channel} | Admin: ${ADMIN_ID}`)
   console.log(`   Symbols: ${getActiveSymbols().map(x=>`${x.emoji||''}${x.label}`).join(', ')}`)
   console.log(`   Bundles: ${getActiveBundles().map(x=>x.label).join(', ')||'none'}`)
