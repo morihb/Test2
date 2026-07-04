@@ -1,13 +1,22 @@
 // ─────────────────────────────────────────────────────────────
-//  GOLD.AI — v4.3  (multi-symbol · multi-timeframe · SPEED-AWARE · BRAIN)
+//  GOLD.AI — v4.4  (multi-symbol · multi-timeframe · SPEED-AWARE · BRAIN)
 //
-//  What changed vs v4.2 (NO change to the core edge/scoring):
-//   • ADAPTIVE BRAIN GATE — after all normal gates pass, the signal is
-//     checked against signal-brain.mjs, which learns from closed trades
-//     (learning_log.json, written by launcher v10.4). Patterns with ≥5
-//     closed trades, win rate <35% and negative net pips are skipped.
-//     3 consecutive SLs on a symbol|tf → 12h cooldown. FAIL-OPEN: with
-//     no history the bot behaves exactly like v4.2. Disable: BRAIN=0.
+//  What changed vs v4.3 (NO change to the core edge/scoring):
+//   • ADAPTIVE HARD ATR BAND — the absolute sanity band (was fixed at
+//     0.03%–3.0%, tuned for GOLD) now scales with the per-symbol calibrated
+//     band injected by the launcher (ATR_LOW / ATR_HIGH env):
+//       hardLow  = min(0.03, atrLow*0.5)
+//       hardHigh = max(3.0,  atrHigh*2)
+//     Forex pairs (EUR/USD, USD/JPY…) have much lower ATR% than gold and
+//     were being killed by the fixed 0.03% floor even after per-symbol
+//     regime-band calibration. Gold behaviour is unchanged.
+//
+//  v4.3: ADAPTIVE BRAIN GATE — after all normal gates pass, the signal is
+//  checked against signal-brain.mjs, which learns from closed trades
+//  (learning_log.json, written by launcher v10.4). Patterns with ≥5
+//  closed trades, win rate <35% and negative net pips are skipped.
+//  3 consecutive SLs on a symbol|tf → 12h cooldown. FAIL-OPEN: with
+//  no history the bot behaves exactly like v4.2. Disable: BRAIN=0.
 //
 //  v4.2: TRADE PROFILES per timeframe (SCALP/INTRADAY/SWING), candle
 //  confirmation, TP1-vs-spread feasibility, min stop distance floor,
@@ -331,7 +340,10 @@ function analyse(candles,nowMs,cfg){
   const e20=last(ema(prices,20)),e50=last(ema(prices,50))
   const rsi=rsiCalc(prices),macd=macdCalc(prices),bb=bbCalc(prices),st=stochCalc(candles),s20=sma20(candles),atr=atrCalc(candles)
   if(!atr||reg.regime==='low_liquidity') return wait('low liquidity / no ATR',reg,cfg)
-  if(reg.atrPct<0.03||reg.atrPct>3.0) return wait(`ATR ${reg.atrPct?.toFixed(3)}% outside band`,reg,cfg)
+  // v4.4: hard sanity band scales with the per-symbol calibrated band
+  // (forex ATR% is far below gold's — the old fixed 0.03% floor blocked pairs)
+  const hardLow=Math.min(0.03,cfg.atrLow*0.5), hardHigh=Math.max(3.0,cfg.atrHigh*2)
+  if(reg.atrPct<hardLow||reg.atrPct>hardHigh) return wait(`ATR ${reg.atrPct?.toFixed(3)}% outside band`,reg,cfg)
   const news=inNewsBlackout(nowMs); if(news) return wait(`news blackout: ${news}`,reg,cfg)
   let h1Trend='neutral',m15Bos='none'
   if(USE_MTF){ const h1=resampleTF(candles,cfg.trendMin),m15=resampleTF(candles,cfg.structMin)
