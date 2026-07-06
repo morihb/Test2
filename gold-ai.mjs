@@ -1,29 +1,35 @@
 // ─────────────────────────────────────────────────────────────
-//  GOLD.AI — v4.4  (multi-symbol · multi-timeframe · SPEED-AWARE · BRAIN)
+//  GOLD.AI — v4.4b  (multi-symbol · multi-timeframe · SPEED-AWARE)
 //
-//  What changed vs v4.3 (NO change to the core edge/scoring):
-//   • ADAPTIVE HARD ATR BAND — the absolute sanity band (was fixed at
-//     0.03%–3.0%, tuned for GOLD) now scales with the per-symbol calibrated
-//     band injected by the launcher (ATR_LOW / ATR_HIGH env):
+//  This is v4.4 with the BRAIN GATE REMOVED. Nothing else changed —
+//  the adaptive ATR band, trade profiles, scoring, TP/SL logic, and
+//  every gate other than the brain check are identical to v4.4.
+//
+//  Removed vs v4.4:
+//   • `import { brainCheck } from './signal-brain.mjs'`
+//   • the "ADAPTIVE BRAIN GATE" block inside analyse() that could
+//     return a WAIT based on learning_log.json history.
+//   signal-brain.mjs is no longer required by this file at all.
+//
+//  Kept from v4.4 (unchanged):
+//   • ADAPTIVE HARD ATR BAND — the absolute sanity band scales with
+//     the per-symbol calibrated band injected by the launcher
+//     (ATR_LOW / ATR_HIGH env):
 //       hardLow  = min(0.03, atrLow*0.5)
 //       hardHigh = max(3.0,  atrHigh*2)
-//     Forex pairs (EUR/USD, USD/JPY…) have much lower ATR% than gold and
-//     were being killed by the fixed 0.03% floor even after per-symbol
-//     regime-band calibration. Gold behaviour is unchanged.
+//     This is what lets forex pairs run without being falsely
+//     blocked as "low liquidity" by gold-tuned bands.
 //
-//  v4.3: ADAPTIVE BRAIN GATE — after all normal gates pass, the signal is
-//  checked against signal-brain.mjs, which learns from closed trades
-//  (learning_log.json, written by launcher v10.4). Patterns with ≥5
-//  closed trades, win rate <35% and negative net pips are skipped.
-//  3 consecutive SLs on a symbol|tf → 12h cooldown. FAIL-OPEN: with
-//  no history the bot behaves exactly like v4.2. Disable: BRAIN=0.
+//  v4.2 (unchanged): TRADE PROFILES per timeframe (SCALP/INTRADAY/
+//  SWING), candle confirmation, TP1-vs-spread feasibility, min stop
+//  distance floor, off-hours scalp strictness, confluence count.
 //
-//  v4.2: TRADE PROFILES per timeframe (SCALP/INTRADAY/SWING), candle
-//  confirmation, TP1-vs-spread feasibility, min stop distance floor,
-//  off-hours scalp strictness, confluence count.
+//  NOTE: launcher.mjs's logOutcome()/learning_log.json and the
+//  LEARNING_LOG env var are untouched — they're harmless without a
+//  brain to read them, and left in place in case you want to
+//  re-enable the gate later.
 // ─────────────────────────────────────────────────────────────
 import fs from 'fs'
-import { brainCheck } from './signal-brain.mjs'
 
 // ── CONFIG ────────────────────────────────────────────────────
 const TG_TOKEN=process.env.TG_TOKEN||'', TG_CHAT=process.env.TG_CHAT||''
@@ -59,7 +65,6 @@ const KILL_DD_R=envNum('KILL_DD_R',10)
 // SPREAD_TP1_MULT           -> TP1 distance must be >= N × current spread
 // SCALP_OFFHOURS_STRICT=0   -> allow weak off-hours scalps
 // CONFLUENCE_MIN            -> min confluence factors required (0 = display only)
-// BRAIN=0                   -> disable the adaptive brain gate
 const REQUIRE_CANDLE_CONFIRM = process.env.REQUIRE_CANDLE_CONFIRM!=='0'
 const SPREAD_TP1_MIN_MULT    = parseFloat(process.env.SPREAD_TP1_MULT)||6
 const SCALP_OFFHOURS_STRICT  = process.env.SCALP_OFFHOURS_STRICT!=='0'
@@ -340,8 +345,8 @@ function analyse(candles,nowMs,cfg){
   const e20=last(ema(prices,20)),e50=last(ema(prices,50))
   const rsi=rsiCalc(prices),macd=macdCalc(prices),bb=bbCalc(prices),st=stochCalc(candles),s20=sma20(candles),atr=atrCalc(candles)
   if(!atr||reg.regime==='low_liquidity') return wait('low liquidity / no ATR',reg,cfg)
-  // v4.4: hard sanity band scales with the per-symbol calibrated band
-  // (forex ATR% is far below gold's — the old fixed 0.03% floor blocked pairs)
+  // adaptive hard sanity band scales with the per-symbol calibrated band
+  // (forex ATR% is far below gold's — a fixed 0.03% floor blocked pairs)
   const hardLow=Math.min(0.03,cfg.atrLow*0.5), hardHigh=Math.max(3.0,cfg.atrHigh*2)
   if(reg.atrPct<hardLow||reg.atrPct>hardHigh) return wait(`ATR ${reg.atrPct?.toFixed(3)}% outside band`,reg,cfg)
   const news=inNewsBlackout(nowMs); if(news) return wait(`news blackout: ${news}`,reg,cfg)
@@ -394,12 +399,6 @@ function analyse(candles,nowMs,cfg){
   // off-hours scalp strictness
   if(SCALP_OFFHOURS_STRICT && profile.type!=='SWING' && sessionOf(nowMs)==='offhours' && conv<MIN_CONV+0.10)
     return wait('off-hours scalp & weak',reg,cfg,{net,bull,bear})
-
-  // ── ADAPTIVE BRAIN GATE (learns from closed trades; fail-open) ──
-  if(process.env.BRAIN!=='0'){
-    const b=brainCheck({sym:SYMBOL_LABEL,tf:cfg.tframe,regime:reg.regime,session:sessionOf(nowMs),score})
-    if(!b.allow) return wait(`brain: ${b.why}`,reg,cfg,{net,bull,bear})
-  }
 
   // ── SL placement (anchored to wicks, regime-scaled buffer) ──
   const buf = reg.regime==='volatile_expansion' ? atr*0.8 : atr*0.5
