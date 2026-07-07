@@ -1,13 +1,26 @@
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  GOLD.AI — Subscription Bot  v6.0 — ATR Calibration + /keepholding + /statistics
+//  GOLD.AI — Subscription Bot  v6.1 — ATR Calibration + Per-Symbol Spread +
+//  /keepholding + /statistics
 //
-//  New in v6.0:
+//  New in v6.1:
+//   • 💱 PER-SYMBOL SPREAD — fixes forex pairs getting killed by
+//     "TP1 too small vs spread". The engine's SPREAD env defaults to 0.30
+//     (gold-tuned, i.e. 30 pips for a 4-decimal pair) — far too wide for
+//     real forex spreads. Each symbol now stores an optional `spread`
+//     (price units, same units as its `decimals`) in settings.json. The
+//     launcher (v10.6) injects it as SPREAD env per run. Unset → engine
+//     falls back to its own 0.30 default (gold behaviour unchanged).
+//     - Asked when adding a new symbol (with pip examples).
+//     - Editable any time via Symbol view → "💱 Edit Spread".
+//     - Restart the launcher after editing to apply.
+//
+//  v6.0:
 //   • 🎯 PER-SYMBOL ATR CALIBRATION — fixes the "low liquidity" false block
 //     on forex pairs (EUR/USD, USD/JPY, EUR/JPY…). calibrateSymbol() fetches
 //     ~500 bars per timeframe from TwelveData, computes the rolling 14-period
 //     ATR% distribution, and stores p5/p95 as atr_bands[tf]={atrLow,atrHigh}
-//     on the symbol in settings.json. The launcher (v10.5) injects these as
+//     on the symbol in settings.json. The launcher injects these as
 //     ATR_LOW/ATR_HIGH into the engine env per run, so each instrument is
 //     judged against ITS OWN volatility profile instead of gold's.
 //     - Auto-calibrates when a new symbol is added via admin.
@@ -73,7 +86,7 @@ const DEFAULT_SETTINGS = {
     {
       id: 'gold', label: 'GOLD (XAU/USD)', emoji: '🥇',
       td_symbol: 'XAU/USD', oanda_symbol: 'XAU_USD', yahoo_symbol: 'XAUUSD=X', decimals: 2,
-      timeframes: ['15m','1h'], active: true,
+      timeframes: ['15m','1h'], active: true, spread: null,
       packages: [
         { id:'g1', label:'1 Month',  price:50,  days:30,  active:true },
         { id:'g2', label:'3 Months', price:120, days:90,  active:true },
@@ -159,6 +172,7 @@ export function getSymbolsForLauncher() {
     yahoo_symbol: s.yahoo_symbol, decimals: s.decimals ?? 2,
     timeframes: s.timeframes || getActiveTimeframes(),
     atr_bands: s.atr_bands || {},
+    spread: s.spread ?? null,   // price units; null = engine falls back to its own 0.30 default
   }))
 }
 
@@ -1010,12 +1024,13 @@ async function screenSymbolView(chatId, msgId, symId) {
   const bandLines = Object.keys(bands).length
     ? Object.entries(bands).map(([tf,b]) => `   ${tf}: ${b.atrLow}%–${b.atrHigh}%`).join('\n')
     : '   (not calibrated — using default gold bands)'
+  const spreadLine = sym.spread != null ? `${sym.spread}` : '0.30 (default/gold)'
   const rows = [
     [{ text:'✏️ Edit Label', callback_data:`adm_sym_edit_label_${symId}` }, { text:'🪙 Edit TD Symbol', callback_data:`adm_sym_edit_td_${symId}` }],
     [{ text:'🔌 Edit OANDA Sym', callback_data:`adm_sym_edit_oanda_${symId}` }, { text:'📈 Edit Yahoo Sym', callback_data:`adm_sym_edit_yahoo_${symId}` }],
     [{ text:'🔢 Edit Decimals', callback_data:`adm_sym_edit_dec_${symId}` }, { text:'😀 Edit Emoji', callback_data:`adm_sym_edit_emoji_${symId}` }],
     [{ text:'📊 Timeframes', callback_data:`adm_sym_tfs_${symId}` }],
-    [{ text:'🎯 Recalibrate ATR', callback_data:`adm_sym_cal_${symId}` }],
+    [{ text:'🎯 Recalibrate ATR', callback_data:`adm_sym_cal_${symId}` }, { text:'💱 Edit Spread', callback_data:`adm_sym_edit_spread_${symId}` }],
     [{ text:'📦 Packages', callback_data:`adm_sym_pkgs_${symId}` }],
     [{ text:'👥 Subscribers', callback_data:`adm_sym_subs_${symId}` }],
     [{ text: sym.active!==false ? '🚫 Disable Symbol' : '✅ Enable Symbol', callback_data:`adm_sym_toggle_${symId}` }],
@@ -1023,7 +1038,7 @@ async function screenSymbolView(chatId, msgId, symId) {
     [{ text:'⬅️ Back', callback_data:'adm_symbols' }],
   ]
   await editMsg(chatId,msgId,
-`📊 <b>${sym.emoji||''} ${sym.label}</b>\n\nTwelveData: <code>${sym.td_symbol}</code>\nOANDA: <code>${sym.oanda_symbol}</code>\nYahoo: <code>${sym.yahoo_symbol}</code>\nDecimals: <b>${sym.decimals}</b>\nTimeframes: <b>${(sym.timeframes||[]).join(', ')}</b>\n🎯 ATR bands:\n${bandLines}\nActive subscribers: <b>${subsCount}</b>\nStatus: ${sym.active!==false?'✅ Active':'❌ Disabled'}`, rows)
+`📊 <b>${sym.emoji||''} ${sym.label}</b>\n\nTwelveData: <code>${sym.td_symbol}</code>\nOANDA: <code>${sym.oanda_symbol}</code>\nYahoo: <code>${sym.yahoo_symbol}</code>\nDecimals: <b>${sym.decimals}</b>\nTimeframes: <b>${(sym.timeframes||[]).join(', ')}</b>\n🎯 ATR bands:\n${bandLines}\n💱 Spread: <b>${spreadLine}</b>\nActive subscribers: <b>${subsCount}</b>\nStatus: ${sym.active!==false?'✅ Active':'❌ Disabled'}`, rows)
 }
 async function screenSymbolTFs(chatId, msgId, symId) {
   const sym = getSymbol(symId); if (!sym) return
@@ -1283,15 +1298,36 @@ async function handleUpdate(upd) {
       if(step==='sym_add_yahoo')   { setSession(chatId,'sym_add_dec',{...data,yahoo:text==='none'?'':text.trim()});   return send(chatId,`🔢 Decimal places:\n(2 for gold/forex, 5 for pairs, 0 for indices)`) }
       if(step==='sym_add_dec')     { const n=parseInt(text); setSession(chatId,'sym_add_emoji',{...data,dec:isNaN(n)?2:n}); return send(chatId,`😀 Emoji (e.g. 💶 🪙 📈) or <code>none</code>:`) }
       if(step==='sym_add_emoji') {
+        setSession(chatId,'sym_add_spread',{...data,emoji:text==='none'?'📊':text.trim()})
+        return send(chatId,
+`💱 <b>Typical spread</b> for "<b>${data.label}</b>" — in <b>price units</b>, not pips:
+
+Examples:
+• Gold (XAU/USD): <code>0.30</code>
+• EUR/USD: <code>0.00015</code>  (~1.5 pip)
+• GBP/USD: <code>0.0002</code>   (~2 pip)
+• USD/JPY: <code>0.02</code>     (~2 pip)
+• GBP/JPY: <code>0.03</code>     (~3 pip)
+
+💡 How to find this: check your broker's spread for this pair (in pips), then convert:
+• 4-decimal pairs (most majors, e.g. EUR/USD): spread ÷ 10000
+• 2-decimal pairs (JPY pairs, gold): spread ÷ 100
+
+Send <code>default</code> to use gold's spread (0.30) — only correct if this instrument's price units resemble gold's.`)
+      }
+      if(step==='sym_add_spread') {
+        const raw=text.trim().toLowerCase()
+        const v = raw==='default' ? null : parseFloat(text)
+        const spreadVal = (v!=null && !isNaN(v) && v>0) ? v : null
         const syms=getSymbols(), id=nextSymbolId(data.label)
-        syms.push({ id, label:data.label, emoji:text==='none'?'📊':text.trim(), td_symbol:data.td, oanda_symbol:data.oanda, yahoo_symbol:data.yahoo, decimals:data.dec, timeframes:['15m','1h'], active:true, packages:[] })
+        syms.push({ id, label:data.label, emoji:data.emoji, td_symbol:data.td, oanda_symbol:data.oanda, yahoo_symbol:data.yahoo, decimals:data.dec, timeframes:['15m','1h'], active:true, packages:[], spread:spreadVal })
         saveSymbols(syms); clearSession(chatId)
         // Auto-calibrate ATR bands in the background (v6.0) — this is what
         // makes forex pairs work instead of being blocked as low_liquidity.
         calibrateSymbol(id)
           .then(r => send(chatId, `${r.ok?'🎯':'⚠️'} <b>ATR calibration for ${data.label}</b>\n\n${r.msg}\n\n⚠️ Restart the launcher to apply.`))
           .catch(e => send(chatId, `⚠️ ATR calibration failed for ${data.label}: ${e.message}\nYou can retry via /admin → Symbols → ${data.label} → 🎯 Recalibrate ATR`))
-        return send(chatId,`✅ <b>Symbol Added!</b>\n\nID: <code>${id}</code>\n\n🎯 Auto-calibrating ATR bands now (takes ~10–30s, result will arrive here)…\n\nAdd packages via /admin → Symbols → ${data.label} → Packages`)
+        return send(chatId,`✅ <b>Symbol Added!</b>\n\nID: <code>${id}</code>\nSpread: <b>${spreadVal ?? '0.30 (default/gold)'}</b>\n\n🎯 Auto-calibrating ATR bands now (takes ~10–30s, result will arrive here)…\n\nAdd packages via /admin → Symbols → ${data.label} → Packages`)
       }
 
       if(step==='sym_edit_label') { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.label=text.trim(); saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ Label updated.\n\n/admin`) }
@@ -1300,6 +1336,13 @@ async function handleUpdate(upd) {
       if(step==='sym_edit_yahoo') { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.yahoo_symbol=text==='none'?'':text.trim(); saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ Yahoo symbol updated.\n\n/admin`) }
       if(step==='sym_edit_dec')   { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s){const n=parseInt(text); s.decimals=isNaN(n)?2:n;} saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ Decimals updated.\n\n/admin`) }
       if(step==='sym_edit_emoji') { const syms=getSymbols(),s=syms.find(x=>x.id===data.symId); if(s)s.emoji=text==='none'?'📊':text.trim(); saveSymbols(syms); clearSession(chatId); return send(chatId,`✅ Emoji updated.\n\n/admin`) }
+      if(step==='sym_edit_spread') {
+        const raw=text.trim().toLowerCase()
+        const syms=getSymbols(),s=syms.find(x=>x.id===data.symId)
+        if(s){ const v = raw==='default' ? null : parseFloat(text); s.spread = (v!=null && !isNaN(v) && v>0) ? v : null }
+        saveSymbols(syms); clearSession(chatId)
+        return send(chatId,`✅ Spread updated.\n\n⚠️ Restart the launcher to apply.\n\n/admin`)
+      }
 
       if(step==='sym_pkg_add_label') { setSession(chatId,'sym_pkg_add_price',{...data,label:text}); return send(chatId,`💰 Price in USD for "<b>${text}</b>":`) }
       if(step==='sym_pkg_add_price') { const p=parseFloat(text); if(isNaN(p)||p<=0) return send(chatId,'❌ Invalid price:'); setSession(chatId,'sym_pkg_add_days',{...data,price:p}); return send(chatId,`📅 Duration in days:`) }
@@ -1492,7 +1535,7 @@ async function handleUpdate(upd) {
     const symView=data.match(/^adm_sym_view_(\w+)$/);   if(symView) return screenSymbolView(chatId,msgId,symView[1])
     const symToggle=data.match(/^adm_sym_toggle_(\w+)$/);  if(symToggle){const syms=getSymbols(),s=syms.find(x=>x.id===symToggle[1]);if(s)s.active=!s.active;saveSymbols(syms);return screenSymbolView(chatId,msgId,symToggle[1])}
     const symDel=data.match(/^adm_sym_delete_(\w+)$/);  if(symDel){saveSymbols(getSymbols().filter(x=>x.id!==symDel[1]));return editMsg(chatId,msgId,`🗑️ Symbol deleted.`,[[{text:'⬅️ Back',callback_data:'adm_symbols'}]])}
-    if(data==='adm_sym_add'){setSession(chatId,'sym_add_label',{});return editMsg(chatId,msgId,`➕ <b>Add Symbol — Step 1/6</b>\n\nSend the <b>display name</b>:`,[[{text:'❌ Cancel',callback_data:'adm_symbols'}]])}
+    if(data==='adm_sym_add'){setSession(chatId,'sym_add_label',{});return editMsg(chatId,msgId,`➕ <b>Add Symbol — Step 1/7</b>\n\nSend the <b>display name</b>:`,[[{text:'❌ Cancel',callback_data:'adm_symbols'}]])}
     // 🎯 Recalibrate ATR (v6.0) — refits the low-liquidity/volatile bands to
     // THIS symbol's real volatility, per timeframe. Restart launcher to apply.
     const symCal=data.match(/^adm_sym_cal_(\w+)$/)
@@ -1506,6 +1549,15 @@ async function handleUpdate(upd) {
         await send(chatId, `⚠️ Calibration error for ${sym.label}: ${e.message}`)
       }
       return screenSymbolView(chatId,msgId,symCal[1])
+    }
+    // 💱 Edit Spread (v6.1)
+    const symESpr=data.match(/^adm_sym_edit_spread_(\w+)$/)
+    if(symESpr){
+      const sym=getSymbol(symESpr[1]); if(!sym) return
+      setSession(chatId,'sym_edit_spread',{symId:symESpr[1]})
+      return editMsg(chatId,msgId,
+`💱 <b>Edit Spread — ${sym.label}</b>\n\nCurrent: <b>${sym.spread ?? '0.30 (default/gold)'}</b>\n\nSend the new spread in <b>price units</b> (not pips), or <code>default</code> to reset to gold's 0.30:\n\nExamples: EUR/USD ≈ <code>0.00015</code> · GBP/JPY ≈ <code>0.03</code>`,
+        [[{text:'❌ Cancel',callback_data:`adm_sym_view_${symESpr[1]}`}]])
     }
     const symEL=data.match(/^adm_sym_edit_label_(\w+)$/); if(symEL){setSession(chatId,'sym_edit_label',{symId:symEL[1]});return editMsg(chatId,msgId,`✏️ Send new <b>display label</b>:`,[[{text:'❌ Cancel',callback_data:`adm_sym_view_${symEL[1]}`}]])}
     const symET=data.match(/^adm_sym_edit_td_(\w+)$/);    if(symET){setSession(chatId,'sym_edit_td',{symId:symET[1]});return editMsg(chatId,msgId,`📡 Send new <b>TwelveData symbol</b>:`,[[{text:'❌ Cancel',callback_data:`adm_sym_view_${symET[1]}`}]])}
@@ -1610,7 +1662,7 @@ async function handleUpdate(upd) {
 // ── LONG POLLING ──────────────────────────────────────────────────────────
 async function startPolling() {
   const s=loadSettings()
-  console.log('🤖 Gold AI Subscription Bot v6.0 — ATR Calibration + /keepholding + /statistics')
+  console.log('🤖 Gold AI Subscription Bot v6.1 — ATR Calibration + Per-Symbol Spread + /keepholding + /statistics')
   console.log(`   Channel: ${s.channel} | Admin: ${ADMIN_ID}`)
   console.log(`   Symbols: ${getActiveSymbols().map(x=>`${x.emoji||''}${x.label}`).join(', ')}`)
   console.log(`   Bundles: ${getActiveBundles().map(x=>x.label).join(', ')||'none'}`)
@@ -1638,12 +1690,12 @@ async function runExpiryChecker(){
       const name=productLabel(sub.symbolId)
       if(days===3&&!sub.warned3d){
         upsertSub(sub.chatId,sub.symbolId,{warned3d:true})
-        await send(sub.chatId,`\u26a0\ufe0f <b>Subscription Expiring Soon</b>\n\n${name} expires in <b>3 days</b>.\n\nRenew: /start`).catch(()=>{})
+        await send(sub.chatId,`⚠️ <b>Subscription Expiring Soon</b>\n\n${name} expires in <b>3 days</b>.\n\nRenew: /start`).catch(()=>{})
       }
       if(exp<=now){
         upsertSub(sub.chatId,sub.symbolId,{status:'expired'})
         markVisitorExpired(sub.chatId)
-        await send(sub.chatId,`\u274c <b>Subscription Expired</b>\n\n${name} access has ended.\n\n/start \u2014 renew`).catch(()=>{})
+        await send(sub.chatId,`❌ <b>Subscription Expired</b>\n\n${name} access has ended.\n\n/start — renew`).catch(()=>{})
       }
     }
   },60*60*1000)
