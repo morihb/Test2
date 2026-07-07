@@ -1,6 +1,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  launcher.mjs  —  v10.6 (Multi-Symbol + Multi-Timeframe + LEARNING LOG +
-//  PER-SYMBOL SPREAD)
+//  launcher.mjs  —  v10.7 (Multi-Symbol + Multi-Timeframe + LEARNING LOG +
+//  PER-SYMBOL SPREAD + STRICT HTF GATE)
+//
+//  New in v10.7:
+//   • STRICT HTF DIRECTION GATE — the old "counter-trend scalp" exception
+//     for 5m is removed. Now ANY timeframe opposing an open trade on ANY
+//     higher timeframe (same symbol) is hard-blocked, no exceptions. If 1h
+//     holds BUY, neither 15m nor 5m can send SELL — only BUY or WAIT — until
+//     that 1h trade fully closes (TP3/SL/BE).
 //
 //  New in v10.6:
 //   • 💱 PER-SYMBOL SPREAD INJECTION — injects env.SPREAD from
@@ -15,9 +22,6 @@
 //     opposite-direction signal on that SAME timeframe is suppressed. The
 //     open trade must fully close (TP3, SL, or break-even) before the
 //     direction can flip. No more "SELL sent while the BUY is still live".
-//   • 5m ↔ 15m HARD GATE — 5m may NEVER oppose an open 15m trade. Opposing
-//     an open 1h/4h/1d trade is still allowed as a flagged counter-trend
-//     scalp (unchanged). 15m/1h/4h/1d keep full HTF blocking as before.
 //   • CALIBRATED ATR BANDS — if the symbol has per-timeframe atr_bands in
 //     settings.json (set via admin "🎯 Recalibrate ATR" or auto on symbol
 //     add), the launcher injects ATR_LOW/ATR_HIGH into the engine env so
@@ -448,34 +452,20 @@ async function runSignalCycle(symObj, tf, isStartup=false) {
         return
       }
 
-      // HTF DIRECTION GATE (v10.5):
-      //  • 15m/1h/4h/1d: blocked from opposing ANY open higher-TF trade.
-      //  • 5m: HARD-blocked if it opposes an open 15m trade — no exceptions.
-      //        Opposing only 1h/4h/1d is allowed as a counter-trend scalp
-      //        (flagged in the message), same as before.
+      // HTF DIRECTION GATE (v10.7) — HARD block, no exceptions.
+      // Any timeframe opposing an open trade on ANY higher timeframe for the
+      // same symbol is suppressed outright. If 1h holds BUY, neither 15m nor
+      // 5m may send SELL — only BUY (or WAIT) — until that 1h trade fully
+      // closes (TP3/SL/BE). Previously 5m was allowed to fire a flagged
+      // "counter-trend scalp" against 1h/4h/1d; that exception is removed.
       const htf=higherTfDirection(loadState(), symObj.id, tf, symObj.timeframes)
-      const counterTrend = htf && htf.dir!==sig.direction
-
-      if(counterTrend && tf!=='5m'){
-        console.log(`[${symObj.label} ${tf}] ⛔ ${sig.direction} suppressed — higher TF ${htf.tf} holds ${htf.dir}`)
+      if(htf && htf.dir!==sig.direction){
+        console.log(`[${symObj.label} ${tf}] ⛔ ${sig.direction} suppressed — higher TF ${htf.tf} holds ${htf.dir} (reversal blocked until it closes)`)
         return
-      }
-      if(tf==='5m'){
-        const m15=openTrade(loadState(), symObj.id, '15m')
-        if(m15 && m15.direction && m15.direction!==sig.direction){
-          console.log(`[${symObj.label} ${tf}] ⛔ ${sig.direction} suppressed — 15m holds ${m15.direction} (5m may not oppose 15m)`)
-          return
-        }
-      }
-      if(counterTrend && tf==='5m'){
-        console.log(`[${symObj.label} ${tf}] ⚠️ ${sig.direction} allowed as counter-trend scalp — higher TF ${htf.tf} holds ${htf.dir}`)
       }
 
       const entry=parseFloat(sig.entry), sl=parseFloat(sig.sl)
       const tp1=parseFloat(sig.tp1), tp2=parseFloat(sig.tp2), tp3=parseFloat(sig.tp3)
-      const counterTrendNote = counterTrend
-        ? `\n⚠️ Counter-trend scalp: ${htf.tf.toUpperCase()} is currently ${htf.dir} — this is a fast 5m play against that trend. Manage risk tightly.`
-        : ''
       const msgText=
 `${dirIcon(sig.direction)} <b>${symObj.label} ${tf.toUpperCase()} — ${sig.direction}</b> (score ${sig.score}/100 ${sig.tier})
 H1 ${sig.h1Trend} · ${sig.session}
@@ -484,7 +474,7 @@ H1 ${sig.h1Trend} · ${sig.session}
 ✅ TP1 ${tp1.toFixed(dp)} (+${toPips(tp1-entry,dp)} pips)
 ✅ TP2 ${tp2.toFixed(dp)} (+${toPips(tp2-entry,dp)} pips)
 ✅ TP3 ${tp3.toFixed(dp)} (+${toPips(tp3-entry,dp)} pips)
-🛡️ SL triggers immediately if price touches ${sl.toFixed(dp)}.${counterTrendNote}
+🛡️ SL triggers immediately if price touches ${sl.toFixed(dp)}.
 ⚠️ Manage risk. Not financial advice.`
       // lastBarTs = signal bar's open (1-min). Filter is b.ts > lastBarTs so the NEXT
       // 1-min bar is the first one evaluated. Catches TP/SL within seconds of touch.
@@ -545,11 +535,11 @@ function scheduleDailySummary(){
 // ── STARTUP ───────────────────────────────────────────────────────────────
 const symbols=getLiveSymbols()
 
-console.log('🚀 Gold AI Launcher v10.6 — Per-Symbol Spread + Reversal Lock + 5m/15m Gate + Calibrated ATR')
+console.log('🚀 Gold AI Launcher v10.7 — Strict HTF Gate + Per-Symbol Spread + Reversal Lock + Calibrated ATR')
 console.log(`   Symbols: ${symbols.map(s=>`${s.emoji}${s.label}[${s.timeframes.join(',')}]`).join('  ')}`)
 console.log(`   ⚡ TP/SL watcher: every 1 min — TP & SL both trigger on wick touch`)
 console.log(`   🔒 Same-TF reversal lock: opposite signal suppressed until TP3/SL/BE`)
-console.log(`   🔒 5m ↔ 15m gate: 5m never opposes an open 15m trade`)
+console.log(`   🔒 Strict HTF gate: any TF opposing an open HIGHER-TF trade is hard-blocked (no counter-trend scalp exception)`)
 console.log(`   💱 Per-symbol spread: injected from admin config, falls back to engine's 0.30 default`)
 console.log(`   🔁 KEEP HOLDING updates respect the /keepholding user toggle`)
 console.log(`   🔑 API keys: ${getLiveApiKeys().length} active`)
