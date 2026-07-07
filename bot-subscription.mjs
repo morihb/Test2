@@ -451,6 +451,49 @@ async function isMember(chatId) {
   catch { return false }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  BOT COMMAND MENU (the native "/" list Telegram shows above the keyboard)
+//  Uses per-chat command SCOPES via setMyCommands, so the menu can differ
+//  per user without any custom UI:
+//   • DEFAULT_COMMANDS  (scope: default) — shown to everyone, including
+//     people who have never subscribed. Includes /statistics.
+//   • SUBSCRIBER_COMMANDS (scope: chat, this user's chatId) — overrides the
+//     default for that one chat, adding /keepholding. Applied the moment a
+//     payment is approved; removed the moment their last active subscription
+//     ends (revoke or natural expiry), which falls back to DEFAULT_COMMANDS.
+// ─────────────────────────────────────────────────────────────────────────────
+const DEFAULT_COMMANDS = [
+  { command:'start',      description:'View plans & subscribe' },
+  { command:'status',     description:'Check my subscription' },
+  { command:'statistics', description:"This week's live performance" },
+  { command:'help',       description:'How to read signals' },
+]
+const SUBSCRIBER_COMMANDS = [
+  ...DEFAULT_COMMANDS,
+  { command:'keepholding', description:'Toggle "KEEP HOLDING" updates' },
+]
+
+// Call once at startup — sets the global fallback menu for anyone without
+// a chat-specific override (i.e. everyone who isn't currently subscribed).
+async function setDefaultCommandMenu() {
+  await tgCall('setMyCommands', { commands: DEFAULT_COMMANDS, scope: { type:'default' } })
+}
+
+// Re-derives whether chatId currently holds ANY active subscription and
+// pushes the matching command list to that chat's scope. Safe to call
+// repeatedly (idempotent) — call after any approve/revoke/expiry event.
+async function syncUserCommandMenu(chatId) {
+  const hasActive = getAllSubsForUser(chatId).some(s => isActive(s))
+  const scope = { type:'chat', chat_id:Number(chatId) }
+  if (hasActive) {
+    await tgCall('setMyCommands', { commands: SUBSCRIBER_COMMANDS, scope })
+  } else {
+    // Remove the chat-specific override so this chat falls back to
+    // DEFAULT_COMMANDS (scope default) automatically — no /keepholding.
+    await tgCall('deleteMyCommands', { scope })
+  }
+}
+
 // ── DISPLAY HELPER ────────────────────────────────────────────────────────
 function productLabel(productId) {
   if (isBundleId(productId)) { const b=getBundle(productId); return `🎁 ${b?.label||productId}` }
@@ -1226,6 +1269,7 @@ async function adminApprove(adminChatId, targetChatId, symId) {
   const now=new Date(), exp=new Date(now.getTime()+pkg.days*86400000)
   upsertSub(targetChatId, symId, { status:'active', plan:pkg.id, planLabel:pkg.label, price:pkg.price, activatedAt:now.toISOString(), expiresAt:exp.toISOString(), pendingPkg:null, pendingMethod:null })
   markVisitorSubscriber(targetChatId)
+  await syncUserCommandMenu(targetChatId)   // unlocks /keepholding in their "/" menu
   const expStr=exp.toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'})
   await send(adminChatId,`✅ Approved ${targetChatId} for ${sym?.label} — ${pkg.label} until ${expStr}`)
   await send(targetChatId,`🎉 <b>Payment Confirmed!</b>\n\nMarket: <b>${sym?.emoji||''} ${sym?.label}</b>\nPlan: <b>${pkg.label}</b> — Active until <b>${expStr}</b>\n\nSignals will be sent here automatically. 🟡\n\n💡 Tip: use /keepholding to turn "KEEP HOLDING" updates on/off, and /statistics to see this week's live results.`)
@@ -1245,6 +1289,7 @@ async function adminApproveBundle(adminChatId, targetChatId, bid) {
   const now=new Date(), exp=new Date(now.getTime()+pkg.days*86400000), expStr=exp.toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'})
   upsertSub(targetChatId, bid, { status:'active', plan:pkg.id, planLabel:`${bundle.label} — ${pkg.label}`, price:pkg.price, activatedAt:now.toISOString(), expiresAt:exp.toISOString(), isBundle:true, pendingPkg:null, pendingMethod:null })
   markVisitorSubscriber(targetChatId)
+  await syncUserCommandMenu(targetChatId)   // unlocks /keepholding in their "/" menu
   const granted=[]
   for (const symId of (bundle.symbols||[])) {
     const sym=getSymbol(symId); if(!sym) continue
@@ -1269,11 +1314,13 @@ async function adminRevoke(adminChatId, targetChatId, productId) {
     for (const s of Object.values(data)) {
       if (s.chatId===String(targetChatId) && s.viaBundle===productId) upsertSub(targetChatId,s.symbolId,{status:'revoked',expiresAt:new Date().toISOString()})
     }
+    await syncUserCommandMenu(targetChatId)   // drops /keepholding if this was their last active sub
     await send(adminChatId,`✅ Revoked bundle ${bundle?.label} (and its markets) from ${targetChatId}.`)
     await send(targetChatId,`⚠️ Your 🎁 ${bundle?.label||productId} bundle has been revoked.`)
     return
   }
   upsertSub(targetChatId,productId,{status:'revoked',expiresAt:new Date().toISOString()})
+  await syncUserCommandMenu(targetChatId)   // drops /keepholding if this was their last active sub
   const sym=getSymbol(productId)
   await send(adminChatId,`✅ Revoked ${targetChatId} from ${sym?.label||productId}.`)
   await send(targetChatId,`⚠️ Your ${sym?.label||productId} subscription has been revoked.`)
@@ -1667,6 +1714,10 @@ async function startPolling() {
   console.log(`   Symbols: ${getActiveSymbols().map(x=>`${x.emoji||''}${x.label}`).join(', ')}`)
   console.log(`   Bundles: ${getActiveBundles().map(x=>x.label).join(', ')||'none'}`)
   console.log(`   API Keys: ${(s.twelvedata_keys||[]).filter(k=>k.active).length} active`)
+  // Global "/" menu fallback: /start, /status, /statistics, /help for everyone.
+  // Active subscribers get an additional per-chat override with /keepholding
+  // (applied on approval, removed on revoke/expiry — see syncUserCommandMenu).
+  await setDefaultCommandMenu().catch(e=>console.error('[commands] default menu failed:', e.message))
   let offset=0
   while(true){
     try{
@@ -1695,6 +1746,7 @@ async function runExpiryChecker(){
       if(exp<=now){
         upsertSub(sub.chatId,sub.symbolId,{status:'expired'})
         markVisitorExpired(sub.chatId)
+        await syncUserCommandMenu(sub.chatId).catch(()=>{})   // drops /keepholding if no active subs remain
         await send(sub.chatId,`❌ <b>Subscription Expired</b>\n\n${name} access has ended.\n\n/start — renew`).catch(()=>{})
       }
     }
