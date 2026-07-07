@@ -1,7 +1,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  launcher.mjs  —  v10.5 (Multi-Symbol + Multi-Timeframe + LEARNING LOG)
+//  launcher.mjs  —  v10.6 (Multi-Symbol + Multi-Timeframe + LEARNING LOG +
+//  PER-SYMBOL SPREAD)
 //
-//  New in v10.5:
+//  New in v10.6:
+//   • 💱 PER-SYMBOL SPREAD INJECTION — injects env.SPREAD from
+//     symObj.spread (set via admin → Symbols → 💱 Edit Spread) the same
+//     way ATR_LOW/ATR_HIGH are already injected. Fixes forex pairs
+//     getting "TP1 too small vs spread" WAITs from gold's 0.30 default
+//     spread (≈30 pips on a 4-decimal pair — 10x too wide for most FX).
+//     Unset symbols keep the engine's own 0.30 default (gold unaffected).
+//
+//  v10.5:
 //   • SAME-TF REVERSAL LOCK — while a timeframe holds an OPEN trade, an
 //     opposite-direction signal on that SAME timeframe is suppressed. The
 //     open trade must fully close (TP3, SL, or break-even) before the
@@ -123,8 +132,10 @@ function addToDaily(trade) {
   saveDaily(daily)
 }
 
-// ── LEARNING LOG (feeds signal-brain.mjs) ─────────────────────────────────
+// ── LEARNING LOG (feeds signal-brain.mjs, if/when re-enabled) ──────────────
 // One row per CLOSED trade — the FINAL outcome only (furthest level reached).
+// Kept as-is: harmless to write even with no brain gate consuming it, and
+// preserves history in case the brain gate is re-enabled later.
 const LEARN_FILE = './learning_log.json'
 function logOutcome(symObj, tf, sig, result, pips, sign) {
   let a=[]; try{a=JSON.parse(fs.readFileSync(LEARN_FILE,'utf8'))}catch{}
@@ -366,6 +377,17 @@ async function runSignalCycle(symObj, tf, isStartup=false) {
     env.ATR_HIGH = String(band.atrHigh)
   }
 
+  // Per-symbol SPREAD (v10.6) — set via admin "💱 Edit Spread" (in price
+  // units, same units as the symbol's decimals). Without this, every symbol
+  // uses the engine's 0.30 default, which is gold-tuned and far too wide for
+  // most forex pairs — it silently fails the "TP1 vs spread" feasibility
+  // gate and turns every otherwise-valid signal into a WAIT. Unset symbols
+  // (spread === null) fall through to the engine's own 0.30 default exactly
+  // as before, so gold's behaviour is unchanged.
+  if (symObj.spread != null) {
+    env.SPREAD = String(symObj.spread)
+  }
+
   // Run engine in ISOLATED dir so it can't touch the launcher's bot_state.json
   const {stdout,stderr}=await exec('node',[ENGINE_SCRIPT,'check'],{env,timeout:60000,cwd:path.resolve(ENGINE_DIR)})
   if(stdout) console.log(`[${symObj.label} ${tf}]`,stdout.trim())
@@ -523,12 +545,12 @@ function scheduleDailySummary(){
 // ── STARTUP ───────────────────────────────────────────────────────────────
 const symbols=getLiveSymbols()
 
-console.log('🚀 Gold AI Launcher v10.5 — Reversal Lock + 5m/15m Gate + Calibrated ATR')
+console.log('🚀 Gold AI Launcher v10.6 — Per-Symbol Spread + Reversal Lock + 5m/15m Gate + Calibrated ATR')
 console.log(`   Symbols: ${symbols.map(s=>`${s.emoji}${s.label}[${s.timeframes.join(',')}]`).join('  ')}`)
 console.log(`   ⚡ TP/SL watcher: every 1 min — TP & SL both trigger on wick touch`)
 console.log(`   🔒 Same-TF reversal lock: opposite signal suppressed until TP3/SL/BE`)
 console.log(`   🔒 5m ↔ 15m gate: 5m never opposes an open 15m trade`)
-console.log(`   🧠 Brain: closed trades → learning_log.json (BRAIN=0 to disable gate)`)
+console.log(`   💱 Per-symbol spread: injected from admin config, falls back to engine's 0.30 default`)
 console.log(`   🔁 KEEP HOLDING updates respect the /keepholding user toggle`)
 console.log(`   🔑 API keys: ${getLiveApiKeys().length} active`)
 console.log(`   💰 Account: $${getAccountSize()} · Risk ${getRiskPct()}%`)
