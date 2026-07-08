@@ -64,9 +64,9 @@ try { fs.mkdirSync(ENGINE_DIR, { recursive: true }) } catch {}
 const ENGINE_TRADE_LOG = path.join(ENGINE_DIR, 'trade_log.json')
 const ENGINE_SCRIPT    = path.resolve('gold-ai.mjs')
 
-const CANDLE_DELAY_MS = 2000
-const RETRY_DELAY_MS  = 60000      // 1 minute — used for per-minute API capacity (429)
-const MAX_RETRIES     = 3
+const CANDLE_DELAY_MS     = 2000
+const KEY_SWITCH_DELAY_MS = 1000    // fast key-to-key rotation on 429 — try the NEXT key almost immediately
+const RETRY_DELAY_MS      = 60000   // long fallback wait — only used once EVERY active key has been tried and is still capped
 const WATCH_PERIOD_MS = 60 * 1000  // 1-minute TP/SL sweep
 const WATCH_BAR_MS    = 60 * 1000  // 1-minute candle for TP/SL detection
 
@@ -320,24 +320,51 @@ function msUntilNextClose(tfMinutes) {
   const now=Date.now(), periodMs=tfMinutes*60000
   return Math.ceil(now/periodMs)*periodMs - now
 }
+
+// Runs `callback(symObj, tf)` with fast key rotation on 429 (per-minute cap
+// hit): switches to the next key and retries after just KEY_SWITCH_DELAY_MS
+// (1s), cycling through every active key. Only if an ENTIRE pass through all
+// keys still comes back 429 does it fall back to the long RETRY_DELAY_MS
+// (60s) wait — then tries one more full pass. Non-rate-limit errors (network
+// hiccups) also get the fast 1s retry, same key. Gives up after 2 full
+// cycles through all keys (bounded — never loops forever).
+async function tryWithKeyRotation(symObj, tf, callback) {
+  const totalKeys = Math.max(getLiveApiKeys().length, 1)
+  for(let cycle=1; cycle<=2; cycle++){
+    for(let i=1; i<=totalKeys; i++){
+      try{ await callback(symObj,tf); return true }
+      catch(e){
+        const is429=e.message?.includes('429')||e.message?.includes('rate')||e.message?.includes('minute')
+        const isNet=!is429 && (e.message?.includes('fetch')||e.message?.includes('ECONNRESET'))
+        if(is429){
+          console.log(`[scheduler] ${symObj.label} ${tf} key rate-limited — switching key (${i}/${totalKeys}, cycle ${cycle}/2), retry in 1s`)
+          switchToNextKey()
+          await sleep(KEY_SWITCH_DELAY_MS)
+        } else if(isNet){
+          console.log(`[scheduler] ${symObj.label} ${tf} network hiccup (${i}/${totalKeys}, cycle ${cycle}/2): ${e.message} — retry in 1s`)
+          await sleep(KEY_SWITCH_DELAY_MS)
+        } else {
+          console.error(`[scheduler] ${symObj.label} ${tf} gave up: ${e.message}`)
+          return false
+        }
+      }
+    }
+    if(cycle===1){
+      console.log(`[scheduler] ${symObj.label} ${tf} all ${totalKeys} keys still rate-limited after quick rotation — waiting 60s before one more pass`)
+      await sleep(RETRY_DELAY_MS)
+    }
+  }
+  console.error(`[scheduler] ${symObj.label} ${tf} gave up — all ${totalKeys} keys rate-limited across both passes`)
+  return false
+}
+
 function scheduleCandle(symObj, tf, callback) {
   const mins=TF_MINUTES[tf]; if(!mins){console.error(`Unknown TF: ${tf}`);return}
   const stagger=TF_STAGGER_MS[tf]||0, wait=msUntilNextClose(mins)+stagger
   console.log(`[scheduler] ${symObj.label} ${tf} next close in ${(wait/1000).toFixed(1)}s`)
   setTimeout(async()=>{
     await sleep(CANDLE_DELAY_MS)
-    for(let attempt=1;attempt<=MAX_RETRIES;attempt++){
-      try{ await callback(symObj,tf); break }
-      catch(e){
-        const is429=e.message?.includes('429')||e.message?.includes('rate')||e.message?.includes('minute')
-        const isNet=e.message?.includes('fetch')||e.message?.includes('ECONNRESET')
-        if((is429||isNet)&&attempt<MAX_RETRIES){
-          if(is429){console.log(`[scheduler] ${symObj.label} ${tf} per-minute capacity full — switching key, retry in 60s`);switchToNextKey()}
-          else console.log(`[scheduler] ${symObj.label} ${tf} attempt ${attempt} failed (${e.message})`)
-          await sleep(RETRY_DELAY_MS)   // wait one minute then retry
-        } else {console.error(`[scheduler] ${symObj.label} ${tf} gave up: ${e.message}`);break}
-      }
-    }
+    await tryWithKeyRotation(symObj, tf, callback)
     scheduleCandle(symObj,tf,callback)
   },wait)
 }
@@ -565,14 +592,7 @@ scheduleDailySummary()
   for(const symObj of symbols){
     for(const tf of symObj.timeframes){
       console.log(`[startup] Initial check: ${symObj.label} ${tf}…`)
-      for(let attempt=1;attempt<=MAX_RETRIES;attempt++){
-        try{await runSignalCycle(symObj,tf,true);break}
-        catch(e){
-          const is429=e.message?.includes('429')||e.message?.includes('fetch failed')||/minute/i.test(e.message)
-          if(is429&&attempt<MAX_RETRIES){switchToNextKey();console.log(`[startup] ${symObj.label} ${tf} capacity full — waiting 60s…`);await sleep(RETRY_DELAY_MS)}
-          else{console.error(`[startup] ${symObj.label} ${tf} gave up: ${e.message}`);break}
-        }
-      }
+      await tryWithKeyRotation(symObj, tf, (s,t)=>runSignalCycle(s,t,true))
       await sleep(3000)
     }
   }
