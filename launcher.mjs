@@ -1,8 +1,24 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  launcher.mjs  —  v10.8 (Multi-Symbol + Multi-Timeframe + LEARNING LOG +
-//  PER-SYMBOL SPREAD + STRICT HTF GATE + CONFIRMED-REVERSAL CASCADE CLOSE)
+//  launcher.mjs  —  v10.9 (Multi-Symbol + Multi-Timeframe + LEARNING LOG +
+//  PER-SYMBOL SPREAD + STRICT HTF GATE + CONFIRMED-REVERSAL CASCADE CLOSE +
+//  PER-TF SEND TOGGLE + POST-TP3 COOLDOWN)
 //
-//  New in v10.8:
+//  New in v10.9:
+//   • PER-TIMEFRAME SEND TOGGLE — admin → Symbols → 📤 Signal Sending lets
+//     you pick, among a symbol's analysed timeframes, which ones actually
+//     broadcast to Telegram and get tracked for TP/SL. Timeframes left off
+//     the send list are STILL fully analysed every cycle (so the HTF gate /
+//     reversal-cascade logic elsewhere still sees whatever they compute) but
+//     never message anyone and never get an open-trade state entry. Useful
+//     to stop e.g. 5m + 15m + 1h all firing near-duplicate alerts for the
+//     same underlying move.
+//   • POST-TP3 COOLDOWN — after a symbol|tf trade hits TP3 (full target), a
+//     new signal on that SAME symbol|tf is suppressed for
+//     POST_TP3_COOLDOWN_CANDLES real candle closes (default 2), then resumes
+//     normally. Stops immediately chasing the same instrument/timeframe
+//     right after a win, when the move may already be exhausted.
+//
+//  v10.8:
 //   • CONFIRMED-REVERSAL CASCADE CLOSE — a held trade is no longer just
 //     suppressed-and-waited-out when the opposite direction shows up. If a
 //     timeframe's own engine analysis independently produces a fresh,
@@ -128,6 +144,62 @@ function higherTfDirection(state, symId, tf, timeframes) {
     if (t && t.direction) return { dir: t.direction, tf: other }
   }
   return null
+}
+
+// ── PER-TIMEFRAME SEND TOGGLE (v10.9) ───────────────────────────────────────
+// symObj.send_timeframes (null = send everything, back-compat default) is a
+// subset of symObj.timeframes. Timeframes NOT in it are still analysed every
+// cycle by runSignalCycle (so the HTF gate / reversal-cascade logic elsewhere
+// keeps working normally for whatever THOSE timeframes compute), but never
+// broadcast to Telegram and never get an open-trade state entry — i.e. never
+// tracked for TP/SL. This is a pure "should I tell anyone" cut applied AFTER
+// analysis, not a "stop analysing" toggle.
+function isSendEnabled(symObj, tf) {
+  if (!Array.isArray(symObj.send_timeframes)) return true   // not configured → send everything
+  return symObj.send_timeframes.includes(tf)
+}
+
+// ── POST-TP3 COOLDOWN (v10.9) ───────────────────────────────────────────────
+// After a symbol|tf trade hits TP3 (full target), suppress sending a brand
+// new signal on that SAME symbol|tf for POST_TP3_COOLDOWN_CANDLES real
+// candle closes, then resume normally. Prevents immediately re-entering the
+// same instrument/timeframe right after a win chases a move that may already
+// be exhausted. Stored as its OWN state key (`${symId}|${tf}|cooldown`) so it
+// never collides with openTrade()'s trade-state lookups (which only ever
+// read the bare `${symId}|${tf}` key) and survives independently of whether
+// a new trade opens/closes in between.
+const POST_TP3_COOLDOWN_CANDLES = parseInt(process.env.POST_TP3_COOLDOWN_CANDLES || '2')
+const cooldownKey = (symId, tf) => `${symId}|${tf}|cooldown`
+
+function getCooldownCandles(symId, tf) {
+  const c = loadState()[cooldownKey(symId, tf)]
+  return (c && typeof c === 'object' && typeof c.candlesLeft === 'number') ? c.candlesLeft : 0
+}
+
+// Directly mutates an ALREADY-LOADED state object (no separate load/save) —
+// used from inside evalTradeAgainstBar, which builds up its own in-memory
+// `state` across a batch of bars before the caller persists it once. Calling
+// loadState()/saveState() independently here would race with and clobber
+// those pending in-memory trade-state edits.
+function armCooldown(state, symId, tf, n) {
+  const key = cooldownKey(symId, tf)
+  if (n > 0) state[key] = { candlesLeft: n }
+  else delete state[key]
+}
+
+// Called once per real candle-close cycle for a symbol|tf (from
+// runSignalCycle). Returns the cooldown count AS IT WAS BEFORE this tick —
+// >0 means this cycle falls inside the cooldown window and sending should be
+// suppressed; 0 means not cooling down, safe to send. Ticks the counter down
+// by 1 as a side effect (own load/save — runSignalCycle isn't sharing an
+// in-memory state object across calls the way the watcher does).
+function tickCooldown(symId, tf) {
+  const before = getCooldownCandles(symId, tf)
+  if (before <= 0) return 0
+  const state = loadState()
+  armCooldown(state, symId, tf, before - 1)
+  saveState(state)
+  return before
 }
 
 // ── STATE (atomic writes) ──────────────────────────────────────────────────
@@ -306,11 +378,13 @@ async function evalTradeAgainstBar(state, symObj, tf, sig, bar) {
   // ── TP3 (full target → close) ──
   if(sig.tp2Hit && !sig.tp3Hit && (dir==='BUY' ? bar.high>=sig.tp3 : bar.low<=sig.tp3)){
     const pips=toPips(sig.tp3-entry,dp)
-    await sendReply(`${dirIcon(dir)} <b>${symObj.label} ${tf.toUpperCase()} — TP3 HIT 🏆 FULL TARGET</b>\n+${pips} pips @ ${sig.tp3.toFixed(dp)}\nAll targets reached! 🎯`, symObj.id, adminReplyId, subMsgIds)
+    await sendReply(`${dirIcon(dir)} <b>${symObj.label} ${tf.toUpperCase()} — TP3 HIT 🏆 FULL TARGET</b>\n+${pips} pips @ ${sig.tp3.toFixed(dp)}\nAll targets reached! 🎯${POST_TP3_COOLDOWN_CANDLES>0?`\n🧊 Cooling down ${POST_TP3_COOLDOWN_CANDLES} candle(s) before a new ${tf.toUpperCase()} signal can send.`:''}`, symObj.id, adminReplyId, subMsgIds)
     addToDaily({sym:symObj.id,tf,dir,result:'TP3',pips,sign:+1,signalId})
     logOutcome(symObj,tf,sig,'TP3',pips,+1)
-    state[key]=null; changed=true
-    console.log(`[${symObj.label} ${tf}] 🏆 TP3 +${pips} pips`)
+    state[key]=null
+    armCooldown(state, symObj.id, tf, POST_TP3_COOLDOWN_CANDLES)   // mutate SAME in-memory state — no separate I/O, avoids clobbering this batch's pending writes
+    changed=true
+    console.log(`[${symObj.label} ${tf}] 🏆 TP3 +${pips} pips${POST_TP3_COOLDOWN_CANDLES>0?` — cooldown armed (${POST_TP3_COOLDOWN_CANDLES} candles)`:''}`)
     return changed   // trade fully closed
   }
 
@@ -511,8 +585,31 @@ async function runSignalCycle(symObj, tf, isStartup=false) {
   const stateKey=`${symObj.id}|${tf}`
   const dp=symObj.decimals ?? 2
 
+  // Tick the post-TP3 cooldown once per real candle-close cycle for this
+  // symbol|tf, regardless of whether a signal was found — it counts real
+  // candles, not signal attempts. `coolingCandlesLeft` is the count AS OF
+  // THIS cycle (before the tick) — >0 means this cycle is still suppressed.
+  const coolingCandlesLeft = tickCooldown(symObj.id, tf)
+
   if(shouldSend){
     const sig=latest
+
+    // ── PER-TIMEFRAME SEND TOGGLE (v10.9) ──────────────────────────────────
+    // This timeframe is still fully analysed (everything above ran normally,
+    // feeding the HTF gate / reversal-cascade logic for whoever reads it) —
+    // it's just never broadcast or tracked when disabled via admin → Symbols
+    // → 📤 Signal Sending.
+    if(!isSendEnabled(symObj, tf)){
+      console.log(`[${symObj.label} ${tf}] 🔇 ${sig.direction} computed (score ${sig.score}) but sending is DISABLED for this timeframe — analysed silently, not tracked`)
+      return
+    }
+
+    // ── POST-TP3 COOLDOWN (v10.9) ──────────────────────────────────────────
+    if(coolingCandlesLeft > 0){
+      console.log(`[${symObj.label} ${tf}] 🧊 ${sig.direction} suppressed — cooling down after TP3 (${coolingCandlesLeft} candle(s) left)`)
+      return
+    }
+
     const isHold=heldBefore&&heldBefore.direction===sig.direction
 
     if(isHold){
@@ -663,9 +760,11 @@ function scheduleDailySummary(){
 // ── STARTUP ───────────────────────────────────────────────────────────────
 const symbols=getLiveSymbols()
 
-console.log('🚀 Gold AI Launcher v10.8 — Confirmed-Reversal Cascade Close + Strict HTF Gate + Per-Symbol Spread + Calibrated ATR')
+console.log('🚀 Gold AI Launcher v10.9 — Per-TF Send Toggle + Post-TP3 Cooldown + Confirmed-Reversal Cascade + Strict HTF Gate + Per-Symbol Spread + Calibrated ATR')
 console.log(`   Symbols: ${symbols.map(s=>`${s.emoji}${s.label}[${s.timeframes.join(',')}]`).join('  ')}`)
 console.log(`   ⚡ TP/SL watcher: every 1 min — TP & SL both trigger on wick touch`)
+console.log(`   📤 Per-TF send toggle: silent timeframes are still analysed (feeds HTF/reversal logic) but never sent or tracked — set via admin → Symbols → Signal Sending`)
+console.log(`   🧊 Post-TP3 cooldown: ${POST_TP3_COOLDOWN_CANDLES} candle(s) suppressed on a symbol|tf right after it hits TP3 (POST_TP3_COOLDOWN_CANDLES to change)`)
 console.log(`   🔄 Confirmed-reversal cascade: fresh gated opposite signal (score≥${REVERSAL_MIN_SCORE}) closes held trade + faster-TF same-direction trades at live price (REVERSAL_CASCADE=0 to disable)`)
 console.log(`   🔒 Strict HTF gate: any TF opposing an open HIGHER-TF trade is hard-blocked (no counter-trend scalp exception)`)
 console.log(`   💱 Per-symbol spread: injected from admin config, falls back to engine's 0.30 default`)
