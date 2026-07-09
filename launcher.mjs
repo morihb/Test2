@@ -1,15 +1,33 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  launcher.mjs  —  v10.7 (Multi-Symbol + Multi-Timeframe + LEARNING LOG +
-//  PER-SYMBOL SPREAD + STRICT HTF GATE)
+//  launcher.mjs  —  v10.8 (Multi-Symbol + Multi-Timeframe + LEARNING LOG +
+//  PER-SYMBOL SPREAD + STRICT HTF GATE + CONFIRMED-REVERSAL CASCADE CLOSE)
 //
-//  New in v10.7:
+//  New in v10.8:
+//   • CONFIRMED-REVERSAL CASCADE CLOSE — a held trade is no longer just
+//     suppressed-and-waited-out when the opposite direction shows up. If a
+//     timeframe's own engine analysis independently produces a fresh,
+//     fully-gated opposite-direction signal (same rigor as any new entry —
+//     score/conviction floor, MTF alignment, candle confirmation, spread
+//     feasibility) while it holds a trade, that's treated as a REAL
+//     confirmed reversal, not noise. The held trade is closed immediately
+//     at the current live price (real pips logged, win or small loss), and
+//     any FASTER timeframe still holding the same OLD direction is cascaded
+//     closed at that same live price too (price is shared across timeframes
+//     of one symbol at any instant). The freed timeframe(s) can then fire
+//     the new opposite-direction signal right away instead of waiting for
+//     TP3/SL/BE. Toggle: REVERSAL_CASCADE=0 to disable (falls back to old
+//     suppress-only behaviour). REVERSAL_MIN_SCORE (default 55) sets how
+//     strong the opposite signal must be to count as confirmation.
+//
+//  v10.7:
 //   • STRICT HTF DIRECTION GATE — the old "counter-trend scalp" exception
 //     for 5m is removed. Now ANY timeframe opposing an open trade on ANY
 //     higher timeframe (same symbol) is hard-blocked, no exceptions. If 1h
 //     holds BUY, neither 15m nor 5m can send SELL — only BUY or WAIT — until
-//     that 1h trade fully closes (TP3/SL/BE).
+//     that 1h trade fully closes (TP3/SL/BE) or gets confirmed-reversal-
+//     closed by v10.8's cascade above.
 //
-//  New in v10.6:
+//  v10.6:
 //   • 💱 PER-SYMBOL SPREAD INJECTION — injects env.SPREAD from
 //     symObj.spread (set via admin → Symbols → 💱 Edit Spread) the same
 //     way ATR_LOW/ATR_HIGH are already injected. Fixes forex pairs
@@ -18,10 +36,10 @@
 //     Unset symbols keep the engine's own 0.30 default (gold unaffected).
 //
 //  v10.5:
-//   • SAME-TF REVERSAL LOCK — while a timeframe holds an OPEN trade, an
-//     opposite-direction signal on that SAME timeframe is suppressed. The
-//     open trade must fully close (TP3, SL, or break-even) before the
-//     direction can flip. No more "SELL sent while the BUY is still live".
+//   • SAME-TF REVERSAL LOCK (superseded by v10.8's cascade close above, but
+//     still the fallback when the opposite signal's score is too weak) —
+//     while a timeframe holds an OPEN trade, an opposite-direction signal on
+//     that SAME timeframe is suppressed until the open trade fully closes.
 //   • CALIBRATED ATR BANDS — if the symbol has per-timeframe atr_bands in
 //     settings.json (set via admin "🎯 Recalibrate ATR" or auto on symbol
 //     add), the launcher injects ATR_LOW/ATR_HIGH into the engine env so
@@ -206,6 +224,57 @@ async function fetchRecentBars(symObj) {
     }catch{ /* network error — try next key */ }
   }
   return { rateLimited:saw429, bars:[] }
+}
+
+// ── CONFIRMED-REVERSAL CASCADE CLOSE (v10.8) ───────────────────────────────
+// A "reversal" is ONLY recognized when a timeframe's own engine analysis
+// independently produces a fresh, fully-gated signal in the OPPOSITE
+// direction to a trade it's currently holding — i.e. it passed every filter
+// a brand-new entry needs (score/conviction floor, MTF alignment, candle
+// confirmation, spread feasibility, etc). This is deliberately NOT a
+// separate lightweight "did the trend flip" check — reusing the exact same
+// rigorous gate as normal entries is what makes it a REAL confirmed reversal
+// rather than a noisy per-candle guess.
+//
+// REVERSAL_CASCADE=0     → disable this feature entirely (old suppress-only
+//                          behaviour: reversal signals just get blocked until
+//                          the held trade naturally hits TP3/SL/BE)
+// REVERSAL_MIN_SCORE     → the fresh opposite signal must meet this score to
+//                          count as confirmation (default 55 = tier B+, i.e.
+//                          a bare tier-C flip alone won't trigger closures)
+const REVERSAL_CASCADE   = process.env.REVERSAL_CASCADE !== '0'
+const REVERSAL_MIN_SCORE = parseInt(process.env.REVERSAL_MIN_SCORE || '55')
+
+// Closes one held trade RIGHT NOW at the given live price (not waiting for
+// TP/SL), logs the real outcome (pips + win/loss from entry vs. live), sends
+// a threaded alert under the original signal, and frees that symbol|tf slot.
+async function closeHeldTrade(symObj, tf, direction, entry, livePrice, reason) {
+  const dp = symObj.decimals ?? 2
+  const state = loadState()
+  const held = openTrade(state, symObj.id, tf)
+  if (!held) return   // already closed by something else (watcher TP/SL, etc.) — nothing to do
+
+  const diff = direction==='BUY' ? (livePrice-entry) : (entry-livePrice)
+  const pips = toPips(diff, dp)
+  const sign = diff > 0 ? +1 : diff < 0 ? -1 : 0
+  const icon = sign>0 ? '✅' : sign<0 ? '❌' : '🟦'
+  const label = sign>0 ? `+${pips} pips` : sign<0 ? `-${pips} pips` : 'break-even'
+
+  const adminReplyId = held.signalMsgId || held.msgId || null
+  const subMsgIds = held.subMsgIds || {}
+  await sendReply(
+`${dirIcon(direction)} <b>${symObj.label} ${tf.toUpperCase()} — TREND REVERSED ${icon}</b>
+${reason}
+Closed early at ${livePrice.toFixed(dp)} (entry ${entry.toFixed(dp)}) → <b>${label}</b>`,
+    symObj.id, adminReplyId, subMsgIds)
+
+  const signalId = makeSignalId(symObj.id, tf, held)
+  addToDaily({ sym:symObj.id, tf, dir:direction, result:'REV', pips, sign, signalId })
+  logOutcome(symObj, tf, held, 'REV', pips, sign)
+
+  state[`${symObj.id}|${tf}`] = null
+  saveState(state)
+  console.log(`[${symObj.label} ${tf}] 🔄 Reversal close: ${label}`)
 }
 
 // Evaluate one open trade against a single closed 1-min bar. Mutates `state`,
@@ -467,15 +536,48 @@ async function runSignalCycle(symObj, tf, isStartup=false) {
       // Saving the old snapshot would clobber those updates.
       console.log(`[${symObj.label} ${tf}] 📡 KEEP HOLDING`)
     } else {
-      // ── SAME-TF REVERSAL LOCK (v10.5) ────────────────────────────────────
-      // A timeframe that still holds an OPEN trade must never flip direction.
-      // The open trade has to fully close (TP3, SL, or break-even) before an
-      // opposite-direction signal on the SAME timeframe is allowed out.
-      // (Re-read fresh state — the trade may have closed during engine exec,
-      // in which case the reversal IS allowed.)
+      // ── CONFIRMED-REVERSAL CASCADE CLOSE (v10.8) ─────────────────────────
+      // `sig` here already passed every entry gate (score/conviction floor,
+      // MTF alignment, candle confirmation, spread feasibility, etc) — so if
+      // its direction opposes what THIS timeframe is currently holding, that
+      // is real, gate-confirmed evidence of a reversal, not noise.
+      // (Re-read fresh state — the trade may have already closed naturally
+      // during engine exec via the watcher, in which case there's nothing to
+      // reverse and we just fall through to a normal fresh entry below.)
       const stillOpen = openTrade(loadState(), symObj.id, tf)
-      if (stillOpen && stillOpen.direction && stillOpen.direction !== sig.direction) {
-        console.log(`[${symObj.label} ${tf}] ⛔ ${sig.direction} suppressed — ${tf} still holds an open ${stillOpen.direction} (waiting for TP3/SL/BE)`)
+      const isConfirmedReversal = REVERSAL_CASCADE && stillOpen && stillOpen.direction
+        && stillOpen.direction !== sig.direction && sig.score >= REVERSAL_MIN_SCORE
+
+      if (isConfirmedReversal) {
+        const oldDir = stillOpen.direction
+        const livePrice = parseFloat(sig.live)
+        console.log(`[${symObj.label} ${tf}] 🔄 CONFIRMED reversal — fresh ${sig.direction} signal (score ${sig.score}) passed all entry gates while ${tf} held ${oldDir}. Closing ${tf} and any lower-TF ${oldDir} trades at live ${livePrice}.`)
+
+        // Close this timeframe's own trade at current live price.
+        await closeHeldTrade(symObj, tf, oldDir, stillOpen.entry, livePrice,
+          `${tf.toUpperCase()} trend reversed to ${sig.direction} — confirmed by a fresh ${sig.tier}-tier signal (score ${sig.score}) passing every entry filter.`)
+
+        // Cascade DOWN only: any timeframe faster than this one, still
+        // holding the OLD direction, gets closed at the same live price
+        // (price is one shared value across all timeframes of a symbol at
+        // any given instant — no need to re-fetch per timeframe).
+        const myMin = TF_MINUTES[tf] || 0
+        for (const otherTf of symObj.timeframes) {
+          if ((TF_MINUTES[otherTf] || 0) >= myMin) continue   // only strictly lower/faster timeframes
+          const otherHeld = openTrade(loadState(), symObj.id, otherTf)
+          if (otherHeld && otherHeld.direction === oldDir) {
+            await closeHeldTrade(symObj, otherTf, oldDir, otherHeld.entry, livePrice,
+              `Higher timeframe (${tf.toUpperCase()}) trend reversed to ${sig.direction} — closing this ${otherTf.toUpperCase()} ${oldDir} early rather than let it fight the new trend.`)
+          }
+        }
+        // Fall through — do NOT return. The old trade(s) are now closed, so
+        // the checks below will find nothing blocking, and the fresh
+        // opposite-direction signal sends immediately instead of waiting.
+      } else if (stillOpen && stillOpen.direction && stillOpen.direction !== sig.direction) {
+        // Opposite signal exists but didn't meet REVERSAL_MIN_SCORE (or the
+        // feature is disabled) — fall back to the old suppress-only
+        // behaviour: wait for the held trade to close naturally.
+        console.log(`[${symObj.label} ${tf}] ⛔ ${sig.direction} suppressed — ${tf} still holds an open ${stillOpen.direction} (score ${sig.score} below reversal threshold ${REVERSAL_MIN_SCORE}, waiting for TP3/SL/BE)`)
         return
       }
 
@@ -483,8 +585,7 @@ async function runSignalCycle(symObj, tf, isStartup=false) {
       // Any timeframe opposing an open trade on ANY higher timeframe for the
       // same symbol is suppressed outright. If 1h holds BUY, neither 15m nor
       // 5m may send SELL — only BUY (or WAIT) — until that 1h trade fully
-      // closes (TP3/SL/BE). Previously 5m was allowed to fire a flagged
-      // "counter-trend scalp" against 1h/4h/1d; that exception is removed.
+      // closes (TP3/SL/BE) OR gets confirmed-reversal-closed above.
       const htf=higherTfDirection(loadState(), symObj.id, tf, symObj.timeframes)
       if(htf && htf.dir!==sig.direction){
         console.log(`[${symObj.label} ${tf}] ⛔ ${sig.direction} suppressed — higher TF ${htf.tf} holds ${htf.dir} (reversal blocked until it closes)`)
@@ -562,10 +663,10 @@ function scheduleDailySummary(){
 // ── STARTUP ───────────────────────────────────────────────────────────────
 const symbols=getLiveSymbols()
 
-console.log('🚀 Gold AI Launcher v10.7 — Strict HTF Gate + Per-Symbol Spread + Reversal Lock + Calibrated ATR')
+console.log('🚀 Gold AI Launcher v10.8 — Confirmed-Reversal Cascade Close + Strict HTF Gate + Per-Symbol Spread + Calibrated ATR')
 console.log(`   Symbols: ${symbols.map(s=>`${s.emoji}${s.label}[${s.timeframes.join(',')}]`).join('  ')}`)
 console.log(`   ⚡ TP/SL watcher: every 1 min — TP & SL both trigger on wick touch`)
-console.log(`   🔒 Same-TF reversal lock: opposite signal suppressed until TP3/SL/BE`)
+console.log(`   🔄 Confirmed-reversal cascade: fresh gated opposite signal (score≥${REVERSAL_MIN_SCORE}) closes held trade + faster-TF same-direction trades at live price (REVERSAL_CASCADE=0 to disable)`)
 console.log(`   🔒 Strict HTF gate: any TF opposing an open HIGHER-TF trade is hard-blocked (no counter-trend scalp exception)`)
 console.log(`   💱 Per-symbol spread: injected from admin config, falls back to engine's 0.30 default`)
 console.log(`   🔁 KEEP HOLDING updates respect the /keepholding user toggle`)
