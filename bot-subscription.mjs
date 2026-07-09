@@ -173,6 +173,12 @@ export function getSymbolsForLauncher() {
     timeframes: s.timeframes || getActiveTimeframes(),
     atr_bands: s.atr_bands || {},
     spread: s.spread ?? null,   // price units; null = engine falls back to its own 0.30 default
+    // Subset of `timeframes` allowed to actually SEND signals + be tracked
+    // for TP/SL. null/undefined = send everything (back-compat default).
+    // Timeframes NOT in this list are still analysed every cycle (so HTF
+    // gate / reversal-cascade math elsewhere is unaffected for THEM), but
+    // never broadcast to Telegram and never get an open-trade state entry.
+    send_timeframes: Array.isArray(s.send_timeframes) ? s.send_timeframes : null,
   }))
 }
 
@@ -1068,11 +1074,16 @@ async function screenSymbolView(chatId, msgId, symId) {
     ? Object.entries(bands).map(([tf,b]) => `   ${tf}: ${b.atrLow}%–${b.atrHigh}%`).join('\n')
     : '   (not calibrated — using default gold bands)'
   const spreadLine = sym.spread != null ? `${sym.spread}` : '0.30 (default/gold)'
+  const analyzedTfs = sym.timeframes || []
+  const sendSet = Array.isArray(sym.send_timeframes) ? new Set(sym.send_timeframes) : new Set(analyzedTfs)
+  const sendLine = analyzedTfs.length
+    ? analyzedTfs.map(tf => sendSet.has(tf) ? tf : `${tf}🔇`).join(', ')
+    : 'none'
   const rows = [
     [{ text:'✏️ Edit Label', callback_data:`adm_sym_edit_label_${symId}` }, { text:'🪙 Edit TD Symbol', callback_data:`adm_sym_edit_td_${symId}` }],
     [{ text:'🔌 Edit OANDA Sym', callback_data:`adm_sym_edit_oanda_${symId}` }, { text:'📈 Edit Yahoo Sym', callback_data:`adm_sym_edit_yahoo_${symId}` }],
     [{ text:'🔢 Edit Decimals', callback_data:`adm_sym_edit_dec_${symId}` }, { text:'😀 Edit Emoji', callback_data:`adm_sym_edit_emoji_${symId}` }],
-    [{ text:'📊 Timeframes', callback_data:`adm_sym_tfs_${symId}` }],
+    [{ text:'📊 Timeframes', callback_data:`adm_sym_tfs_${symId}` }, { text:'📤 Signal Sending', callback_data:`adm_sym_send_${symId}` }],
     [{ text:'🎯 Recalibrate ATR', callback_data:`adm_sym_cal_${symId}` }, { text:'💱 Edit Spread', callback_data:`adm_sym_edit_spread_${symId}` }],
     [{ text:'📦 Packages', callback_data:`adm_sym_pkgs_${symId}` }],
     [{ text:'👥 Subscribers', callback_data:`adm_sym_subs_${symId}` }],
@@ -1081,7 +1092,7 @@ async function screenSymbolView(chatId, msgId, symId) {
     [{ text:'⬅️ Back', callback_data:'adm_symbols' }],
   ]
   await editMsg(chatId,msgId,
-`📊 <b>${sym.emoji||''} ${sym.label}</b>\n\nTwelveData: <code>${sym.td_symbol}</code>\nOANDA: <code>${sym.oanda_symbol}</code>\nYahoo: <code>${sym.yahoo_symbol}</code>\nDecimals: <b>${sym.decimals}</b>\nTimeframes: <b>${(sym.timeframes||[]).join(', ')}</b>\n🎯 ATR bands:\n${bandLines}\n💱 Spread: <b>${spreadLine}</b>\nActive subscribers: <b>${subsCount}</b>\nStatus: ${sym.active!==false?'✅ Active':'❌ Disabled'}`, rows)
+`📊 <b>${sym.emoji||''} ${sym.label}</b>\n\nTwelveData: <code>${sym.td_symbol}</code>\nOANDA: <code>${sym.oanda_symbol}</code>\nYahoo: <code>${sym.yahoo_symbol}</code>\nDecimals: <b>${sym.decimals}</b>\nTimeframes: <b>${analyzedTfs.join(', ')||'none'}</b>\n📤 Sending: <b>${sendLine}</b> <i>(🔇 = analysed silently, not sent, not tracked)</i>\n🎯 ATR bands:\n${bandLines}\n💱 Spread: <b>${spreadLine}</b>\nActive subscribers: <b>${subsCount}</b>\nStatus: ${sym.active!==false?'✅ Active':'❌ Disabled'}`, rows)
 }
 async function screenSymbolTFs(chatId, msgId, symId) {
   const sym = getSymbol(symId); if (!sym) return
@@ -1090,6 +1101,26 @@ async function screenSymbolTFs(chatId, msgId, symId) {
   rows.push([{ text:'⬅️ Back', callback_data:`adm_sym_view_${symId}` }])
   await editMsg(chatId,msgId,`📊 <b>${sym.label} — Timeframes</b>\n\nActive: <b>${active.join(', ')||'none'}</b>\n\n💡 After changing timeframes, run 🎯 Recalibrate ATR so the new TF gets its own band.`, rows)
 }
+// 📤 Signal Sending (v10.9) — among the ANALYSED timeframes above, choose
+// which ones actually broadcast to Telegram + get TP/SL tracked. The rest
+// keep being analysed every cycle (so the HTF gate / reversal-cascade logic
+// still sees whatever they compute — this is purely a "post-analysis" cut,
+// not a "stop analysing" toggle) but never message anyone and are never
+// treated as an open position. Useful to stop e.g. 5m + 15m + 1h all firing
+// near-duplicate alerts for the same underlying move — pick just one to send.
+async function screenSymbolSendTFs(chatId, msgId, symId) {
+  const sym = getSymbol(symId); if (!sym) return
+  const analyzed = sym.timeframes || []
+  const sendSet = Array.isArray(sym.send_timeframes) ? new Set(sym.send_timeframes) : new Set(analyzed)
+  if (!analyzed.length) {
+    return editMsg(chatId,msgId,`📤 <b>${sym.label} — Signal Sending</b>\n\nNo timeframes are analysed yet — set those up first under 📊 Timeframes.`,[[{text:'⬅️ Back',callback_data:`adm_sym_view_${symId}`}]])
+  }
+  const rows = analyzed.map(tf => [{ text:`${sendSet.has(tf)?'✅ send':'🔇 silent'}  ${tf}`, callback_data:`adm_sym_send_toggle_${symId}_${tf}` }])
+  rows.push([{ text:'⬅️ Back', callback_data:`adm_sym_view_${symId}` }])
+  await editMsg(chatId,msgId,
+`📤 <b>${sym.label} — Signal Sending</b>\n\n✅ send = broadcasts to Telegram, tracked for TP1/TP2/TP3/SL like normal.\n🔇 silent = still analysed every candle (feeds the HTF/reversal logic normally) but never messaged and never tracked as an open position.\n\nUse this to stop multiple timeframes firing near-duplicate alerts for the same move — pick just the one(s) you actually want subscribers to see.\n\n⚠️ Restart the launcher after changing this.`, rows)
+}
+
 async function screenSymbolPackages(chatId, msgId, symId) {
   const sym = getSymbol(symId); if (!sym) return
   const pkgs = sym.packages || []
@@ -1606,6 +1637,24 @@ Send <code>default</code> to use gold's spread (0.30) — only correct if this i
 `💱 <b>Edit Spread — ${sym.label}</b>\n\nCurrent: <b>${sym.spread ?? '0.30 (default/gold)'}</b>\n\nSend the new spread in <b>price units</b> (not pips), or <code>default</code> to reset to gold's 0.30:\n\nExamples: EUR/USD ≈ <code>0.00015</code> · GBP/JPY ≈ <code>0.03</code>`,
         [[{text:'❌ Cancel',callback_data:`adm_sym_view_${symESpr[1]}`}]])
     }
+    // 📤 Signal Sending (v10.9) — toggle route MUST be checked before the
+    // plain screen-open route below, since \w+ also matches underscores and
+    // would otherwise swallow "toggle_<symId>_<tf>" as a single symId.
+    const symSendToggle=data.match(/^adm_sym_send_toggle_(\w+)_(.+)$/)
+    if(symSendToggle){
+      const syms=getSymbols(), s=syms.find(x=>x.id===symSendToggle[1]); if(!s) return
+      const tf=symSendToggle[2], analyzed=s.timeframes||[]
+      // Materialize the default (send everything) into a real array on first
+      // toggle, so partial overrides behave predictably from here on.
+      let sendArr = Array.isArray(s.send_timeframes) ? s.send_timeframes.slice() : analyzed.slice()
+      const i=sendArr.indexOf(tf)
+      if(i>=0) sendArr.splice(i,1); else sendArr.push(tf)
+      s.send_timeframes = sendArr
+      saveSymbols(syms)
+      return screenSymbolSendTFs(chatId,msgId,symSendToggle[1])
+    }
+    const symSendView=data.match(/^adm_sym_send_(\w+)$/)
+    if(symSendView) return screenSymbolSendTFs(chatId,msgId,symSendView[1])
     const symEL=data.match(/^adm_sym_edit_label_(\w+)$/); if(symEL){setSession(chatId,'sym_edit_label',{symId:symEL[1]});return editMsg(chatId,msgId,`✏️ Send new <b>display label</b>:`,[[{text:'❌ Cancel',callback_data:`adm_sym_view_${symEL[1]}`}]])}
     const symET=data.match(/^adm_sym_edit_td_(\w+)$/);    if(symET){setSession(chatId,'sym_edit_td',{symId:symET[1]});return editMsg(chatId,msgId,`📡 Send new <b>TwelveData symbol</b>:`,[[{text:'❌ Cancel',callback_data:`adm_sym_view_${symET[1]}`}]])}
     const symEO=data.match(/^adm_sym_edit_oanda_(\w+)$/); if(symEO){setSession(chatId,'sym_edit_oanda',{symId:symEO[1]});return editMsg(chatId,msgId,`🔌 Send new <b>OANDA instrument</b> or <code>none</code>:`,[[{text:'❌ Cancel',callback_data:`adm_sym_view_${symEO[1]}`}]])}
