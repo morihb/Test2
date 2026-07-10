@@ -179,6 +179,12 @@ export function getSymbolsForLauncher() {
     // gate / reversal-cascade math elsewhere is unaffected for THEM), but
     // never broadcast to Telegram and never get an open-trade state entry.
     send_timeframes: Array.isArray(s.send_timeframes) ? s.send_timeframes : null,
+    // Custom per-timeframe dependency graph: { tf: [otherTf, ...] }. If a
+    // timeframe has no entry here, the launcher falls back to the legacy
+    // default (depends on every OTHER analysed timeframe with a strictly
+    // higher duration — the original "any higher TF blocks any lower TF"
+    // rule). An explicit empty array is respected as "depends on nothing".
+    depends: (s.depends && typeof s.depends === 'object') ? s.depends : null,
   }))
 }
 
@@ -1084,6 +1090,7 @@ async function screenSymbolView(chatId, msgId, symId) {
     [{ text:'🔌 Edit OANDA Sym', callback_data:`adm_sym_edit_oanda_${symId}` }, { text:'📈 Edit Yahoo Sym', callback_data:`adm_sym_edit_yahoo_${symId}` }],
     [{ text:'🔢 Edit Decimals', callback_data:`adm_sym_edit_dec_${symId}` }, { text:'😀 Edit Emoji', callback_data:`adm_sym_edit_emoji_${symId}` }],
     [{ text:'📊 Timeframes', callback_data:`adm_sym_tfs_${symId}` }, { text:'📤 Signal Sending', callback_data:`adm_sym_send_${symId}` }],
+    [{ text:'🔗 Dependencies', callback_data:`adm_sym_dep_${symId}` }],
     [{ text:'🎯 Recalibrate ATR', callback_data:`adm_sym_cal_${symId}` }, { text:'💱 Edit Spread', callback_data:`adm_sym_edit_spread_${symId}` }],
     [{ text:'📦 Packages', callback_data:`adm_sym_pkgs_${symId}` }],
     [{ text:'👥 Subscribers', callback_data:`adm_sym_subs_${symId}` }],
@@ -1120,6 +1127,60 @@ async function screenSymbolSendTFs(chatId, msgId, symId) {
   await editMsg(chatId,msgId,
 `📤 <b>${sym.label} — Signal Sending</b>\n\n✅ send = broadcasts to Telegram, tracked for TP1/TP2/TP3/SL like normal.\n🔇 silent = still analysed every candle (feeds the HTF/reversal logic normally) but never messaged and never tracked as an open position.\n\nUse this to stop multiple timeframes firing near-duplicate alerts for the same move — pick just the one(s) you actually want subscribers to see.\n\n⚠️ Restart the launcher after changing this.`, rows)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  🔗 TIMEFRAME DEPENDENCIES (v10.10) — fully custom per-symbol gating graph.
+//  Replaces the old fixed "any strictly-higher timeframe blocks any lower
+//  one" rule with an explicit, admin-chosen list PER timeframe: "this
+//  timeframe depends on [these other timeframes]". If ANY of those hold an
+//  open trade in the OPPOSITE direction, this timeframe is blocked from
+//  sending until that dependency closes (or gets confirmed-reversal-closed).
+//  Dependencies aren't restricted to "higher" timeframes — 1m could depend on
+//  5m + 15m + 1h, while 5m on the SAME symbol depends on only 15m, etc. Any
+//  combination is allowed; it's the admin's call.
+//  Not-yet-customised timeframes keep the legacy default (depend on every
+//  analysed timeframe with a strictly higher duration) so nothing changes
+//  for existing symbols until you actually open this screen and touch one.
+// ─────────────────────────────────────────────────────────────────────────────
+const TF_MINUTES_LOCAL = { '1m':1,'3m':3,'5m':5,'15m':15,'30m':30,'1h':60,'2h':120,'4h':240,'1d':1440 }
+function defaultDependsOnLocal(sym, tf) {
+  const myMin = TF_MINUTES_LOCAL[tf] || 0
+  return (sym.timeframes||[]).filter(t => (TF_MINUTES_LOCAL[t]||0) > myMin)
+}
+function getDependsOnLocal(sym, tf) {
+  const cfg = sym.depends || {}
+  return Array.isArray(cfg[tf]) ? cfg[tf] : defaultDependsOnLocal(sym, tf)
+}
+
+async function screenSymbolDependencies(chatId, msgId, symId) {
+  const sym = getSymbol(symId); if (!sym) return
+  const analyzed = sym.timeframes || []
+  if (!analyzed.length) {
+    return editMsg(chatId,msgId,`🔗 <b>${sym.label} — Dependencies</b>\n\nNo timeframes are analysed yet — set those up first under 📊 Timeframes.`,[[{text:'⬅️ Back',callback_data:`adm_sym_view_${symId}`}]])
+  }
+  const rows = analyzed.map(tf => {
+    const deps = getDependsOnLocal(sym, tf)
+    return [{ text:`${tf}  →  ${deps.length ? deps.join(', ') : 'nothing (free)'}`, callback_data:`adm_sym_dep_pick_${symId}_${tf}` }]
+  })
+  rows.push([{ text:'⬅️ Back', callback_data:`adm_sym_view_${symId}` }])
+  await editMsg(chatId,msgId,
+`🔗 <b>${sym.label} — Timeframe Dependencies</b>\n\nTap a timeframe to choose which OTHER timeframes it depends on. Any dependency holding an open trade in the OPPOSITE direction blocks this timeframe from sending until it closes.\n\nUn-customised timeframes default to depending on every higher timeframe (original behaviour).`, rows)
+}
+
+async function screenSymbolDependencyEdit(chatId, msgId, symId, tf) {
+  const sym = getSymbol(symId); if (!sym) return
+  const analyzed = sym.timeframes || []
+  const current = new Set(getDependsOnLocal(sym, tf))
+  const options = analyzed.filter(t => t !== tf)
+  if (!options.length) {
+    return editMsg(chatId,msgId,`🔗 <b>${tf.toUpperCase()} Dependencies</b>\n\nNo other timeframes are analysed for ${sym.label} — nothing to depend on.`,[[{text:'⬅️ Back',callback_data:`adm_sym_dep_${symId}`}]])
+  }
+  const rows = options.map(other => [{ text:`${current.has(other)?'✅':'⬜'} ${other}`, callback_data:`adm_sym_dep_toggle_${symId}_${tf}_${other}` }])
+  rows.push([{ text:'⬅️ Back', callback_data:`adm_sym_dep_${symId}` }])
+  await editMsg(chatId,msgId,
+`🔗 <b>${sym.label} — ${tf.toUpperCase()} depends on:</b>\n\n✅ = ${tf.toUpperCase()} is blocked from sending an opposite-direction signal while this timeframe holds an open trade.\n⬜ = ${tf.toUpperCase()} ignores this timeframe entirely.\n\n⚠️ Restart the launcher after changing this.`, rows)
+}
+
 
 async function screenSymbolPackages(chatId, msgId, symId) {
   const sym = getSymbol(symId); if (!sym) return
@@ -1655,6 +1716,25 @@ Send <code>default</code> to use gold's spread (0.30) — only correct if this i
     }
     const symSendView=data.match(/^adm_sym_send_(\w+)$/)
     if(symSendView) return screenSymbolSendTFs(chatId,msgId,symSendView[1])
+    // 🔗 Dependencies (v10.10) — same ordering rule: toggle (3 params) before
+    // pick (2 params) before plain view (1 param), since \w+ matches
+    // underscores and would otherwise swallow the more specific callbacks.
+    const symDepToggle=data.match(/^adm_sym_dep_toggle_(\w+)_(\w+)_(\w+)$/)
+    if(symDepToggle){
+      const syms=getSymbols(), s=syms.find(x=>x.id===symDepToggle[1]); if(!s) return
+      const tf=symDepToggle[2], other=symDepToggle[3]
+      s.depends = s.depends || {}
+      let arr = Array.isArray(s.depends[tf]) ? s.depends[tf].slice() : defaultDependsOnLocal(s, tf).slice()
+      const i = arr.indexOf(other)
+      if (i>=0) arr.splice(i,1); else arr.push(other)
+      s.depends[tf] = arr
+      saveSymbols(syms)
+      return screenSymbolDependencyEdit(chatId,msgId,symDepToggle[1],tf)
+    }
+    const symDepPick=data.match(/^adm_sym_dep_pick_(\w+)_(\w+)$/)
+    if(symDepPick) return screenSymbolDependencyEdit(chatId,msgId,symDepPick[1],symDepPick[2])
+    const symDepView=data.match(/^adm_sym_dep_(\w+)$/)
+    if(symDepView) return screenSymbolDependencies(chatId,msgId,symDepView[1])
     const symEL=data.match(/^adm_sym_edit_label_(\w+)$/); if(symEL){setSession(chatId,'sym_edit_label',{symId:symEL[1]});return editMsg(chatId,msgId,`✏️ Send new <b>display label</b>:`,[[{text:'❌ Cancel',callback_data:`adm_sym_view_${symEL[1]}`}]])}
     const symET=data.match(/^adm_sym_edit_td_(\w+)$/);    if(symET){setSession(chatId,'sym_edit_td',{symId:symET[1]});return editMsg(chatId,msgId,`📡 Send new <b>TwelveData symbol</b>:`,[[{text:'❌ Cancel',callback_data:`adm_sym_view_${symET[1]}`}]])}
     const symEO=data.match(/^adm_sym_edit_oanda_(\w+)$/); if(symEO){setSession(chatId,'sym_edit_oanda',{symId:symEO[1]});return editMsg(chatId,msgId,`🔌 Send new <b>OANDA instrument</b> or <code>none</code>:`,[[{text:'❌ Cancel',callback_data:`adm_sym_view_${symEO[1]}`}]])}
