@@ -1,9 +1,25 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  launcher.mjs  —  v10.9 (Multi-Symbol + Multi-Timeframe + LEARNING LOG +
-//  PER-SYMBOL SPREAD + STRICT HTF GATE + CONFIRMED-REVERSAL CASCADE CLOSE +
-//  PER-TF SEND TOGGLE + POST-TP3 COOLDOWN)
+//  launcher.mjs  —  v10.10 (Multi-Symbol + Multi-Timeframe + LEARNING LOG +
+//  PER-SYMBOL SPREAD + CUSTOM TIMEFRAME DEPENDENCY GRAPH + CONFIRMED-
+//  REVERSAL CASCADE CLOSE + PER-TF SEND TOGGLE + POST-TP3 COOLDOWN)
 //
-//  New in v10.9:
+//  New in v10.10:
+//   • CUSTOM TIMEFRAME DEPENDENCY GRAPH — replaces the old fixed "any
+//     strictly-higher timeframe blocks any lower one" rule with an explicit,
+//     admin-chosen list PER timeframe (admin → Symbols → 🔗 Dependencies):
+//     "this timeframe depends on [these other timeframes]". Not restricted
+//     to "higher" timeframes — e.g. 1m can depend on 5m + 15m + 1h, while 5m
+//     on the SAME symbol depends on only 15m, or nothing at all — any
+//     combination, per symbol. If ANY configured dependency holds an open
+//     trade in the OPPOSITE direction, the timeframe is blocked from sending
+//     until that dependency closes or gets confirmed-reversal-closed. The
+//     confirmed-reversal cascade close (v10.8) now cascades to whichever
+//     timeframes actually DEPEND on the one that reversed, instead of a
+//     fixed "every faster timeframe" rule. Un-customised timeframes keep the
+//     legacy default (depend on every higher timeframe) so nothing changes
+//     until a symbol's dependencies are explicitly edited.
+//
+//  v10.9:
 //   • PER-TIMEFRAME SEND TOGGLE — admin → Symbols → 📤 Signal Sending lets
 //     you pick, among a symbol's analysed timeframes, which ones actually
 //     broadcast to Telegram and get tracked for TP/SL. Timeframes left off
@@ -41,7 +57,9 @@
 //     higher timeframe (same symbol) is hard-blocked, no exceptions. If 1h
 //     holds BUY, neither 15m nor 5m can send SELL — only BUY or WAIT — until
 //     that 1h trade fully closes (TP3/SL/BE) or gets confirmed-reversal-
-//     closed by v10.8's cascade above.
+//     closed by v10.8's cascade above. (Superseded by v10.10: this "any
+//     higher TF" rule is now just the DEFAULT for un-customised timeframes,
+//     not a fixed rule — admin can override it per timeframe.)
 //
 //  v10.6:
 //   • 💱 PER-SYMBOL SPREAD INJECTION — injects env.SPREAD from
@@ -134,16 +152,42 @@ function makeSignalId(symId, tf, sig) {
   return `${symId}|${tf}|${sig.direction}|${sig.ts||sig.signalMsgId||sig.entry}`
 }
 
-// HTF GATE: returns the direction of any OPEN higher-timeframe trade for this
-// symbol, or null. A higher TF = more minutes than the TF being evaluated.
-function higherTfDirection(state, symId, tf, timeframes) {
+// ── CUSTOM TIMEFRAME DEPENDENCY GRAPH (v10.10) ──────────────────────────────
+// Replaces the old fixed "any strictly-higher timeframe blocks any lower
+// one" rule with an explicit, admin-chosen list PER timeframe (set via
+// admin → Symbols → 🔗 Dependencies): "this timeframe depends on [these
+// other timeframes]". Dependencies aren't restricted to "higher" timeframes
+// — 1m could depend on 5m + 15m + 1h, while 5m on the SAME symbol depends on
+// only 15m, or nothing at all. Any combination is allowed.
+// Un-customised timeframes (symObj.depends has no array for that tf) fall
+// back to the legacy default — every OTHER analysed timeframe with a
+// strictly higher duration — so nothing changes until admin explicitly
+// configures a given timeframe.
+function defaultDependsOn(symObj, tf) {
   const myMin = TF_MINUTES[tf] || 0
-  for (const other of timeframes) {
-    if ((TF_MINUTES[other] || 0) <= myMin) continue
+  return (symObj.timeframes || []).filter(t => (TF_MINUTES[t] || 0) > myMin)
+}
+function getDependsOn(symObj, tf) {
+  const cfg = symObj.depends || {}
+  return Array.isArray(cfg[tf]) ? cfg[tf] : defaultDependsOn(symObj, tf)
+}
+// Returns the direction of the first dependency currently holding an open
+// trade, or null. Generalizes the old higherTfDirection() to an arbitrary
+// admin-configured list instead of an automatic "higher timeframe" rule.
+function dependencyDirection(state, symId, dependsOn) {
+  for (const other of dependsOn) {
     const t = openTrade(state, symId, other)
     if (t && t.direction) return { dir: t.direction, tf: other }
   }
   return null
+}
+// Reverse lookup — which OTHER timeframes of this symbol list `reversedTf`
+// among their own dependencies? Used by the confirmed-reversal cascade close
+// to know which held trades to close when `reversedTf` reverses (replaces
+// the old "cascade to every faster timeframe" rule with "cascade to every
+// timeframe that actually depends on this one").
+function getDependents(symObj, reversedTf) {
+  return (symObj.timeframes || []).filter(t => t !== reversedTf && getDependsOn(symObj, t).includes(reversedTf))
 }
 
 // ── PER-TIMEFRAME SEND TOGGLE (v10.9) ───────────────────────────────────────
@@ -648,23 +692,22 @@ async function runSignalCycle(symObj, tf, isStartup=false) {
       if (isConfirmedReversal) {
         const oldDir = stillOpen.direction
         const livePrice = parseFloat(sig.live)
-        console.log(`[${symObj.label} ${tf}] 🔄 CONFIRMED reversal — fresh ${sig.direction} signal (score ${sig.score}) passed all entry gates while ${tf} held ${oldDir}. Closing ${tf} and any lower-TF ${oldDir} trades at live ${livePrice}.`)
+        console.log(`[${symObj.label} ${tf}] 🔄 CONFIRMED reversal — fresh ${sig.direction} signal (score ${sig.score}) passed all entry gates while ${tf} held ${oldDir}. Closing ${tf} and any dependent ${oldDir} trades at live ${livePrice}.`)
 
         // Close this timeframe's own trade at current live price.
         await closeHeldTrade(symObj, tf, oldDir, stillOpen.entry, livePrice,
           `${tf.toUpperCase()} trend reversed to ${sig.direction} — confirmed by a fresh ${sig.tier}-tier signal (score ${sig.score}) passing every entry filter.`)
 
-        // Cascade DOWN only: any timeframe faster than this one, still
-        // holding the OLD direction, gets closed at the same live price
-        // (price is one shared value across all timeframes of a symbol at
-        // any given instant — no need to re-fetch per timeframe).
-        const myMin = TF_MINUTES[tf] || 0
-        for (const otherTf of symObj.timeframes) {
-          if ((TF_MINUTES[otherTf] || 0) >= myMin) continue   // only strictly lower/faster timeframes
+        // Cascade to every timeframe whose CUSTOM dependency list actually
+        // includes this one (admin → Symbols → 🔗 Dependencies) — not just
+        // "faster" timeframes. Price is one shared value across all
+        // timeframes of a symbol at any given instant — no need to re-fetch.
+        const dependents = getDependents(symObj, tf)
+        for (const otherTf of dependents) {
           const otherHeld = openTrade(loadState(), symObj.id, otherTf)
           if (otherHeld && otherHeld.direction === oldDir) {
             await closeHeldTrade(symObj, otherTf, oldDir, otherHeld.entry, livePrice,
-              `Higher timeframe (${tf.toUpperCase()}) trend reversed to ${sig.direction} — closing this ${otherTf.toUpperCase()} ${oldDir} early rather than let it fight the new trend.`)
+              `${tf.toUpperCase()} (a dependency of ${otherTf.toUpperCase()}) reversed to ${sig.direction} — closing this ${otherTf.toUpperCase()} ${oldDir} early rather than let it fight the new trend.`)
           }
         }
         // Fall through — do NOT return. The old trade(s) are now closed, so
@@ -678,14 +721,17 @@ async function runSignalCycle(symObj, tf, isStartup=false) {
         return
       }
 
-      // HTF DIRECTION GATE (v10.7) — HARD block, no exceptions.
-      // Any timeframe opposing an open trade on ANY higher timeframe for the
-      // same symbol is suppressed outright. If 1h holds BUY, neither 15m nor
-      // 5m may send SELL — only BUY (or WAIT) — until that 1h trade fully
-      // closes (TP3/SL/BE) OR gets confirmed-reversal-closed above.
-      const htf=higherTfDirection(loadState(), symObj.id, tf, symObj.timeframes)
-      if(htf && htf.dir!==sig.direction){
-        console.log(`[${symObj.label} ${tf}] ⛔ ${sig.direction} suppressed — higher TF ${htf.tf} holds ${htf.dir} (reversal blocked until it closes)`)
+      // TIMEFRAME DEPENDENCY GATE (v10.10) — HARD block, no exceptions.
+      // Any timeframe opposing an open trade on ANY of ITS configured
+      // dependencies (admin → Symbols → 🔗 Dependencies; defaults to every
+      // higher timeframe if never customised) is suppressed outright. E.g.
+      // if 1m depends on 5m/15m/1h and 1h holds BUY, 1m can't send SELL —
+      // only BUY (or WAIT) — until that dependency closes (TP3/SL/BE) OR
+      // gets confirmed-reversal-closed above.
+      const dependsOn = getDependsOn(symObj, tf)
+      const dep = dependencyDirection(loadState(), symObj.id, dependsOn)
+      if(dep && dep.dir!==sig.direction){
+        console.log(`[${symObj.label} ${tf}] ⛔ ${sig.direction} suppressed — depends on ${dep.tf} which holds ${dep.dir} (blocked until it closes or reverses)`)
         return
       }
 
@@ -760,13 +806,13 @@ function scheduleDailySummary(){
 // ── STARTUP ───────────────────────────────────────────────────────────────
 const symbols=getLiveSymbols()
 
-console.log('🚀 Gold AI Launcher v10.9 — Per-TF Send Toggle + Post-TP3 Cooldown + Confirmed-Reversal Cascade + Strict HTF Gate + Per-Symbol Spread + Calibrated ATR')
+console.log('🚀 Gold AI Launcher v10.10 — Custom TF Dependency Graph + Per-TF Send Toggle + Post-TP3 Cooldown + Confirmed-Reversal Cascade + Per-Symbol Spread + Calibrated ATR')
 console.log(`   Symbols: ${symbols.map(s=>`${s.emoji}${s.label}[${s.timeframes.join(',')}]`).join('  ')}`)
 console.log(`   ⚡ TP/SL watcher: every 1 min — TP & SL both trigger on wick touch`)
-console.log(`   📤 Per-TF send toggle: silent timeframes are still analysed (feeds HTF/reversal logic) but never sent or tracked — set via admin → Symbols → Signal Sending`)
+console.log(`   🔗 Custom TF dependency graph: each timeframe blocked only by its OWN configured dependencies (default = every higher TF) — set via admin → Symbols → Dependencies`)
+console.log(`   📤 Per-TF send toggle: silent timeframes are still analysed (feeds dependency/reversal logic) but never sent or tracked — set via admin → Symbols → Signal Sending`)
 console.log(`   🧊 Post-TP3 cooldown: ${POST_TP3_COOLDOWN_CANDLES} candle(s) suppressed on a symbol|tf right after it hits TP3 (POST_TP3_COOLDOWN_CANDLES to change)`)
-console.log(`   🔄 Confirmed-reversal cascade: fresh gated opposite signal (score≥${REVERSAL_MIN_SCORE}) closes held trade + faster-TF same-direction trades at live price (REVERSAL_CASCADE=0 to disable)`)
-console.log(`   🔒 Strict HTF gate: any TF opposing an open HIGHER-TF trade is hard-blocked (no counter-trend scalp exception)`)
+console.log(`   🔄 Confirmed-reversal cascade: fresh gated opposite signal (score≥${REVERSAL_MIN_SCORE}) closes held trade + dependent-TF same-direction trades at live price (REVERSAL_CASCADE=0 to disable)`)
 console.log(`   💱 Per-symbol spread: injected from admin config, falls back to engine's 0.30 default`)
 console.log(`   🔁 KEEP HOLDING updates respect the /keepholding user toggle`)
 console.log(`   🔑 API keys: ${getLiveApiKeys().length} active`)
