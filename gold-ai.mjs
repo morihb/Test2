@@ -1,33 +1,16 @@
 // ─────────────────────────────────────────────────────────────
-//  GOLD.AI — v4.4b  (multi-symbol · multi-timeframe · SPEED-AWARE)
+//  GOLD.AI — v4.4c  (multi-symbol · multi-timeframe · SPEED-AWARE +
+//  ATR DIAGNOSTIC LOGGING)
 //
-//  This is v4.4 with the BRAIN GATE REMOVED. Nothing else changed —
-//  the adaptive ATR band, trade profiles, scoring, TP/SL logic, and
-//  every gate other than the brain check are identical to v4.4.
-//
-//  Removed vs v4.4:
-//   • `import { brainCheck } from './signal-brain.mjs'`
-//   • the "ADAPTIVE BRAIN GATE" block inside analyse() that could
-//     return a WAIT based on learning_log.json history.
-//   signal-brain.mjs is no longer required by this file at all.
-//
-//  Kept from v4.4 (unchanged):
-//   • ADAPTIVE HARD ATR BAND — the absolute sanity band scales with
-//     the per-symbol calibrated band injected by the launcher
-//     (ATR_LOW / ATR_HIGH env):
-//       hardLow  = min(0.03, atrLow*0.5)
-//       hardHigh = max(3.0,  atrHigh*2)
-//     This is what lets forex pairs run without being falsely
-//     blocked as "low liquidity" by gold-tuned bands.
-//
-//  v4.2 (unchanged): TRADE PROFILES per timeframe (SCALP/INTRADAY/
-//  SWING), candle confirmation, TP1-vs-spread feasibility, min stop
-//  distance floor, off-hours scalp strictness, confluence count.
-//
-//  NOTE: launcher.mjs's logOutcome()/learning_log.json and the
-//  LEARNING_LOG env var are untouched — they're harmless without a
-//  brain to read them, and left in place in case you want to
-//  re-enable the gate later.
+//  This is v4.4b with ONE addition: every WAIT caused by ATR
+//  (low_liquidity or the hard sanity band) now carries the ACTUAL
+//  measured atrPct plus the exact atrLow/atrHigh band it was judged
+//  against, and checkOne()'s console log prints them. Previously the
+//  log only said "low liquidity" with no numbers, making it
+//  impossible to tell a real quiet market from a bad calibration
+//  without separately fetching data and recomputing ATR by hand.
+//  Nothing else changed — same scoring, gates, TP/SL logic, trade
+//  profiles as v4.4b (brain gate already removed in v4.4b).
 // ─────────────────────────────────────────────────────────────
 import fs from 'fs'
 
@@ -61,10 +44,6 @@ const MAX_CONSEC_LOSSES=envNum('MAX_CONSEC',4)
 const KILL_DD_R=envNum('KILL_DD_R',10)
 
 // ── DECISION-QUALITY GATES (toggle via env) ──────────────────
-// REQUIRE_CANDLE_CONFIRM=0  -> disable candle confirmation
-// SPREAD_TP1_MULT           -> TP1 distance must be >= N × current spread
-// SCALP_OFFHOURS_STRICT=0   -> allow weak off-hours scalps
-// CONFLUENCE_MIN            -> min confluence factors required (0 = display only)
 const REQUIRE_CANDLE_CONFIRM = process.env.REQUIRE_CANDLE_CONFIRM!=='0'
 const SPREAD_TP1_MIN_MULT    = parseFloat(process.env.SPREAD_TP1_MULT)||6
 const SCALP_OFFHOURS_STRICT  = process.env.SCALP_OFFHOURS_STRICT!=='0'
@@ -80,13 +59,6 @@ const TF_PRESETS={
 }
 
 // ── TRADE PROFILES — the "speed" layer ───────────────────────
-//   type       SCALP | INTRADAY | SWING  (display + behaviour)
-//   maxHold    bars before the trade is time-stopped (keeps fast TFs fast)
-//   tpR        [tp1,tp2,tp3] R-multiples — the PRIMARY target spacing
-//   tpCapAtr   hard cap on how far any TP may sit from entry (in ATR)
-//   minStopAtr floor on stop distance (in ATR) so noise/spread can't insta-kill
-//   liquidity  'off'/'light' = R-based targets (snapped nearer to liquidity in
-//              the path) · 'on' = full MTF liquidity-target search (swing)
 const TRADE_PROFILES={
   '5m' : {type:'SCALP',    maxHold:12, tpR:[1.0,1.5,2.0], tpCapAtr:3,  minStopAtr:0.6, liquidity:'off'},
   '15m': {type:'SCALP',    maxHold:12, tpR:[1.0,1.5,2.0], tpCapAtr:4,  minStopAtr:0.7, liquidity:'off'},
@@ -121,7 +93,6 @@ function loadNewsEvents(){
 const NEWS_EVENTS=loadNewsEvents()
 const TF={scalp:{slb:3}}
 
-// human-readable hold duration from bars + minutes/bar
 function holdText(bars,minPerBar){
   const mins=bars*minPerBar
   if(mins<60) return `${mins}m`
@@ -253,11 +224,10 @@ function htfTrend(h1){ if(h1.length<50) return 'neutral'
   if(e20&&e50&&price>e50&&e20>e50) return 'bullish'
   if(e20&&e50&&price<e50&&e20<e50) return 'bearish'; return 'neutral' }
 
-// signal-bar candle confirmation: close must sit on the trade's side of the bar
 function candleConfirms(dir, bar){
   if(!bar) return true
   const range=bar.high-bar.low; if(range<=0) return true
-  const closePos=(bar.close-bar.low)/range   // 0=at low, 1=at high
+  const closePos=(bar.close-bar.low)/range
   if(dir==='BUY')  return closePos>=0.40
   if(dir==='SELL') return closePos<=0.60
   return true
@@ -275,12 +245,10 @@ function spreadAt(ts,regime){ let s=SPREAD_BASE
 function stopSlipAt(ts,regime){ return (inNewsBlackout(ts)||regime==='volatile_expansion')?STOP_SLIP_FAST:STOP_SLIP }
 
 // ── TP PLACEMENT (shared by scalp + swing paths) ─────────────
-// allTargets: [{level,kind,base,strength,tfWeight}] beyond entry in the trade dir
 function placeTPs(dir, entry, sl, atr, profile, allTargets, tpBuf){
   const R = Math.abs(entry - sl)
 
   if(profile.liquidity==='on'){
-    // ── SWING: full liquidity-target search (v4.1 behaviour) ──
     const cands = allTargets
       .filter(t => dir==='BUY' ? (t.level > entry + R*0.8 && t.level <= entry + atr*12)
                                : (t.level < entry - R*0.8 && t.level >= entry - atr*12))
@@ -308,8 +276,6 @@ function placeTPs(dir, entry, sl, atr, profile, allTargets, tpBuf){
     return { tp1,tp2,tp3, tpInfo:picked.map(p=>p.kind) }
   }
 
-  // ── SCALP / INTRADAY: R-based targets, snapped NEARER to any
-  //    liquidity sitting in the path (take profit before the magnet) ──
   const cap = profile.tpCapAtr*atr
   const levels = allTargets
     .filter(t => dir==='BUY' ? t.level>entry : t.level<entry)
@@ -392,15 +358,12 @@ function analyse(candles,nowMs,cfg){
   ].filter(Boolean).length
   if(CONFLUENCE_MIN>0 && confl<CONFLUENCE_MIN) return wait(`confluence ${confl}/<${CONFLUENCE_MIN}`,reg,cfg,{net,bull,bear})
 
-  // candle confirmation on the signal bar — scalp/intraday only
   if(REQUIRE_CANDLE_CONFIRM && profile.type!=='SWING' && !candleConfirms(dir,last(candles)))
     return wait('candle not confirming',reg,cfg,{net,bull,bear})
 
-  // off-hours scalp strictness
   if(SCALP_OFFHOURS_STRICT && profile.type!=='SWING' && sessionOf(nowMs)==='offhours' && conv<MIN_CONV+0.10)
     return wait('off-hours scalp & weak',reg,cfg,{net,bull,bear})
 
-  // ── SL placement (anchored to wicks, regime-scaled buffer) ──
   const buf = reg.regime==='volatile_expansion' ? atr*0.8 : atr*0.5
   const stopMult = reg.regime==='volatile_expansion' ? 2.5 : 1.8
 
@@ -413,7 +376,6 @@ function analyse(candles,nowMs,cfg){
   const weekLow     = Math.min(...weekCandles.map(c=>c.low))
   const weekHigh    = Math.max(...weekCandles.map(c=>c.high))
 
-  // pooled MTF swing levels (look-ahead safe — resampleTF drops forming bar)
   const htfDefs=[{mins:cfg.min,weight:1},{mins:15,weight:2},{mins:60,weight:3},{mins:240,weight:4}]
   const pooledHighs=[], pooledLows=[]
   for(const def of htfDefs){
@@ -457,7 +419,6 @@ function analyse(candles,nowMs,cfg){
     let slRaw = anchor ? anchor - buf : entry - atr*stopMult
     if(slRaw >= entry) slRaw = entry - atr*stopMult
     sl = +Math.max(slRaw, entry - atr*5).toFixed(SYMBOL_DECIMALS)
-    // minimum stop distance floor (noise/spread can't insta-kill)
     if(entry - sl < profile.minStopAtr*atr)
       sl = +Math.max(entry - profile.minStopAtr*atr, entry - atr*5).toFixed(SYMBOL_DECIMALS)
   }else{
@@ -477,7 +438,6 @@ function analyse(candles,nowMs,cfg){
 
   const { tp1, tp2, tp3, tpInfo } = placeTPs(dir, entry, sl, atr, profile, buildTargets(dir), tpBuf)
 
-  // ── feasibility: TP1 must clear the spread by a margin ──
   const spr = spreadAt(nowMs, reg.regime)
   if(Math.abs(tp1-entry) < SPREAD_TP1_MIN_MULT*spr)
     return wait('TP1 too small vs spread',reg,cfg,{net,bull,bear})
@@ -493,7 +453,17 @@ function analyse(candles,nowMs,cfg){
     inv:dir==='BUY'?`${cfg.tframe} close below ${fmt(sl)}`:`${cfg.tframe} close above ${fmt(sl)}`,
     reasons, skipped:false }
 }
-function wait(why,reg,cfg,extra={}){ return {direction:'WAIT',skipped:true,why,symbol:SYMBOL_LABEL,tframe:cfg?.tframe,regime:reg?.regime,...extra} }
+// ── DIAGNOSTIC-ENRICHED WAIT (v4.4c) ──────────────────────────
+// Every WAIT now carries the actual measured atrPct plus the exact
+// atrLow/atrHigh band it was judged against (cfg's calibrated values —
+// the SAME numbers marketRegime() and the hard-band check above just
+// used), so the console log can show real numbers instead of just a
+// regime label. Costs nothing extra to compute — reg already has atrPct.
+function wait(why,reg,cfg,extra={}){
+  return { direction:'WAIT', skipped:true, why, symbol:SYMBOL_LABEL, tframe:cfg?.tframe,
+    regime:reg?.regime, atrPct:reg?.atrPct??null, atrLow:cfg?.atrLow??null, atrHigh:cfg?.atrHigh??null,
+    ...extra }
+}
 
 // ── DATA VALIDATION ──────────────────────────────────────────
 function validateData(c,cfg){
@@ -687,7 +657,18 @@ async function checkOne(tframe){
   if(candles.length<50){console.log(`[${ts}] ${SYMBOL_LABEL} ${tframe} too few bars`);return}
   const closed=candles.slice(0,-1),forming=candles[candles.length-1]
   const sig=analyse(closed,closed[closed.length-1].timestamp,cfg)
-  if(sig.skipped){console.log(`[${ts}] ${SYMBOL_LABEL} ${tframe} WAIT · ${sig.regime} · ${sig.why}`);return}
+  if(sig.skipped){
+    // ── DIAGNOSTIC LOGGING (v4.4c) ─────────────────────────────
+    // Print the actual measured ATR% and the exact band it was judged
+    // against whenever we have them (low-liquidity / hard-band WAITs),
+    // so it's immediately obvious whether a WAIT is a real quiet market
+    // or a bad calibration — no separate manual check needed.
+    const atrInfo = sig.atrPct!=null
+      ? ` · ATR ${sig.atrPct.toFixed(4)}% (band ${sig.atrLow}–${sig.atrHigh}%)`
+      : ''
+    console.log(`[${ts}] ${SYMBOL_LABEL} ${tframe} WAIT · ${sig.regime} · ${sig.why}${atrInfo}`)
+    return
+  }
   const live=forming.close,R=Math.abs(sig.entry-sig.sl)
   if((sig.direction==='BUY'?live<=sig.sl:live>=sig.sl)){console.log(`[${ts}] ${SYMBOL_LABEL} ${tframe} SKIP: live past stop`);return}
   if((sig.direction==='BUY'?sig.entry-live:live-sig.entry)>0.5*R){console.log(`[${ts}] ${SYMBOL_LABEL} ${tframe} SKIP: stale (>0.5R drift)`);return}
