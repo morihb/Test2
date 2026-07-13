@@ -1,9 +1,27 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  launcher.mjs  —  v10.10 (Multi-Symbol + Multi-Timeframe + LEARNING LOG +
+//  launcher.mjs  —  v10.11 (Multi-Symbol + Multi-Timeframe + LEARNING LOG +
 //  PER-SYMBOL SPREAD + CUSTOM TIMEFRAME DEPENDENCY GRAPH + CONFIRMED-
-//  REVERSAL CASCADE CLOSE + PER-TF SEND TOGGLE + POST-TP3 COOLDOWN)
+//  REVERSAL CASCADE CLOSE + PER-TF SEND TOGGLE + POST-TP3 COOLDOWN +
+//  CROSS-TIMEFRAME DUPLICATE SUPPRESSION)
 //
-//  New in v10.10:
+//  New in v10.11:
+//   • CROSS-TIMEFRAME DUPLICATE SUPPRESSION — if a fresh signal fires on one
+//     timeframe (e.g. 5m) while ANOTHER timeframe of the SAME symbol (e.g.
+//     1m) already holds an open trade in the SAME direction opened within
+//     the last DUPLICATE_WINDOW_MIN minutes (default 60), it's treated as
+//     the same underlying move, not two independent trades. Only the BETTER
+//     signal (higher score) is sent and tracked — the weaker one is dropped
+//     silently: no message, no state entry, no daily/learning row. If the
+//     NEW signal is the better one, the older, weaker duplicate is closed
+//     out of state quietly (no "reversal"/"closed" message — it was never
+//     meant to be two separate trades) and the new one sends normally.
+//   • SILENT TP3 COOLDOWN — the post-TP3 cooldown still arms exactly as
+//     before (POST_TP3_COOLDOWN_CANDLES real candle closes before a new
+//     signal on that symbol|tf can send), but the TP3 alert message no
+//     longer mentions the cooldown to subscribers — it's purely an internal
+//     suppression, not a user-facing detail.
+//
+//  v10.10:
 //   • CUSTOM TIMEFRAME DEPENDENCY GRAPH — replaces the old fixed "any
 //     strictly-higher timeframe blocks any lower one" rule with an explicit,
 //     admin-chosen list PER timeframe (admin → Symbols → 🔗 Dependencies):
@@ -201,6 +219,34 @@ function getDependents(symObj, reversedTf) {
 function isSendEnabled(symObj, tf) {
   if (!Array.isArray(symObj.send_timeframes)) return true   // not configured → send everything
   return symObj.send_timeframes.includes(tf)
+}
+
+// ── CROSS-TIMEFRAME DUPLICATE SUPPRESSION (v10.11) ──────────────────────────
+// If a fresh signal fires on timeframe A while ANOTHER timeframe B of the
+// SAME symbol already holds an open trade in the SAME direction, opened
+// within the last DUPLICATE_WINDOW_MIN minutes, treat it as one underlying
+// move rather than two independent trades. Only the BETTER signal (higher
+// score) is sent/tracked:
+//   • If the NEW signal (tf A) scores higher than the held one (tf B), the
+//     held one is dropped from state silently (no message — it was never
+//     really a separate trade) and the new one goes on to send normally.
+//   • If the NEW signal scores lower or equal, IT is dropped instead — never
+//     sent, never tracked, never logged. The caller should `return` in that
+//     case without doing anything else.
+// This runs only on the "brand-new signal" path — never on KEEP HOLDING or
+// the confirmed-reversal path, which already have their own state handling.
+const DUPLICATE_WINDOW_MIN = parseInt(process.env.DUPLICATE_WINDOW_MIN || '60')
+function findDuplicateAcrossTimeframes(symObj, tf, direction) {
+  const state = loadState(), now = Date.now()
+  for (const otherTf of symObj.timeframes) {
+    if (otherTf === tf) continue
+    const t = openTrade(state, symObj.id, otherTf)
+    if (t && t.direction === direction) {
+      const openedAt = t.ts ? new Date(t.ts).getTime() : 0
+      if (now - openedAt <= DUPLICATE_WINDOW_MIN * 60000) return { tf: otherTf, trade: t }
+    }
+  }
+  return null
 }
 
 // ── POST-TP3 COOLDOWN (v10.9) ───────────────────────────────────────────────
@@ -422,13 +468,13 @@ async function evalTradeAgainstBar(state, symObj, tf, sig, bar) {
   // ── TP3 (full target → close) ──
   if(sig.tp2Hit && !sig.tp3Hit && (dir==='BUY' ? bar.high>=sig.tp3 : bar.low<=sig.tp3)){
     const pips=toPips(sig.tp3-entry,dp)
-    await sendReply(`${dirIcon(dir)} <b>${symObj.label} ${tf.toUpperCase()} — TP3 HIT 🏆 FULL TARGET</b>\n+${pips} pips @ ${sig.tp3.toFixed(dp)}\nAll targets reached! 🎯${POST_TP3_COOLDOWN_CANDLES>0?`\n🧊 Cooling down ${POST_TP3_COOLDOWN_CANDLES} candle(s) before a new ${tf.toUpperCase()} signal can send.`:''}`, symObj.id, adminReplyId, subMsgIds)
+    await sendReply(`${dirIcon(dir)} <b>${symObj.label} ${tf.toUpperCase()} — TP3 HIT 🏆 FULL TARGET</b>\n+${pips} pips @ ${sig.tp3.toFixed(dp)}\nAll targets reached! 🎯`, symObj.id, adminReplyId, subMsgIds)
     addToDaily({sym:symObj.id,tf,dir,result:'TP3',pips,sign:+1,signalId})
     logOutcome(symObj,tf,sig,'TP3',pips,+1)
     state[key]=null
-    armCooldown(state, symObj.id, tf, POST_TP3_COOLDOWN_CANDLES)   // mutate SAME in-memory state — no separate I/O, avoids clobbering this batch's pending writes
+    armCooldown(state, symObj.id, tf, POST_TP3_COOLDOWN_CANDLES)   // mutate SAME in-memory state — no separate I/O, avoids clobbering this batch's pending writes; cooldown is silent, never mentioned in the user-facing message
     changed=true
-    console.log(`[${symObj.label} ${tf}] 🏆 TP3 +${pips} pips${POST_TP3_COOLDOWN_CANDLES>0?` — cooldown armed (${POST_TP3_COOLDOWN_CANDLES} candles)`:''}`)
+    console.log(`[${symObj.label} ${tf}] 🏆 TP3 +${pips} pips${POST_TP3_COOLDOWN_CANDLES>0?` — cooldown armed silently (${POST_TP3_COOLDOWN_CANDLES} candles)`:''}`)
     return changed   // trade fully closed
   }
 
@@ -735,6 +781,26 @@ async function runSignalCycle(symObj, tf, isStartup=false) {
         return
       }
 
+      // ── CROSS-TIMEFRAME DUPLICATE SUPPRESSION (v10.11) ───────────────────
+      // Another timeframe of this SAME symbol may already be holding a fresh
+      // trade in the SAME direction (e.g. 1m fired, now 5m fires too on the
+      // same move). Only the better-scoring signal is kept — the weaker one
+      // never sends and never gets tracked. Runs AFTER the dependency gate
+      // so a genuinely blocked signal is reported as blocked, not as a
+      // duplicate.
+      const dup = findDuplicateAcrossTimeframes(symObj, tf, sig.direction)
+      if (dup) {
+        if (sig.score > (dup.trade.score ?? 0)) {
+          const s = loadState()
+          s[`${symObj.id}|${dup.tf}`] = null
+          saveState(s)
+          console.log(`[${symObj.label} ${tf}] 🔁 Duplicate ${sig.direction} across timeframes — ${dup.tf} (score ${dup.trade.score}) dropped silently in favor of this ${tf} signal (score ${sig.score})`)
+        } else {
+          console.log(`[${symObj.label} ${tf}] 🔁 Duplicate ${sig.direction} suppressed — ${dup.tf} already holds an equal/better signal (score ${dup.trade.score} vs ${sig.score})`)
+          return
+        }
+      }
+
       const entry=parseFloat(sig.entry), sl=parseFloat(sig.sl)
       const tp1=parseFloat(sig.tp1), tp2=parseFloat(sig.tp2), tp3=parseFloat(sig.tp3)
       const msgText=
@@ -806,12 +872,13 @@ function scheduleDailySummary(){
 // ── STARTUP ───────────────────────────────────────────────────────────────
 const symbols=getLiveSymbols()
 
-console.log('🚀 Gold AI Launcher v10.10 — Custom TF Dependency Graph + Per-TF Send Toggle + Post-TP3 Cooldown + Confirmed-Reversal Cascade + Per-Symbol Spread + Calibrated ATR')
+console.log('🚀 Gold AI Launcher v10.11 — Cross-TF Duplicate Suppression + Silent TP3 Cooldown + Custom TF Dependency Graph + Per-TF Send Toggle + Confirmed-Reversal Cascade + Per-Symbol Spread + Calibrated ATR')
 console.log(`   Symbols: ${symbols.map(s=>`${s.emoji}${s.label}[${s.timeframes.join(',')}]`).join('  ')}`)
 console.log(`   ⚡ TP/SL watcher: every 1 min — TP & SL both trigger on wick touch`)
 console.log(`   🔗 Custom TF dependency graph: each timeframe blocked only by its OWN configured dependencies (default = every higher TF) — set via admin → Symbols → Dependencies`)
 console.log(`   📤 Per-TF send toggle: silent timeframes are still analysed (feeds dependency/reversal logic) but never sent or tracked — set via admin → Symbols → Signal Sending`)
-console.log(`   🧊 Post-TP3 cooldown: ${POST_TP3_COOLDOWN_CANDLES} candle(s) suppressed on a symbol|tf right after it hits TP3 (POST_TP3_COOLDOWN_CANDLES to change)`)
+console.log(`   🔁 Cross-TF duplicate suppression: only the better-scoring signal across timeframes (within ${DUPLICATE_WINDOW_MIN} min) is sent/tracked — DUPLICATE_WINDOW_MIN to change`)
+console.log(`   🧊 Post-TP3 cooldown: ${POST_TP3_COOLDOWN_CANDLES} candle(s) suppressed silently on a symbol|tf right after it hits TP3 (POST_TP3_COOLDOWN_CANDLES to change, not shown in the TP3 message)`)
 console.log(`   🔄 Confirmed-reversal cascade: fresh gated opposite signal (score≥${REVERSAL_MIN_SCORE}) closes held trade + dependent-TF same-direction trades at live price (REVERSAL_CASCADE=0 to disable)`)
 console.log(`   💱 Per-symbol spread: injected from admin config, falls back to engine's 0.30 default`)
 console.log(`   🔁 KEEP HOLDING updates respect the /keepholding user toggle`)
