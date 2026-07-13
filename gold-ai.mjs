@@ -1,16 +1,27 @@
 // ─────────────────────────────────────────────────────────────
-//  GOLD.AI — v4.4c  (multi-symbol · multi-timeframe · SPEED-AWARE +
-//  ATR DIAGNOSTIC LOGGING)
+//  GOLD.AI — v4.4d  (multi-symbol · multi-timeframe · SPEED-AWARE +
+//  ATR DIAGNOSTIC LOGGING + MISSING 1m PRESET FIX)
 //
-//  This is v4.4b with ONE addition: every WAIT caused by ATR
-//  (low_liquidity or the hard sanity band) now carries the ACTUAL
-//  measured atrPct plus the exact atrLow/atrHigh band it was judged
-//  against, and checkOne()'s console log prints them. Previously the
-//  log only said "low liquidity" with no numbers, making it
-//  impossible to tell a real quiet market from a bad calibration
-//  without separately fetching data and recomputing ATR by hand.
-//  Nothing else changed — same scoring, gates, TP/SL logic, trade
-//  profiles as v4.4b (brain gate already removed in v4.4b).
+//  New in v4.4d:
+//   • MISSING '1m' PRESET FIX — TF_PRESETS and TRADE_PROFILES had NO
+//     entry for '1m'. cfgFor()/profileFor() both fall back to a
+//     default preset when a timeframe is missing (`||TF_PRESETS['5m']`
+//     and `||TRADE_PROFILES['15m']`), so every "1m" cycle was silently
+//     fetching 5-MINUTE candles from TwelveData (cfg.td='5min') while
+//     logging and labeling everything as "1m". This is why live 1m ATR
+//     readings looked "stuck" for several minutes at a stretch (the
+//     5-min bars underneath only actually changed once every 5
+//     minutes) before jumping — a real bug, not sampling noise. Added
+//     a proper '1m' entry to both tables (min:1, td:'1min', its own
+//     ATR band + SCALP profile). ATR_LOW/ATR_HIGH from a symbol's
+//     calibrated 1m band (once recalibrated against real 1-minute
+//     data) will still override these fallback values as before.
+//
+//  v4.4c: WAIT logs now print actual ATR% + calibrated band for
+//  low_liquidity / hard-band diagnostics.
+//
+//  v4.4b: brain gate removed. Everything else (adaptive ATR band,
+//  trade profiles, scoring, TP/SL logic) unchanged from v4.4.
 // ─────────────────────────────────────────────────────────────
 import fs from 'fs'
 
@@ -51,6 +62,7 @@ const CONFLUENCE_MIN         = envNum('CONFLUENCE_MIN',0)
 
 // ── TIMEFRAME PRESETS (data/interval/regime bands) ───────────
 const TF_PRESETS={
+  '1m': {min:1,   td:'1min', oanda:'M1', trendMin:15,   structMin:5,   atrLow:0.02,atrHigh:0.35,window:480, warmup:300,maxHold:20,target:40000},
   '5m': {min:5,   td:'5min', oanda:'M5', trendMin:60,   structMin:15,  atrLow:0.04,atrHigh:0.55,window:1200,warmup:700,maxHold:24,target:30000},
   '15m':{min:15,  td:'15min',oanda:'M15',trendMin:240,  structMin:60,  atrLow:0.08,atrHigh:0.80,window:600, warmup:400,maxHold:24,target:25000},
   '1h': {min:60,  td:'1h',   oanda:'H1', trendMin:240,  structMin:60,  atrLow:0.15,atrHigh:1.20,window:400, warmup:300,maxHold:24,target:20000},
@@ -60,6 +72,7 @@ const TF_PRESETS={
 
 // ── TRADE PROFILES — the "speed" layer ───────────────────────
 const TRADE_PROFILES={
+  '1m' : {type:'SCALP',    maxHold:10, tpR:[1.0,1.5,2.0], tpCapAtr:3,  minStopAtr:0.5, liquidity:'off'},
   '5m' : {type:'SCALP',    maxHold:12, tpR:[1.0,1.5,2.0], tpCapAtr:3,  minStopAtr:0.6, liquidity:'off'},
   '15m': {type:'SCALP',    maxHold:12, tpR:[1.0,1.5,2.0], tpCapAtr:4,  minStopAtr:0.7, liquidity:'off'},
   '1h' : {type:'INTRADAY', maxHold:10, tpR:[1.0,1.6,2.5], tpCapAtr:6,  minStopAtr:0.8, liquidity:'light'},
