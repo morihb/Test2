@@ -1,9 +1,26 @@
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  GOLD.AI — Subscription Bot  v6.1 — ATR Calibration + Per-Symbol Spread +
-//  /keepholding + /statistics
+//  GOLD.AI — Subscription Bot  v6.2 — ATR CALIBRATION MARGIN FIX + Per-Symbol
+//  Spread + /keepholding + /statistics
 //
-//  New in v6.1:
+//  New in v6.2:
+//   • 🎯 ATR CALIBRATION MARGIN FIX — calibrateSymbol()/atrPctDistribution()
+//     previously set atrLow = the RAW 5th percentile of one ~500-bar sample,
+//     with NO safety margin. By definition, 5% of THAT specific calibration
+//     window already fell below that floor — so any later period even
+//     slightly quieter than the calibration window (very common, since a
+//     single ~8-hour fetch only ever samples whatever sessions happened to
+//     be active then) would trip low_liquidity far more than the intended
+//     5% of the time. Fixed by applying the margin the design always called
+//     for but never actually implemented: atrLow = p5 × 0.7 (30% of headroom
+//     below the sample's quietest 5%), atrHigh = p95 × 1.4 (40% headroom
+//     above the sample's most volatile 5%). This does NOT change the ATR
+//     math itself (still the same Wilder ATR%, same percentile calc) — it
+//     only widens the band so a single finite historical sample doesn't act
+//     as a hard, zero-slack edge. Existing symbols keep their OLD (tighter,
+//     unpadded) bands until you tap "🎯 Recalibrate ATR" again.
+//
+//  v6.1:
 //   • 💱 PER-SYMBOL SPREAD — fixes forex pairs getting killed by
 //     "TP1 too small vs spread". The engine's SPREAD env defaults to 0.30
 //     (gold-tuned, i.e. 30 pips for a 4-decimal pair) — far too wide for
@@ -216,12 +233,13 @@ function setKeepHolding(chatId, on) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ATR CALIBRATION (v6.0) — per-symbol, per-timeframe regime bands
-//  Fetches ~500 bars per timeframe from TwelveData, computes the rolling
-//  14-period ATR% distribution, and stores p5/p95 as the low-liquidity /
-//  volatile-expansion thresholds. This is what makes forex pairs work —
-//  gold's default bands (e.g. 0.08–0.80% on 15m) sit far above typical
-//  forex ATR%, so every pair was blocked as "low_liquidity".
+//  ATR CALIBRATION (v6.0, margin fix in v6.2) — per-symbol, per-timeframe
+//  regime bands. Fetches ~500 bars per timeframe from TwelveData, computes
+//  the rolling 14-period ATR% distribution, and stores a PADDED low-liquidity
+//  / volatile-expansion band derived from that distribution's p5/p95. This is
+//  what makes forex pairs work — gold's default bands (e.g. 0.08–0.80% on
+//  15m) sit far above typical forex ATR%, so every pair was blocked as
+//  "low_liquidity".
 // ─────────────────────────────────────────────────────────────────────────────
 const TF_TO_TD = { '1m':'1min','3m':'3min','5m':'5min','15m':'15min','30m':'30min','1h':'1h','2h':'2h','4h':'4h','1d':'1day' }
 
@@ -272,10 +290,20 @@ export async function calibrateSymbol(symId) {
     const bars = await fetchBarsForCalibration(sym.td_symbol, tf)
     const dist = bars ? atrPctDistribution(bars) : null
     if (dist) {
-      const atrLow  = Math.max(dist.p5, 0.0005)                 // sanity floor
-      const atrHigh = Math.max(dist.p95, atrLow * 3)            // band must have width
-      bands[tf] = { atrLow:+atrLow.toFixed(5), atrHigh:+atrHigh.toFixed(5), calibratedAt:new Date().toISOString(), bars:bars.length }
-      details.push(`• ${tf}: ${bands[tf].atrLow}% – ${bands[tf].atrHigh}%  (${bars.length} bars)`)
+      // ── v6.2 MARGIN FIX ──────────────────────────────────────────────
+      // dist.p5/dist.p95 are the RAW percentiles of ONE ~500-bar sample.
+      // Using them as a hard, unpadded floor/ceiling means 5% of THAT
+      // sample already sat outside the band by construction — so any
+      // later period even slightly quieter (or livelier) than the
+      // specific hours this calibration happened to run during will trip
+      // low_liquidity (or volatile_expansion) far more than 5% of the
+      // time, purely from sampling variance, not a real regime change.
+      // p5 × 0.7 gives 30% headroom below the sample's quietest 5%;
+      // p95 × 1.4 gives 40% headroom above its most volatile 5%.
+      const atrLow  = Math.max(dist.p5 * 0.7, 0.0005)             // sanity floor + margin
+      const atrHigh = Math.max(dist.p95 * 1.4, atrLow * 3)        // band must have width
+      bands[tf] = { atrLow:+atrLow.toFixed(5), atrHigh:+atrHigh.toFixed(5), calibratedAt:new Date().toISOString(), bars:bars.length, rawP5:dist.p5, rawP95:dist.p95 }
+      details.push(`• ${tf}: ${bands[tf].atrLow}% – ${bands[tf].atrHigh}%  (${bars.length} bars, raw p5/p95: ${dist.p5}%/${dist.p95}%)`)
     } else {
       details.push(`• ${tf}: ❌ not enough data — keeping current band`)
     }
@@ -1838,7 +1866,7 @@ Send <code>default</code> to use gold's spread (0.30) — only correct if this i
 // ── LONG POLLING ──────────────────────────────────────────────────────────
 async function startPolling() {
   const s=loadSettings()
-  console.log('🤖 Gold AI Subscription Bot v6.1 — ATR Calibration + Per-Symbol Spread + /keepholding + /statistics')
+  console.log('🤖 Gold AI Subscription Bot v6.2 — ATR Calibration Margin Fix + Per-Symbol Spread + /keepholding + /statistics')
   console.log(`   Channel: ${s.channel} | Admin: ${ADMIN_ID}`)
   console.log(`   Symbols: ${getActiveSymbols().map(x=>`${x.emoji||''}${x.label}`).join(', ')}`)
   console.log(`   Bundles: ${getActiveBundles().map(x=>x.label).join(', ')||'none'}`)
