@@ -1,10 +1,23 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  launcher.mjs  —  v10.11 (Multi-Symbol + Multi-Timeframe + LEARNING LOG +
+//  launcher.mjs  —  v10.12 (Multi-Symbol + Multi-Timeframe + LEARNING LOG +
 //  PER-SYMBOL SPREAD + CUSTOM TIMEFRAME DEPENDENCY GRAPH + CONFIRMED-
 //  REVERSAL CASCADE CLOSE + PER-TF SEND TOGGLE + POST-TP3 COOLDOWN +
-//  CROSS-TIMEFRAME DUPLICATE SUPPRESSION)
+//  CROSS-TIMEFRAME DUPLICATE SUPPRESSION + SINGLE TRADE PER SYMBOL)
 //
-//  New in v10.11:
+//  New in v10.12:
+//   • SINGLE ACTIVE TRADE PER SYMBOL (default ON) — the main lock most
+//     setups want: while ANY timeframe of a symbol holds an open trade, NO
+//     other timeframe of that symbol may send a fresh signal, regardless of
+//     direction, score, or timeframe hierarchy. E.g. if 1m holds a SELL,
+//     5m and 1h are both blocked from sending ANYTHING (BUY or SELL) on
+//     that symbol until the 1m trade closes (TP3/SL/BE) or gets confirmed-
+//     reversal-closed. This is stricter than, and checked BEFORE, both the
+//     dependency gate and the cross-timeframe duplicate suppression below —
+//     with it ON (the default), those two rarely get a chance to fire at
+//     all. Set SINGLE_TRADE_PER_SYMBOL=0 to fall back to the old behaviour
+//     (multiple timeframes of one symbol can each hold their own trade,
+//     governed by the dependency graph + duplicate suppression instead).
+//
 //   • CROSS-TIMEFRAME DUPLICATE SUPPRESSION — if a fresh signal fires on one
 //     timeframe (e.g. 5m) while ANOTHER timeframe of the SAME symbol (e.g.
 //     1m) already holds an open trade in the SAME direction opened within
@@ -245,6 +258,28 @@ function findDuplicateAcrossTimeframes(symObj, tf, direction) {
       const openedAt = t.ts ? new Date(t.ts).getTime() : 0
       if (now - openedAt <= DUPLICATE_WINDOW_MIN * 60000) return { tf: otherTf, trade: t }
     }
+  }
+  return null
+}
+
+// ── SINGLE ACTIVE TRADE PER SYMBOL (v10.12, default ON) ─────────────────────
+// Stricter than the duplicate suppression above: while ANY timeframe of a
+// symbol holds an open trade, NO other timeframe of that same symbol may
+// send a fresh signal — regardless of direction, regardless of score, and
+// regardless of whether the other timeframe is "higher" or "lower". Only
+// one active trade per symbol, ever, across every timeframe. The blocked
+// signal isn't sent, tracked, or logged — it's simply skipped, exactly like
+// every other suppression in this file.
+// Set SINGLE_TRADE_PER_SYMBOL=0 to go back to allowing multiple concurrent
+// timeframes on the same symbol to each hold their own trade (in which case
+// the dependency gate + duplicate suppression above still apply as before).
+const SINGLE_TRADE_PER_SYMBOL = process.env.SINGLE_TRADE_PER_SYMBOL !== '0'
+function anyOtherTfHoldingTrade(symObj, tf) {
+  const state = loadState()
+  for (const otherTf of symObj.timeframes) {
+    if (otherTf === tf) continue
+    const t = openTrade(state, symObj.id, otherTf)
+    if (t) return { tf: otherTf, trade: t }
   }
   return null
 }
@@ -767,7 +802,22 @@ async function runSignalCycle(symObj, tf, isStartup=false) {
         return
       }
 
+      // ── SINGLE ACTIVE TRADE PER SYMBOL (v10.12) ──────────────────────────
+      // Default ON. If ANY other timeframe of this symbol already holds an
+      // open trade — any direction — this fresh signal is dropped outright,
+      // before the dependency gate or duplicate check even run. This is the
+      // main lock most setups want: only one active trade per symbol, ever.
+      if (SINGLE_TRADE_PER_SYMBOL) {
+        const other = anyOtherTfHoldingTrade(symObj, tf)
+        if (other) {
+          console.log(`[${symObj.label} ${tf}] ⛔ ${sig.direction} suppressed — ${other.tf} already holds an active ${other.trade.direction} trade on this symbol (single-trade-per-symbol; set SINGLE_TRADE_PER_SYMBOL=0 to allow concurrent timeframes)`)
+          return
+        }
+      }
+
       // TIMEFRAME DEPENDENCY GATE (v10.10) — HARD block, no exceptions.
+      // Only reached when SINGLE_TRADE_PER_SYMBOL=0 finds nothing above, or
+      // the symbol has multiple trades allowed.
       // Any timeframe opposing an open trade on ANY of ITS configured
       // dependencies (admin → Symbols → 🔗 Dependencies; defaults to every
       // higher timeframe if never customised) is suppressed outright. E.g.
@@ -872,9 +922,10 @@ function scheduleDailySummary(){
 // ── STARTUP ───────────────────────────────────────────────────────────────
 const symbols=getLiveSymbols()
 
-console.log('🚀 Gold AI Launcher v10.11 — Cross-TF Duplicate Suppression + Silent TP3 Cooldown + Custom TF Dependency Graph + Per-TF Send Toggle + Confirmed-Reversal Cascade + Per-Symbol Spread + Calibrated ATR')
+console.log('🚀 Gold AI Launcher v10.12 — Single Trade Per Symbol + Cross-TF Duplicate Suppression + Silent TP3 Cooldown + Custom TF Dependency Graph + Per-TF Send Toggle + Confirmed-Reversal Cascade + Per-Symbol Spread + Calibrated ATR')
 console.log(`   Symbols: ${symbols.map(s=>`${s.emoji}${s.label}[${s.timeframes.join(',')}]`).join('  ')}`)
 console.log(`   ⚡ TP/SL watcher: every 1 min — TP & SL both trigger on wick touch`)
+console.log(`   🔒 Single trade per symbol: ${SINGLE_TRADE_PER_SYMBOL?'ON':'OFF'} — only one active trade per symbol across all timeframes (SINGLE_TRADE_PER_SYMBOL=0 to allow concurrent timeframes)`)
 console.log(`   🔗 Custom TF dependency graph: each timeframe blocked only by its OWN configured dependencies (default = every higher TF) — set via admin → Symbols → Dependencies`)
 console.log(`   📤 Per-TF send toggle: silent timeframes are still analysed (feeds dependency/reversal logic) but never sent or tracked — set via admin → Symbols → Signal Sending`)
 console.log(`   🔁 Cross-TF duplicate suppression: only the better-scoring signal across timeframes (within ${DUPLICATE_WINDOW_MIN} min) is sent/tracked — DUPLICATE_WINDOW_MIN to change`)
