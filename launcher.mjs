@@ -1,8 +1,20 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  launcher.mjs  —  v10.12 (Multi-Symbol + Multi-Timeframe + LEARNING LOG +
+//  launcher.mjs  —  v10.13 (Multi-Symbol + Multi-Timeframe + LEARNING LOG +
 //  PER-SYMBOL SPREAD + CUSTOM TIMEFRAME DEPENDENCY GRAPH + CONFIRMED-
-//  REVERSAL CASCADE CLOSE + PER-TF SEND TOGGLE + POST-TP3 COOLDOWN +
+//  REVERSAL CASCADE CLOSE + PER-TF SEND TOGGLE + POST-TP3/POST-SL COOLDOWN +
 //  CROSS-TIMEFRAME DUPLICATE SUPPRESSION + SINGLE TRADE PER SYMBOL)
+//
+//  New in v10.13:
+//   • POST-SL COOLDOWN — mirrors the existing post-TP3 cooldown. After a
+//     symbol|tf trade is stopped out by a GENUINE loss (no TP level ever
+//     reached, not a break-even close), a fresh signal on that SAME
+//     symbol|tf is suppressed for POST_SL_COOLDOWN_CANDLES real candle
+//     closes (default 2), same as the TP3 cooldown. Prevents immediately
+//     re-entering right after a loss on a move that may still be working
+//     against the original idea. A trade that reached TP1 and later closed
+//     at break-even does NOT arm this — that was still a win overall, not a
+//     loss. Like the TP3 cooldown, this is silent: nothing about it appears
+//     in the SL alert message itself, only in the console/journal log.
 //
 //  New in v10.12:
 //   • SINGLE ACTIVE TRADE PER SYMBOL (default ON) — the main lock most
@@ -294,6 +306,13 @@ function anyOtherTfHoldingTrade(symObj, tf) {
 // read the bare `${symId}|${tf}` key) and survives independently of whether
 // a new trade opens/closes in between.
 const POST_TP3_COOLDOWN_CANDLES = parseInt(process.env.POST_TP3_COOLDOWN_CANDLES || '2')
+// Same idea, for a real stop-loss instead of a full win. After a symbol|tf
+// trade is stopped out (a genuine SL — NOT a break-even close), suppress a
+// new signal on that SAME symbol|tf for POST_SL_COOLDOWN_CANDLES real candle
+// closes. Prevents immediately re-entering right after a loss on a move that
+// may still be working against the original idea. Break-even closes do NOT
+// arm this cooldown — only a real loss does.
+const POST_SL_COOLDOWN_CANDLES = parseInt(process.env.POST_SL_COOLDOWN_CANDLES || '2')
 const cooldownKey = (symId, tf) => `${symId}|${tf}|cooldown`
 
 function getCooldownCandles(symId, tf) {
@@ -522,6 +541,7 @@ async function evalTradeAgainstBar(state, symObj, tf, sig, bar) {
     const label = isBE ? 'Break-even (0 pips)' : `-${pips} pips`
     await sendReply(`${dirIcon(dir)} <b>${symObj.label} ${tf.toUpperCase()} — ${isBE?'CLOSED AT BREAK-EVEN 🟦':'STOP LOSS ❌'}</b>\n${label} @ ${sl.toFixed(dp)}\nPrice touched the stop — stopped out immediately.`, symObj.id, adminReplyId, subMsgIds)
     addToDaily({sym:symObj.id,tf,dir,result:isBE?'BE':'SL',pips,sign:isBE?0:-1,signalId})
+    let armedSlCooldown=false
     {
       // Learning row = FINAL outcome (furthest level reached), not the raw stop.
       // A trade that hit TP1 then stopped at break-even was a WIN for the brain.
@@ -529,9 +549,14 @@ async function evalTradeAgainstBar(state, symObj, tf, sig, bar) {
       const finalSign = (sig.tp2Hit||sig.tp1Hit) ? +1 : (isBE ? 0 : -1)
       const finalPips = sig.tp2Hit ? toPips(sig.tp2-entry,dp) : sig.tp1Hit ? toPips(sig.tp1-entry,dp) : pips
       logOutcome(symObj,tf,sig,finalRes,finalPips,finalSign)
+      // Only a GENUINE loss (no TP ever hit, not break-even) arms the SL
+      // cooldown — a trade that reached TP1 and later got stopped at
+      // break-even was still a win overall, and shouldn't be treated like
+      // a fresh loss for cooldown purposes.
+      if(finalSign===-1){ armCooldown(state, symObj.id, tf, POST_SL_COOLDOWN_CANDLES); armedSlCooldown=true }
     }
     state[key]=null; changed=true
-    console.log(`[${symObj.label} ${tf}] ${isBE?'🟦 BE':'🔴 SL'} (${label})`)
+    console.log(`[${symObj.label} ${tf}] ${isBE?'🟦 BE':'🔴 SL'} (${label})${armedSlCooldown&&POST_SL_COOLDOWN_CANDLES>0?` — cooldown armed silently (${POST_SL_COOLDOWN_CANDLES} candles)`:''}`)
   }
   return changed
 }
@@ -922,7 +947,7 @@ function scheduleDailySummary(){
 // ── STARTUP ───────────────────────────────────────────────────────────────
 const symbols=getLiveSymbols()
 
-console.log('🚀 Gold AI Launcher v10.12 — Single Trade Per Symbol + Cross-TF Duplicate Suppression + Silent TP3 Cooldown + Custom TF Dependency Graph + Per-TF Send Toggle + Confirmed-Reversal Cascade + Per-Symbol Spread + Calibrated ATR')
+console.log('🚀 Gold AI Launcher v10.13 — Post-SL Cooldown + Single Trade Per Symbol + Cross-TF Duplicate Suppression + Silent TP3 Cooldown + Custom TF Dependency Graph + Per-TF Send Toggle + Confirmed-Reversal Cascade + Per-Symbol Spread + Calibrated ATR')
 console.log(`   Symbols: ${symbols.map(s=>`${s.emoji}${s.label}[${s.timeframes.join(',')}]`).join('  ')}`)
 console.log(`   ⚡ TP/SL watcher: every 1 min — TP & SL both trigger on wick touch`)
 console.log(`   🔒 Single trade per symbol: ${SINGLE_TRADE_PER_SYMBOL?'ON':'OFF'} — only one active trade per symbol across all timeframes (SINGLE_TRADE_PER_SYMBOL=0 to allow concurrent timeframes)`)
@@ -930,6 +955,7 @@ console.log(`   🔗 Custom TF dependency graph: each timeframe blocked only by 
 console.log(`   📤 Per-TF send toggle: silent timeframes are still analysed (feeds dependency/reversal logic) but never sent or tracked — set via admin → Symbols → Signal Sending`)
 console.log(`   🔁 Cross-TF duplicate suppression: only the better-scoring signal across timeframes (within ${DUPLICATE_WINDOW_MIN} min) is sent/tracked — DUPLICATE_WINDOW_MIN to change`)
 console.log(`   🧊 Post-TP3 cooldown: ${POST_TP3_COOLDOWN_CANDLES} candle(s) suppressed silently on a symbol|tf right after it hits TP3 (POST_TP3_COOLDOWN_CANDLES to change, not shown in the TP3 message)`)
+console.log(`   🧊 Post-SL cooldown: ${POST_SL_COOLDOWN_CANDLES} candle(s) suppressed silently on a symbol|tf right after a genuine stop-loss (not break-even) (POST_SL_COOLDOWN_CANDLES to change, not shown in the SL message)`)
 console.log(`   🔄 Confirmed-reversal cascade: fresh gated opposite signal (score≥${REVERSAL_MIN_SCORE}) closes held trade + dependent-TF same-direction trades at live price (REVERSAL_CASCADE=0 to disable)`)
 console.log(`   💱 Per-symbol spread: injected from admin config, falls back to engine's 0.30 default`)
 console.log(`   🔁 KEEP HOLDING updates respect the /keepholding user toggle`)
