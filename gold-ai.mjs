@@ -1,21 +1,27 @@
 // ─────────────────────────────────────────────────────────────
-//  GOLD.AI — v4.4d  (multi-symbol · multi-timeframe · SPEED-AWARE +
-//  ATR DIAGNOSTIC LOGGING + MISSING 1m PRESET FIX)
+//  GOLD.AI — v4.4e  (multi-symbol · multi-timeframe · SPEED-AWARE +
+//  ATR DIAGNOSTIC LOGGING + 1m PRESET FIX + S/R TP BUFFER FIX)
 //
-//  New in v4.4d:
-//   • MISSING '1m' PRESET FIX — TF_PRESETS and TRADE_PROFILES had NO
-//     entry for '1m'. cfgFor()/profileFor() both fall back to a
-//     default preset when a timeframe is missing (`||TF_PRESETS['5m']`
-//     and `||TRADE_PROFILES['15m']`), so every "1m" cycle was silently
-//     fetching 5-MINUTE candles from TwelveData (cfg.td='5min') while
-//     logging and labeling everything as "1m". This is why live 1m ATR
-//     readings looked "stuck" for several minutes at a stretch (the
-//     5-min bars underneath only actually changed once every 5
-//     minutes) before jumping — a real bug, not sampling noise. Added
-//     a proper '1m' entry to both tables (min:1, td:'1min', its own
-//     ATR band + SCALP profile). ATR_LOW/ATR_HIGH from a symbol's
-//     calibrated 1m band (once recalibrated against real 1-minute
-//     data) will still override these fallback values as before.
+//  New in v4.4e:
+//   • RESPECT SUPPORT/RESISTANCE ON TPs — placeTPs()'s scalp/intraday path
+//     (used by every non-SWING timeframe) had a bug where, if a nearby
+//     resistance/support/liquidity level was found "in path" toward a TP
+//     but the buffered (pulled-back) point failed a minimum-distance sanity
+//     check, the code abandoned the buffer ENTIRELY and fell back to the
+//     raw, un-buffered R-multiple target — which is the same value that
+//     made that level "in path" to begin with. Net effect: TP would land
+//     almost exactly ON the level, and real trades would frequently miss it
+//     by a few cents on the wick. Fixed by always applying the buffer once
+//     a level is found, and relaxing the minimum-forward-progress floor
+//     specifically for a level-snapped TP (R*0.15 instead of R*0.4) so it
+//     can never get pushed back up past its own buffer and onto the level.
+//     Also widened the buffer itself (~15-20% larger: 0.35/0.25/0.7×ATR for
+//     normal/ranging/volatile regimes, was 0.3/0.2/0.6) for extra real-world
+//     margin against ordinary spread/noise.
+//
+//  v4.4d: added the missing '1m' TF_PRESETS/TRADE_PROFILES entry — '1m' was
+//  silently falling back to the 5m preset (fetching 5-minute candles while
+//  labeled 1m).
 //
 //  v4.4c: WAIT logs now print actual ATR% + calibrated band for
 //  low_liquidity / hard-band diagnostics.
@@ -298,16 +304,33 @@ function placeTPs(dir, entry, sl, atr, profile, allTargets, tpBuf){
     let target = dir==='BUY' ? entry + R*profile.tpR[k] : entry - R*profile.tpR[k]
     target = dir==='BUY' ? Math.min(target, entry+cap) : Math.max(target, entry-cap)
     let kind = `${profile.tpR[k]}R`
+    let snappedToLevel = false
     for(const lv of levels){
       const inPath = dir==='BUY' ? (lv.level > prev + R*0.3 && lv.level <= target)
                                  : (lv.level < prev - R*0.3 && lv.level >= target)
       if(inPath){
-        const snapped = dir==='BUY' ? lv.level - tpBuf : lv.level + tpBuf
-        if(dir==='BUY' ? snapped > prev + R*0.3 : snapped < prev - R*0.3){ target=snapped; kind=lv.kind }
+        // Respect the level — ALWAYS take profit before it, never on top of
+        // it. Previously, if this buffered point failed a minimum-distance
+        // sanity check, the code fell all the way back to the raw,
+        // un-buffered R-multiple target — which is the same value that made
+        // this level "in path" in the first place, so TP would land almost
+        // exactly ON the resistance/support and miss by cents. Now the
+        // buffer is applied unconditionally; the minimum-progress floor
+        // below is relaxed for a snapped TP specifically so it can never
+        // push the target back into the level it was just pulled off of.
+        target = dir==='BUY' ? lv.level - tpBuf : lv.level + tpBuf
+        kind = lv.kind
+        snappedToLevel = true
         break
       }
     }
-    target = dir==='BUY' ? Math.max(target, prev + R*0.4) : Math.min(target, prev - R*0.4)
+    // Minimum forward progress from the previous TP. A level-snapped TP
+    // only needs enough separation to stay meaningfully distinct from the
+    // previous TP (R*0.15) — enforcing the full R*0.4 here would risk
+    // shoving it back up past the buffer and onto the level itself. A
+    // plain R-multiple TP (no level found nearby) keeps the original R*0.4.
+    const minProgress = snappedToLevel ? R*0.15 : R*0.4
+    target = dir==='BUY' ? Math.max(target, prev + minProgress) : Math.min(target, prev - minProgress)
     tps.push({lvl:+target.toFixed(SYMBOL_DECIMALS), kind}); prev=target
   }
   return { tp1:tps[0].lvl, tp2:tps[1].lvl, tp3:tps[2].lvl, tpInfo:tps.map(t=>t.kind) }
@@ -400,9 +423,13 @@ function analyse(candles,nowMs,cfg){
     pooledLows .push(...scoreSwings(s.L,s.L,atr,lastIdx,sp).map(l=>({...l,tfWeight:def.weight})))
   }
   const { equalHighs, equalLows } = detectEqualLevels(str.H, str.L, atr)
-  const tpBuf = reg.regime==='volatile_expansion' ? atr*0.6
-              : reg.regime==='ranging'            ? atr*0.2
-              :                                      atr*0.3
+  // Buffer kept BEFORE any resistance/support/liquidity level when placing
+  // TPs — widened slightly (was 0.6/0.2/0.3×ATR) so a TP doesn't sit close
+  // enough to the level that ordinary spread/noise stops it a few cents
+  // short. See placeTPs() for how this is applied.
+  const tpBuf = reg.regime==='volatile_expansion' ? atr*0.7
+              : reg.regime==='ranging'            ? atr*0.25
+              :                                      atr*0.35
 
   const buildTargets=(d)=>{
     const t=[]
