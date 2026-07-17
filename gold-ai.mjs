@@ -1,33 +1,30 @@
 // ─────────────────────────────────────────────────────────────
-//  GOLD.AI — v4.4e  (multi-symbol · multi-timeframe · SPEED-AWARE +
-//  ATR DIAGNOSTIC LOGGING + 1m PRESET FIX + S/R TP BUFFER FIX)
+//  GOLD.AI — v4.5  (LIMIT-AT-LEVEL ENTRIES + BREAK→RETEST / RANGE→FADE
+//  DECISION ENGINE, on top of v4.4e)
 //
-//  New in v4.4e:
-//   • RESPECT SUPPORT/RESISTANCE ON TPs — placeTPs()'s scalp/intraday path
-//     (used by every non-SWING timeframe) had a bug where, if a nearby
-//     resistance/support/liquidity level was found "in path" toward a TP
-//     but the buffered (pulled-back) point failed a minimum-distance sanity
-//     check, the code abandoned the buffer ENTIRELY and fell back to the
-//     raw, un-buffered R-multiple target — which is the same value that
-//     made that level "in path" to begin with. Net effect: TP would land
-//     almost exactly ON the level, and real trades would frequently miss it
-//     by a few cents on the wick. Fixed by always applying the buffer once
-//     a level is found, and relaxing the minimum-forward-progress floor
-//     specifically for a level-snapped TP (R*0.15 instead of R*0.4) so it
-//     can never get pushed back up past its own buffer and onto the level.
-//     Also widened the buffer itself (~15-20% larger: 0.35/0.25/0.7×ATR for
-//     normal/ranging/volatile regimes, was 0.3/0.2/0.6) for extra real-world
-//     margin against ordinary spread/noise.
+//  New in v4.5:
+//   • ENTRIES ARE NOW PENDING LIMITS AT A LEVEL, not market fills. The
+//     decision engine (in analyse()) decides WHAT KIND of setup this is:
+//       – BREAK → RETEST : the last CLOSED candle broke out of the range →
+//         rest a limit at the broken level for the pullback (continuation).
+//       – RANGE → FADE   : price inside the range → sell the upper edge /
+//         buy the lower edge.
+//       – MIDDLE / mismatch → WAIT.
+//     Scoring still decides DIRECTION; the setup must agree with it.
+//     The launcher holds the order as pending, fills it when price trades in,
+//     or cancels it if the pullback never comes.
+//   • New tunables (env): ORDER_MODE, LIMIT_MIN_DIST_ATR, LIMIT_MAX_DIST_ATR,
+//     LIMIT_FALLBACK, USE_RANGE_GATE, RANGE_LOOKBACK, SELL_ZONE, BUY_ZONE,
+//     BREAK_BUFFER_ATR.
+//   • analyse() now returns orderType ('SELL_LIMIT'|'BUY_LIMIT'|'MARKET')
+//     and setupKind ('retest_up'|'retest_down'|'fade_high'|'fade_low').
 //
-//  v4.4d: added the missing '1m' TF_PRESETS/TRADE_PROFILES entry — '1m' was
-//  silently falling back to the 5m preset (fetching 5-minute candles while
-//  labeled 1m).
+//  NOTE: the BACKTEST (simulateTrade) still models MARKET fills at next-bar
+//  open — it does NOT yet model limit fills / retests / expiry, so backtest
+//  stats will NOT reflect this new live logic until simulateTrade is updated.
 //
-//  v4.4c: WAIT logs now print actual ATR% + calibrated band for
-//  low_liquidity / hard-band diagnostics.
-//
-//  v4.4b: brain gate removed. Everything else (adaptive ATR band,
-//  trade profiles, scoring, TP/SL logic) unchanged from v4.4.
+//  v4.4e: S/R TP buffer fix. v4.4d: 1m preset. v4.4c: ATR diagnostic logs.
+//  v4.4b: brain gate removed.
 // ─────────────────────────────────────────────────────────────
 import fs from 'fs'
 
@@ -65,6 +62,18 @@ const REQUIRE_CANDLE_CONFIRM = process.env.REQUIRE_CANDLE_CONFIRM!=='0'
 const SPREAD_TP1_MIN_MULT    = parseFloat(process.env.SPREAD_TP1_MULT)||6
 const SCALP_OFFHOURS_STRICT  = process.env.SCALP_OFFHOURS_STRICT!=='0'
 const CONFLUENCE_MIN         = envNum('CONFLUENCE_MIN',0)
+
+// ── ENTRY / DECISION MODE (limit-at-level + break→retest / range→fade) ───
+// The heart of v4.5. See analyse() for how these drive the setup engine.
+const ORDER_MODE         = (process.env.ORDER_MODE || 'limit').toLowerCase()      // 'limit' | 'market'
+const LIMIT_MIN_DIST_ATR = parseFloat(process.env.LIMIT_MIN_DIST_ATR) || 0.3      // a fade level must be ≥ this far from price
+const LIMIT_MAX_DIST_ATR = parseFloat(process.env.LIMIT_MAX_DIST_ATR) || 1.5      // …and ≤ this far
+const LIMIT_FALLBACK     = (process.env.LIMIT_FALLBACK || 'market').toLowerCase() // reserved (Patch-4 always uses a level or WAITs)
+const USE_RANGE_GATE     = process.env.USE_RANGE_GATE !== '0'                     // trade the edges, wait in the middle
+const RANGE_LOOKBACK     = parseInt(process.env.RANGE_LOOKBACK) || 100            // bars that define "the range"
+const SELL_ZONE          = parseFloat(process.env.SELL_ZONE) || 0.65             // only SELL when price ≥ this fraction of range
+const BUY_ZONE           = parseFloat(process.env.BUY_ZONE)  || 0.35             // only BUY  when price ≤ this fraction of range
+const BREAK_BUFFER_ATR   = parseFloat(process.env.BREAK_BUFFER_ATR) || 0.10      // a CLOSE must clear a level by this × ATR to be a "break"
 
 // ── TIMEFRAME PRESETS (data/interval/regime bands) ───────────
 const TF_PRESETS={
@@ -309,26 +318,12 @@ function placeTPs(dir, entry, sl, atr, profile, allTargets, tpBuf){
       const inPath = dir==='BUY' ? (lv.level > prev + R*0.3 && lv.level <= target)
                                  : (lv.level < prev - R*0.3 && lv.level >= target)
       if(inPath){
-        // Respect the level — ALWAYS take profit before it, never on top of
-        // it. Previously, if this buffered point failed a minimum-distance
-        // sanity check, the code fell all the way back to the raw,
-        // un-buffered R-multiple target — which is the same value that made
-        // this level "in path" in the first place, so TP would land almost
-        // exactly ON the resistance/support and miss by cents. Now the
-        // buffer is applied unconditionally; the minimum-progress floor
-        // below is relaxed for a snapped TP specifically so it can never
-        // push the target back into the level it was just pulled off of.
         target = dir==='BUY' ? lv.level - tpBuf : lv.level + tpBuf
         kind = lv.kind
         snappedToLevel = true
         break
       }
     }
-    // Minimum forward progress from the previous TP. A level-snapped TP
-    // only needs enough separation to stay meaningfully distinct from the
-    // previous TP (R*0.15) — enforcing the full R*0.4 here would risk
-    // shoving it back up past the buffer and onto the level itself. A
-    // plain R-multiple TP (no level found nearby) keeps the original R*0.4.
     const minProgress = snappedToLevel ? R*0.15 : R*0.4
     target = dir==='BUY' ? Math.max(target, prev + minProgress) : Math.min(target, prev - minProgress)
     tps.push({lvl:+target.toFixed(SYMBOL_DECIMALS), kind}); prev=target
@@ -347,8 +342,6 @@ function analyse(candles,nowMs,cfg){
   const e20=last(ema(prices,20)),e50=last(ema(prices,50))
   const rsi=rsiCalc(prices),macd=macdCalc(prices),bb=bbCalc(prices),st=stochCalc(candles),s20=sma20(candles),atr=atrCalc(candles)
   if(!atr||reg.regime==='low_liquidity') return wait('low liquidity / no ATR',reg,cfg)
-  // adaptive hard sanity band scales with the per-symbol calibrated band
-  // (forex ATR% is far below gold's — a fixed 0.03% floor blocked pairs)
   const hardLow=Math.min(0.03,cfg.atrLow*0.5), hardHigh=Math.max(3.0,cfg.atrHigh*2)
   if(reg.atrPct<hardLow||reg.atrPct>hardHigh) return wait(`ATR ${reg.atrPct?.toFixed(3)}% outside band`,reg,cfg)
   const news=inNewsBlackout(nowMs); if(news) return wait(`news blackout: ${news}`,reg,cfg)
@@ -423,10 +416,6 @@ function analyse(candles,nowMs,cfg){
     pooledLows .push(...scoreSwings(s.L,s.L,atr,lastIdx,sp).map(l=>({...l,tfWeight:def.weight})))
   }
   const { equalHighs, equalLows } = detectEqualLevels(str.H, str.L, atr)
-  // Buffer kept BEFORE any resistance/support/liquidity level when placing
-  // TPs — widened slightly (was 0.6/0.2/0.3×ATR) so a TP doesn't sit close
-  // enough to the level that ordinary spread/noise stops it a few cents
-  // short. See placeTPs() for how this is applied.
   const tpBuf = reg.regime==='volatile_expansion' ? atr*0.7
               : reg.regime==='ranging'            ? atr*0.25
               :                                      atr*0.35
@@ -447,33 +436,101 @@ function analyse(candles,nowMs,cfg){
     return t
   }
 
-  let entry=price, sl
+  // ══════════════════════════════════════════════════════════════
+  //  UNIFIED SETUP ENGINE (v4.5) — decide WHAT KIND of trade this is,
+  //  then rest a pending limit at the level. Direction comes from the
+  //  scoring above (`dir`); the setup must AGREE with it, else WAIT.
+  //    • BREAK → RETEST : last CLOSED candle broke the range → limit at the
+  //      broken level for the pullback (continuation; also how trend days
+  //      are handled — join the break, don't fade it).
+  //    • RANGE → FADE   : price inside the range → sell the upper edge / buy
+  //      the lower edge. Middle → WAIT.
+  // ══════════════════════════════════════════════════════════════
+  const dp = SYMBOL_DECIMALS
+  const spr0     = spreadAt(nowMs, reg.regime)
+  const entryBuf = Math.max(atr*0.10, spr0*1.5)   // fill a touch before the level
+  const levelBuf = buf                            // SL sits this far beyond the level
+  const breakBuf = atr*BREAK_BUFFER_ATR           // a CLOSE must clear a level by this to be a "break"
+
+  // Range = bars BEFORE the last closed candle (analyse() is fed CLOSED
+  // candles, so last(candles) is a confirmed close).
+  const rl    = Math.min(candles.length-1, RANGE_LOOKBACK)
+  const prior = candles.slice(-(rl+1), -1)
+  const rHi   = prior.length ? Math.max(...prior.map(c=>c.high)) : price
+  const rLo   = prior.length ? Math.min(...prior.map(c=>c.low))  : price
+  const span  = rHi - rLo
+
+  let entry=null, sl=null, orderType='MARKET', setupKind='none'
+  const brokeUp   = price > rHi + breakBuf         // last close cleared resistance
+  const brokeDown = price < rLo - breakBuf         // last close broke support
+
+  if(ORDER_MODE!=='market' && (brokeUp || brokeDown)){
+    // ── BREAK → RETEST ──
+    if(brokeUp && dir==='BUY'){
+      entry=+(rHi + entryBuf).toFixed(dp)          // buy the pullback to old resistance → now support
+      sl   =+(rHi - levelBuf).toFixed(dp)
+      orderType='BUY_LIMIT'; setupKind='retest_up'
+    } else if(brokeDown && dir==='SELL'){
+      entry=+(rLo - entryBuf).toFixed(dp)          // sell the pullback to old support → now resistance
+      sl   =+(rLo + levelBuf).toFixed(dp)
+      orderType='SELL_LIMIT'; setupKind='retest_down'
+    } else {
+      return wait(`break ${brokeUp?'up':'down'} but score says ${dir} — no clean setup`,reg,cfg,{net,bull,bear})
+    }
+  } else if(ORDER_MODE!=='market' && USE_RANGE_GATE && span>0){
+    // ── RANGE → FADE the edge ──
+    const pos = (price - rLo) / span               // 0 = floor, 1 = ceiling
+    if(dir==='SELL' && pos >= SELL_ZONE){
+      const resAbove=[
+        ...pooledHighs.map(h=>h.high), ...equalHighs.map(e=>e.level),
+        ...(prevDayHigh>price?[prevDayHigh]:[]), rHi,
+      ].filter(l=>l>price && Math.abs(l-price)>=atr*LIMIT_MIN_DIST_ATR && Math.abs(l-price)<=atr*LIMIT_MAX_DIST_ATR)
+      const lvl = resAbove.length ? Math.min(...resAbove) : null
+      if(lvl==null) return wait('sell edge but no resistance within range',reg,cfg,{net,bull,bear})
+      entry=+(lvl - entryBuf).toFixed(dp); sl=+(lvl + levelBuf).toFixed(dp)
+      orderType='SELL_LIMIT'; setupKind='fade_high'
+    } else if(dir==='BUY' && pos <= BUY_ZONE){
+      const supBelow=[
+        ...pooledLows.map(l=>l.low), ...equalLows.map(e=>e.level),
+        ...(prevDayLow<price?[prevDayLow]:[]), rLo,
+      ].filter(l=>l<price && Math.abs(l-price)>=atr*LIMIT_MIN_DIST_ATR && Math.abs(l-price)<=atr*LIMIT_MAX_DIST_ATR)
+      const lvl = supBelow.length ? Math.max(...supBelow) : null
+      if(lvl==null) return wait('buy edge but no support within range',reg,cfg,{net,bull,bear})
+      entry=+(lvl + entryBuf).toFixed(dp); sl=+(lvl - levelBuf).toFixed(dp)
+      orderType='BUY_LIMIT'; setupKind='fade_low'
+    } else {
+      return wait(`no edge — price mid-range (${(pos*100)|0}%), score ${dir}`,reg,cfg,{net,bull,bear,pos:+pos.toFixed(2)})
+    }
+  } else if(ORDER_MODE==='market'){
+    // ── MARKET fallback (only if you set ORDER_MODE=market) ──
+    entry=price
+    if(dir==='BUY'){
+      const anchor = (liq.sweepBull&&liq.prevLow&&liq.prevLow<entry)?liq.prevLow
+                   : (str.rL&&str.rL.low<entry)?str.rL.low
+                   : (prevDayLow<entry)?prevDayLow : null
+      let slRaw = anchor ? anchor - buf : entry - atr*stopMult
+      if(slRaw>=entry) slRaw = entry - atr*stopMult
+      sl = +Math.max(slRaw, entry - atr*5).toFixed(dp)
+    } else {
+      const anchor = (liq.sweepBear&&liq.prevHigh&&liq.prevHigh>entry)?liq.prevHigh
+                   : (str.rH&&str.rH.high>entry)?str.rH.high
+                   : (prevDayHigh>entry)?prevDayHigh : null
+      let slRaw = anchor ? anchor + buf : entry + atr*stopMult
+      if(slRaw<=entry) slRaw = entry + atr*stopMult
+      sl = +Math.min(slRaw, entry + atr*5).toFixed(dp)
+    }
+  } else {
+    // ORDER_MODE=limit but neither a break nor a valid range edge → stand down.
+    return wait('no break and no range edge — standing down',reg,cfg,{net,bull,bear})
+  }
+
+  // ── shared: minimum stop distance + hard cap (both paths) ──
   if(dir==='BUY'){
-    const sweepWickLow  = liq.sweepBull && liq.prevLow ? liq.prevLow : null
-    const structWickLow = str.rL ? str.rL.low : null
-    const dayLow        = prevDayLow < price ? prevDayLow : null
-    let anchor=null
-    if(sweepWickLow  && sweepWickLow  < entry) anchor=sweepWickLow
-    else if(structWickLow && structWickLow < entry) anchor=structWickLow
-    else if(dayLow        && dayLow        < entry) anchor=dayLow
-    let slRaw = anchor ? anchor - buf : entry - atr*stopMult
-    if(slRaw >= entry) slRaw = entry - atr*stopMult
-    sl = +Math.max(slRaw, entry - atr*5).toFixed(SYMBOL_DECIMALS)
-    if(entry - sl < profile.minStopAtr*atr)
-      sl = +Math.max(entry - profile.minStopAtr*atr, entry - atr*5).toFixed(SYMBOL_DECIMALS)
-  }else{
-    const sweepWickHigh  = liq.sweepBear && liq.prevHigh ? liq.prevHigh : null
-    const structWickHigh = str.rH ? str.rH.high : null
-    const dayHigh        = prevDayHigh > price ? prevDayHigh : null
-    let anchor=null
-    if(sweepWickHigh  && sweepWickHigh  > entry) anchor=sweepWickHigh
-    else if(structWickHigh && structWickHigh > entry) anchor=structWickHigh
-    else if(dayHigh        && dayHigh        > entry) anchor=dayHigh
-    let slRaw = anchor ? anchor + buf : entry + atr*stopMult
-    if(slRaw <= entry) slRaw = entry + atr*stopMult
-    sl = +Math.min(slRaw, entry + atr*5).toFixed(SYMBOL_DECIMALS)
-    if(sl - entry < profile.minStopAtr*atr)
-      sl = +Math.min(entry + profile.minStopAtr*atr, entry + atr*5).toFixed(SYMBOL_DECIMALS)
+    if(entry - sl < profile.minStopAtr*atr) sl = entry - profile.minStopAtr*atr
+    sl = +Math.max(sl, entry - atr*5).toFixed(dp)
+  } else {
+    if(sl - entry < profile.minStopAtr*atr) sl = entry + profile.minStopAtr*atr
+    sl = +Math.min(sl, entry + atr*5).toFixed(dp)
   }
 
   const { tp1, tp2, tp3, tpInfo } = placeTPs(dir, entry, sl, atr, profile, buildTargets(dir), tpBuf)
@@ -484,7 +541,7 @@ function analyse(candles,nowMs,cfg){
 
   const riskUSD=ACCT*(RISK/100),units=riskUSD/Math.abs(entry-sl)
   return { symbol:SYMBOL_LABEL, tframe:cfg.tframe, tradeType:profile.type, maxHoldBars:profile.maxHold,
-    direction:dir, score, tier, net, bull, bear, confluence:confl,
+    direction:dir, orderType, setupKind, score, tier, net, bull, bear, confluence:confl,
     conflict:+conflict.toFixed(2), regime:reg.regime, adx:reg.adx, atrPct:+reg.atrPct.toFixed(3),
     session:sessionOf(nowMs), h1Trend, m15Bos,
     entry:+entry.toFixed(SYMBOL_DECIMALS), sl, tp1, tp2, tp3, tpInfo,
@@ -493,12 +550,8 @@ function analyse(candles,nowMs,cfg){
     inv:dir==='BUY'?`${cfg.tframe} close below ${fmt(sl)}`:`${cfg.tframe} close above ${fmt(sl)}`,
     reasons, skipped:false }
 }
-// ── DIAGNOSTIC-ENRICHED WAIT (v4.4c) ──────────────────────────
-// Every WAIT now carries the actual measured atrPct plus the exact
-// atrLow/atrHigh band it was judged against (cfg's calibrated values —
-// the SAME numbers marketRegime() and the hard-band check above just
-// used), so the console log can show real numbers instead of just a
-// regime label. Costs nothing extra to compute — reg already has atrPct.
+
+// ── DIAGNOSTIC-ENRICHED WAIT ──────────────────────────────────
 function wait(why,reg,cfg,extra={}){
   return { direction:'WAIT', skipped:true, why, symbol:SYMBOL_LABEL, tframe:cfg?.tframe,
     regime:reg?.regime, atrPct:reg?.atrPct??null, atrLow:cfg?.atrLow??null, atrHigh:cfg?.atrHigh??null,
@@ -582,7 +635,7 @@ async function fetchYahooSpot(cfg){
       if(res.ok){ const a=parseYahoo(await res.json()); if(a.length>200) return a } }catch(_){} }
   throw new Error(`No Yahoo data for ${SYMBOL_YAHOO} — set OANDA_TOKEN or TWELVEDATA_KEY`) }
 
-// ── SIMULATE TRADE ───────────────────────────────────────────
+// ── SIMULATE TRADE (⚠️ still models MARKET fills — see header note) ──
 function simulateTrade(candles,i,sig,maxHold=24){
   if(i+1>=candles.length) return null
   const dir=sig.direction,eb=candles[i+1]
@@ -698,11 +751,6 @@ async function checkOne(tframe){
   const closed=candles.slice(0,-1),forming=candles[candles.length-1]
   const sig=analyse(closed,closed[closed.length-1].timestamp,cfg)
   if(sig.skipped){
-    // ── DIAGNOSTIC LOGGING (v4.4c) ─────────────────────────────
-    // Print the actual measured ATR% and the exact band it was judged
-    // against whenever we have them (low-liquidity / hard-band WAITs),
-    // so it's immediately obvious whether a WAIT is a real quiet market
-    // or a bad calibration — no separate manual check needed.
     const atrInfo = sig.atrPct!=null
       ? ` · ATR ${sig.atrPct.toFixed(4)}% (band ${sig.atrLow}–${sig.atrHigh}%)`
       : ''
@@ -711,16 +759,20 @@ async function checkOne(tframe){
   }
   const live=forming.close,R=Math.abs(sig.entry-sig.sl)
   if((sig.direction==='BUY'?live<=sig.sl:live>=sig.sl)){console.log(`[${ts}] ${SYMBOL_LABEL} ${tframe} SKIP: live past stop`);return}
-  if((sig.direction==='BUY'?sig.entry-live:live-sig.entry)>0.5*R){console.log(`[${ts}] ${SYMBOL_LABEL} ${tframe} SKIP: stale (>0.5R drift)`);return}
+  // Only MARKET orders can be "stale" — a LIMIT is SUPPOSED to sit away from price.
+  if(sig.orderType==='MARKET' && (sig.direction==='BUY'?sig.entry-live:live-sig.entry)>0.5*R){console.log(`[${ts}] ${SYMBOL_LABEL} ${tframe} SKIP: stale (>0.5R drift)`);return}
   const slip=+(live-sig.entry).toFixed(SYMBOL_DECIMALS)
   const barTs=closed[closed.length-1].timestamp,key=`${SYMBOL_LABEL}|${tframe}|${sig.direction}|${barTs}`
   if(key===loadKey(tframe)){console.log(`[${ts}] ${SYMBOL_LABEL} ${tframe} already alerted this bar`);return}
   saveKey(tframe,key); logTrade({ts,symbol:SYMBOL_LABEL,tframe,live,slip,...sig})
   const tpLabel=(p,k)=>`${fmt(p)}${k?` (${k})`:''}`
   const hold=holdText(sig.maxHoldBars||profileFor(tframe).maxHold, cfg.min)
+  const otLabel = sig.orderType==='SELL_LIMIT' ? 'SELL LIMIT'
+                : sig.orderType==='BUY_LIMIT'  ? 'BUY LIMIT'
+                : sig.direction
   await sendTelegram(
-`🟡 <b>${SYMBOL_LABEL} ${tframe.toUpperCase()} — ${sig.direction}</b> · ${sig.tradeType} (score ${sig.score}/100 ${sig.tier})
-Net ${sig.net} (bull ${sig.bull}/bear ${sig.bear}) · confluence ${sig.confluence}/6 · H1 ${sig.h1Trend}
+`🟡 <b>${SYMBOL_LABEL} ${tframe.toUpperCase()} — ${otLabel}</b> · ${sig.tradeType} (score ${sig.score}/100 ${sig.tier})
+Setup ${sig.setupKind} · Net ${sig.net} (bull ${sig.bull}/bear ${sig.bear}) · confluence ${sig.confluence}/6 · H1 ${sig.h1Trend}
 ${SESSION_LABEL[sig.session]||sig.session} · ⏱ target ≤ ${hold}
 Planned ${fmt(sig.entry)} · live ${fmt(live)} (drift ${slip>=0?'+':''}${slip})
 SL ${fmt(sig.sl)}  (RR ${sig.rr})
@@ -729,7 +781,7 @@ TP2 ${tpLabel(sig.tp2,sig.tpInfo?.[1])}
 TP3 ${tpLabel(sig.tp3,sig.tpInfo?.[2])}
 Size ${sig.posSize}
 ⚠️ Source ${SOURCE} — must equal your execution venue.`)
-  console.log(`[${ts}] ✅ ${SYMBOL_LABEL} ${tframe} ${sig.direction} ${sig.tradeType} net ${sig.net} · live ${fmt(live)}`)
+  console.log(`[${ts}] ✅ ${SYMBOL_LABEL} ${tframe} ${sig.orderType} (${sig.setupKind}) net ${sig.net} · live ${fmt(live)}`)
 }
 
 async function check(){ for(const tf of LIVE_TFS){ await checkOne(tf) } }
@@ -739,7 +791,7 @@ const mode=process.argv[2]||'check'
 if(mode==='backtest'||mode==='report'){
   const cfg=cfgFor(TFRAME), profile=profileFor(TFRAME)
   console.log(`Symbol: ${SYMBOL_LABEL} (TD: ${SYMBOL_TD}) · Timeframe: ${TFRAME} · Profile: ${profile.type} (maxHold ${profile.maxHold} bars ≈ ${holdText(profile.maxHold,cfg.min)}, TPs ${profile.tpR.join('/')}R)`)
-  console.log(`⚠️  BACKTEST SOURCE = ${SOURCE}.`)
+  console.log(`⚠️  BACKTEST SOURCE = ${SOURCE}. NOTE: simulateTrade still models MARKET fills — limit/retest behaviour is NOT reflected here yet.`)
   const raw=SOURCE==='twelvedata'
     ?await fetchTwelveDataPaged(parseInt(process.env.BARS)||cfg.target,cfg)
     :await fetchCandles(5000,cfg)
